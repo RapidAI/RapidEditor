@@ -1,0 +1,36 @@
+#!/bin/sh
+# pkg postinstall: register the app and the Finder right-click Quick Action.
+# Everything is best-effort: a failure here must never fail the installation.
+set -u
+
+APP="/Applications/RapidEditor.app"
+SERVICE="/Library/Services/Open with RapidEditor.workflow"
+
+/usr/bin/plutil -lint "$APP/Contents/Info.plist" >/dev/null 2>&1 || \
+    echo "RapidEditor: warning - Info.plist did not validate"
+/usr/bin/plutil -lint "$SERVICE/Contents/document.wflow" >/dev/null 2>&1 || \
+    echo "RapidEditor: warning - Quick Action workflow did not validate"
+
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
+fi
+/usr/bin/touch "$APP" >/dev/null 2>&1 || true
+
+# The Services visibility flags live in the *user's* pbs domain, not root's.
+CONSOLE_USER=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+    HELPER="$(cd "$(dirname "$0")" && pwd)/enable_service.py"
+    if [ -f "$HELPER" ]; then
+        TMPHELPER="/tmp/rapideditor-enable-service.py"
+        /bin/cp "$HELPER" "$TMPHELPER" >/dev/null 2>&1 || true
+        /bin/chmod 644 "$TMPHELPER" >/dev/null 2>&1 || true
+        /usr/bin/su -l "$CONSOLE_USER" -c "/usr/bin/python3 $TMPHELPER" >/dev/null 2>&1 || true
+        /bin/rm -f "$TMPHELPER" >/dev/null 2>&1 || true
+    fi
+else
+    /System/Library/CoreServices/pbs -flush >/dev/null 2>&1 || true
+fi
+
+echo "RapidEditor installed. Right-click any file > Open With > RapidEditor."
+exit 0

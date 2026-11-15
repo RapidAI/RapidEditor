@@ -1,0 +1,41 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Produced binaries / installers (artifacts are uploaded by CI, never committed)
+dist/
+installer-output/
+*.exe
+*.dll
+*.pkg
+*.dmg
+*.AppImage
+*.app/
+*.workflow/
+*.nsi.exe
+
+# Python helpers
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Local test data
+big-*.log
+*.log
+!docs/*.log

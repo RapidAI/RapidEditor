@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=RapidEditor
+GenericName=Fast text and code editor
+GenericName[zh_CN]=快速文本与源码编辑器
+Comment=Multi-tab editor with syntax highlighting and large-file support
+Comment[zh_CN]=多标签编辑、语法高亮、支持大文件
+Exec=__EXEC__
+Icon=__ICON__
+Terminal=false
+Categories=Utility;TextEditor;Development;
+StartupNotify=true
+StartupWMClass=RapidEditor
+MimeType=text/plain;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-python;application/json;application/xml;application/x-shellscript;application/x-yaml;text/markdown;text/x-log;text/csv;text/x-sql;text/x-ini;

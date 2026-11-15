@@ -1,0 +1,14 @@
+# File-manager right-click action (Nemo / Caja / Nautilus with
+# filemanager-actions / Thunar-compatible action providers). On GNOME without
+# that extension, the MimeType association in rapideditor.desktop still puts
+# RapidEditor in the "Open With" context menu.
+[Desktop Entry]
+Type=Action
+Name=Open with RapidEditor
+Name[zh_CN]=用 RapidEditor 打开
+Icon=__ICON__
+Profiles=profile-zero;
+
+[X-Action-Profile profile-zero]
+Exec=__EXEC__
+MimeTypes=all/allfiles;

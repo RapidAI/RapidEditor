@@ -1,0 +1,316 @@
+diff --git a/src/cui_editor.c b/src/cui_editor.c
+index 961e1ee..b60af0e 100644
+--- a/src/cui_editor.c
++++ b/src/cui_editor.c
+@@ -109,6 +109,68 @@ static int cui__ed_caret_col(const cui__ed *E, int pos) {
+     return cui__ed_col(E->buf, E->ls[line], pos, E->tab);
+ }
+ 
++/* ---- pixel positions ----
++ * A monospace grid only fits single-width glyphs. CJK and emoji glyphs that
++ * come from a fallback font are wider (about 1.67 ASCII cells here), so the
++ * caret, selection, marks, text runs and hit testing must use the real font
++ * advances. The integer "column" helpers above stay for line/column display,
++ * go-to-line and indentation, where one code point is one column. */
++
++/* Width in points of s[a, b), with tabs expanded to the next stop. */
++static float cui__ed_span(cui_ctx *ui, float size, float cw, int tab,
++                          const char *s, int a, int b) {
++    float x = 0;
++    int i = a;
++    while (i < b) {
++        int j = i;
++        while (j < b && s[j] != '\t') {
++            uint32_t cp;
++            int n = cui__utf8_decode(s + j, b - j, &cp);
++            j += n > 0 ? n : 1;
++        }
++        if (j > i) x += cui__text_width(ui, CUI_FONT_MONO, size, s + i, j - i, true);
++        if (j < b && s[j] == '\t') {
++            float stop = (float)tab * cw;
++            x = (floorf(x / stop) + 1.0f) * stop;
++            j++;
++        }
++        i = j;
++    }
++    return x;
++}
++
++/* Byte boundary in [a, e) nearest to the pixel offset px from the line start. */
++static int cui__ed_at_px(cui_ctx *ui, float size, float cw, int tab,
++                         const char *s, int a, int e, float px) {
++    float acc = 0;
++    int i = a;
++    while (i < e) {
++        if (s[i] == '\t') {
++            float stop = (float)tab * cw;
++            float next = (floorf(acc / stop) + 1.0f) * stop;
++            if (px < (acc + next) * 0.5f) break;
++            acc = next;
++            i++;
++            continue;
++        }
++        uint32_t cp;
++        int n = cui__utf8_decode(s + i, e - i, &cp);
++        if (n <= 0) n = 1;
++        float w = cui__text_width(ui, CUI_FONT_MONO, size, s + i, n, true);
++        if (px < acc + w * 0.5f) break;
++        acc += w;
++        i += n;
++    }
++    return i;
++}
++
++static int cui__ed_pos_px(cui_ctx *ui, float size, float cw, const cui__ed *E,
++                          int line, float px) {
++    line = CUI_CLAMP(line, 0, E->nl - 1);
++    return cui__ed_at_px(ui, size, cw, E->tab, E->buf, E->ls[line],
++                         cui__ed_end(E, line), px);
++}
++
+ /* first character of the line that is not a space or a tab */
+ static int cui__ed_first_text(const cui__ed *E, int line) {
+     int i = E->ls[line], e = cui__ed_end(E, line);
+@@ -379,7 +441,9 @@ typedef struct {
+     bool in_block, json, empty, focused, show_line, ro;
+     cui__lang lang;
+     int tab, cursor, anchor, caret_line, caret_col;
+-    int br_line[2], br_col[2];
++    float caret_px;             /* caret in real text pixels, not grid columns */
++    int br_line[2];
++    float br_px[2];
+     const char *query; int qn;
+     const cui_text_mark *marks; int nmarks;   /* the app's marks that reach the lines in view */
+     cui_color mark_colors[7];
+@@ -394,21 +458,49 @@ typedef struct {
+     int vc0, vc1;               /* columns in view */
+ } cui__ed_paint;
+ 
+-/* Draws s[a, b) from column col; tabs expand; only the columns in view. */
+-static void cui__ed_run(cui_ctx *ui, const cui__ed_paint *p, const char *s, int a, int b, int col, float x0, float y, cui_color c) {
++/* Draws s[a, b) starting xoff points from the line start. Tabs expand and
++ * only the pixels in view are drawn; advances come from the font so wide
++ * glyphs stay aligned with the caret. */
++static void cui__ed_run(cui_ctx *ui, const cui__ed_paint *p, const char *s,
++                        int a, int b, float xoff, float x0, float y, cui_color c) {
++    float minx = (float)p->vc0 * p->cw;
++    float maxx = (float)(p->vc1 + 1) * p->cw;
+     int i = a;
+-    while (i < b && col < p->vc1) {
+-        if (s[i] == '\t') { col = (col / p->tab + 1) * p->tab; i++; continue; }
+-        int j = i, cj = col;
+-        while (j < b && s[j] != '\t') { if (((unsigned char)s[j] & 0xC0) != 0x80) cj++; j++; }
+-        if (cj > p->vc0) {
+-            int i2 = i, c2 = col;
+-            while (c2 < p->vc0 && i2 < j) { i2 = cui__utf8_next(s, j, i2); c2++; }
+-            int j2 = i2, c3 = c2;
+-            while (j2 < j && c3 < p->vc1) { j2 = cui__utf8_next(s, j, j2); c3++; }
+-            if (j2 > i2) cui__draw_text_line(ui, CUI_FONT_MONO, p->size, x0 + (float)c2 * p->cw, y, c, s + i2, j2 - i2, true);
++    float x = xoff;
++    while (i < b && x < maxx) {
++        if (s[i] == '\t') {
++            float stop = (float)p->tab * p->cw;
++            x = (floorf(x / stop) + 1.0f) * stop;
++            i++;
++            continue;
++        }
++        int j = i;
++        while (j < b && s[j] != '\t') {
++            uint32_t cp;
++            int n = cui__utf8_decode(s + j, b - j, &cp);
++            j += n > 0 ? n : 1;
++        }
++        int i2 = i, j2;
++        float x2 = x, x3;
++        while (i2 < j && x2 < minx) {
++            uint32_t cp;
++            int n = cui__utf8_decode(s + i2, j - i2, &cp);
++            if (n <= 0) n = 1;
++            x2 += cui__text_width(ui, CUI_FONT_MONO, p->size, s + i2, n, true);
++            i2 += n;
++        }
++        j2 = i2;
++        x3 = x2;
++        while (j2 < j && x3 < maxx) {
++            uint32_t cp;
++            int n = cui__utf8_decode(s + j2, j - j2, &cp);
++            if (n <= 0) n = 1;
++            x3 += cui__text_width(ui, CUI_FONT_MONO, p->size, s + j2, n, true);
++            j2 += n;
+         }
+-        col = cj;
++        if (j2 > i2)
++            cui__draw_text_line(ui, CUI_FONT_MONO, p->size, x0 + x2, y, c, s + i2, j2 - i2, true);
++        x += cui__text_width(ui, CUI_FONT_MONO, p->size, s + i, j - i, true);
+         i = j;
+     }
+ }
+@@ -472,7 +564,8 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
+         /* selection */
+         if (s1 > s0 && s1 > als && s0 <= ale) {
+             int a = CUI_MAX(s0, als) - p->base, b = CUI_MIN(s1, ale) - p->base;
+-            float xa = (float)cui__ed_col(s, ls, a, p->tab) * p->cw, xb = (float)cui__ed_col(s, ls, b, p->tab) * p->cw;
++            float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, a);
++            float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, b);
+             if (s1 > ale) xb += p->cw * 0.6f;   /* the newline is selected too */
+             cui_draw_rect(ui, (cui_rect){ x0 + xa, y, xb - xa, p->lh }, CUI_CORNERS(2), p->sel);
+         }
+@@ -482,7 +575,8 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
+             if (mk->start > ale) break;
+             if (mk->end <= als && !(mk->end == mk->start && mk->start == als)) continue;
+             int a = CUI_MAX(mk->start, als) - p->base, b = CUI_MIN(mk->end, ale) - p->base;
+-            float xa = (float)cui__ed_col(s, ls, a, p->tab) * p->cw, xb = (float)cui__ed_col(s, ls, b, p->tab) * p->cw;
++            float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, a);
++            float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, b);
+             if (xb - xa < 2) { xa -= 1; xb = xa + 2; }   /* an empty match shows as a bar */
+             cui_draw_rect(ui, (cui_rect){ x0 + xa, y + 1, xb - xa, p->lh - 2 }, CUI_CORNERS(2), p->mark_colors[CUI_CLAMP(mk->color, 0, 6)]);
+         }
+@@ -490,32 +584,30 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
+         if (p->qn > 0) {
+             for (int i = ls; i + p->qn <= le; i++) {
+                 if (!cui__ed_hit(s, le, i, p->query, p->qn)) continue;
+-                float xa = (float)cui__ed_col(s, ls, i, p->tab) * p->cw, xb = (float)cui__ed_col(s, ls, i + p->qn, p->tab) * p->cw;
++                float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i);
++                float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i + p->qn);
+                 cui_draw_rect_border(ui, (cui_rect){ x0 + xa - 1, y + 1, xb - xa + 2, p->lh - 2 }, CUI_CORNERS(3), p->match, p->match_edge, 1);
+             }
+         }
+         /* the bracket pair */
+         for (int m = 0; m < 2; m++)
+             if (p->br_line[m] == line)
+-                cui_draw_rect_border(ui, (cui_rect){ x0 + (float)p->br_col[m] * p->cw - 0.5f, y + 2, p->cw + 1, p->lh - 4 }, CUI_CORNERS(3),
++                cui_draw_rect_border(ui, (cui_rect){ x0 + p->br_px[m] - 0.5f, y + 2, p->cw + 1, p->lh - 4 }, CUI_CORNERS(3),
+                                      p->brk, p->brk_edge, 1);
+-        /* text: tokenized up to the last column in view */
+-        int stop = cui__ed_at_col(s, ls, le, (float)p->vc1 + 1, p->tab);
++        /* text: tokenized up to the last pixel in view */
++        float maxx = (float)(p->vc1 + 1) * p->cw;
++        int stop = cui__ed_at_px(ui, p->size, p->cw, p->tab, s, ls, le, maxx);
+         if (stop < le) stop = cui__utf8_next(s, le, stop);
+         int nn = stop - ls;
+         if (nn + 1 > tok_cap) { tok_cap = nn + 1; toks = cui__frame_alloc(ui, sizeof *toks * (size_t)tok_cap); }
+         bool was_block = block;
+         int nt = cui__tokenize(&p->lang, p->json, s + ls, nn, &block, toks, tok_cap);
+-        int pos = ls, col = 0;
+         for (int t = 0; t < nt; t++) {
+             int a = ls + toks[t].start, b = a + toks[t].len;
+-            col = cui__ed_adv(s, pos, a, p->tab, col);
+-            int ca = col;
+-            col = cui__ed_adv(s, a, b, p->tab, col);
+-            pos = b;
+-            if (ca >= p->vc1) break;
++            float xoff = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, a);
++            if (xoff >= maxx) break;
+             /* A plain-text token may start with whitespace and still contain text. */
+-            cui__ed_run(ui, p, s, a, b, ca, x0, y + ty, p->colors[toks[t].kind]);
++            cui__ed_run(ui, p, s, a, b, xoff, x0, y + ty, p->colors[toks[t].kind]);
+         }
+         /* a block comment opened past the columns in view still carries on */
+         if (stop < le && p->lang.block_comments) block = cui__ed_scan_line(&p->lang, s, ls, le, was_block);
+@@ -528,7 +620,7 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
+         float blink = 0.5f + 0.5f * cosf((float)p->caret_phase * 2.0f * CUI_PI / 1.06f);
+         float a = (blink > 0.35f || p->caret_phase < 0.5) ? 1.0f : 0.0f;
+         float y = r.y + CUI__ED_INSET + (float)((double)p->caret_line * p->lh - p->sy);
+-        float cx = x0 + (float)p->caret_col * p->cw;
++        float cx = x0 + p->caret_px;
+         cui_draw_rect(ui, (cui_rect){ roundf(cx * ui->scale) / ui->scale - 0.75f, y + ty, 1.5f, fh }, CUI_CORNERS(0.75f), cui_alpha(p->caret, a));
+     }
+     cui_pop_clip(ui);
+@@ -619,6 +711,7 @@ typedef struct {
+     cui_interact lr;
+     bool focused;
+     int caret_line, caret_col;
++    float caret_px;
+ } cui__edf;
+ 
+ /* requests made from code since the last frame: select, go to, find */
+@@ -675,7 +768,7 @@ static void cui__edf_bar_keys(cui__edf *f) {
+ 
+ /* a press: on a scrollbar it grabs the thumb; in the gutter it selects lines; in the code it
+  * places the caret, and a double or triple click selects a word or a line */
+-static void cui__edf_press(cui__edf *f, int line, float col) {
++static void cui__edf_press(cui__edf *f, int line, float px) {
+     cui__ed *E = f->E;
+     cui__ed_state *st = E->st;
+     cui_edit_state *e = &st->ed;
+@@ -698,7 +791,8 @@ static void cui__edf_press(cui__edf *f, int line, float col) {
+         }
+         return;
+     }
+-    int pos = cui__ed_pos(E, line, ui->mx < f->gx ? 0 : col);
++    int pos = cui__ed_pos_px(E->ui, f->size, f->cw, E, line,
++                             ui->mx < f->gx ? 0.0f : px);
+     int clicks = ui->click_count;
+     st->drag = ui->mx < f->gx ? 3 : clicks >= 3 ? 3 : clicks == 2 ? 2 : 1;
+     if (st->drag == 1) {
+@@ -759,8 +853,9 @@ static void cui__edf_drag_select(cui__edf *f) {
+     float y0 = br.y + CUI__ED_INSET - (float)st->sy;
+     float x0 = gx + CUI__ED_GAP - st->sx;
+     int line = (int)floor(((double)ui->my - y0) / lh);
+-    float col = (ui->mx - x0) / cw;
+-    int pos = cui__ed_pos(E, line, st->drag == 3 ? 0 : col);
++    float px = ui->mx - x0;
++    int pos = cui__ed_pos_px(E->ui, f->size, f->cw, E, line,
++                             st->drag == 3 ? 0.0f : px);
+     if (line < 0) pos = 0;
+     if (line >= E->nl) pos = E->len;
+     int prev = e->cursor;
+@@ -789,8 +884,8 @@ static void cui__edf_pointer(cui__edf *f) {
+     if (f->lr.hovered) cui__set_cursor(ui, (f->over_vbar || f->over_hbar || ui->mx < f->gx) ? CUI_CURSOR_ARROW : CUI_CURSOR_TEXT);
+     if (f->known) {
+         int line = (int)floor(((double)ui->my - y0) / f->lh);
+-        float col = (ui->mx - x0) / f->cw;
+-        if (f->lr.hovered && ui->mpressed[0]) cui__edf_press(f, line, col);
++        float px = ui->mx - x0;
++        if (f->lr.hovered && ui->mpressed[0]) cui__edf_press(f, line, px);
+         if (st->bar_drag && f->lr.active && ui->mdown[0]) cui__edf_bar_drag(f);
+         if (st->drag && f->lr.active && ui->mdown[0] && !ui->mpressed[0]) cui__edf_drag_select(f);
+     }
+@@ -1072,8 +1167,10 @@ static void cui__edf_follow_caret(cui__edf *f) {
+     }
+     f->caret_line = cui__ed_line_of(E, e->cursor);
+     f->caret_col = cui__ed_col(E->buf, E->ls[f->caret_line], e->cursor, E->tab);
++    f->caret_px = cui__ed_span(E->ui, f->size, cw, E->tab, E->buf,
++                               E->ls[f->caret_line], e->cursor);
+     /* a line wider than the longest in bytes (tabs) still scrolls into reach */
+-    f->max_sx = CUI_MAX(f->max_sx, (float)f->caret_col * cw + CUI__ED_GAP + 24 - code_w);
++    f->max_sx = CUI_MAX(f->max_sx, f->caret_px + CUI__ED_GAP + 24 - code_w);
+     if (E->reveal) {
+         double cy = (double)f->caret_line * lh;
+         bool out = cy < st->sy || cy + lh > st->sy + view_h;
+@@ -1083,7 +1180,7 @@ static void cui__edf_follow_caret(cui__edf *f) {
+         }
+         else if (cy < st->sy) st->sy = cy;
+         else if (cy + lh > st->sy + view_h) st->sy = cy + lh - view_h;
+-        float cx = (float)f->caret_col * cw, margin = CUI_MIN(cw * 4, code_w * 0.25f);
++        float cx = f->caret_px, margin = CUI_MIN(cw * 4, code_w * 0.25f);
+         if (cx < st->sx + margin) st->sx = cx - margin;
+         if (cx > st->sx + code_w - margin) st->sx = cx - code_w + margin;
+         if (E->center && (cx < st->sx || cx > st->sx + code_w)) st->sx = cx - code_w * 0.5f;
+@@ -1122,6 +1219,7 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
+     p->tab = E->tab;
+     p->cursor = e->cursor; p->anchor = e->anchor;
+     p->caret_line = f->caret_line; p->caret_col = f->caret_col;
++    p->caret_px = f->caret_px;
+     p->focused = focused;
+     p->show_line = focused || ui->focus == f->fid || ui->focus == f->gid;
+     p->ro = E->ro;
+@@ -1143,7 +1241,8 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
+             int pos[2] = { ba, bb };
+             for (int m = 0; m < 2; m++) {
+                 p->br_line[m] = cui__ed_line_of(E, pos[m]);
+-                p->br_col[m] = cui__ed_col(E->buf, E->ls[p->br_line[m]], pos[m], E->tab);
++                p->br_px[m] = cui__ed_span(ui, f->size, cw, E->tab, E->buf,
++                                            E->ls[p->br_line[m]], pos[m]);
+             }
+         }
+     }
+@@ -1284,7 +1383,7 @@ static cui_code_editor_result cui__code_editor_ex_body(cui_ctx *ui, const char *
+     cui__edf_build_lines(&f, &L, json, dark);
+     if (f.focused) cui__wakeup_after(ui, 0.53f);
+     if (f.focused && ui->platform.set_text_input_rect) {
+-        cui_rect cr = { f.gx + CUI__ED_GAP - st->sx + (float)f.caret_col * f.cw, f.br.y + CUI__ED_INSET + (float)((double)f.caret_line * f.lh - st->sy), 1, f.lh };
++        cui_rect cr = { f.gx + CUI__ED_GAP - st->sx + f.caret_px, f.br.y + CUI__ED_INSET + (float)((double)f.caret_line * f.lh - st->sy), 1, f.lh };
+         ui->platform.set_text_input_rect(ui->platform.user, cr);
+     }
+     if (f.focused) cui__focus_ring(ui, outer, ui->focus_visible ? 1.0f : 0.0f);

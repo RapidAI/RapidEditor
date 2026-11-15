@@ -1,0 +1,207 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number, without the v prefix (e.g. 1.0.0)'
+        required: false
+        default: '1.0.0'
+      publish:
+        description: 'Create a GitHub Release even without a tag'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/v}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="1.0.0"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building RapidEditor $V"
+
+  # One job produces the x64, arm64 and universal NSIS installers. The ARM64
+  # payload is cross-compiled with llvm-mingw, so no ARM64 Windows runner is
+  # required and a single universal installer can adapt at install time.
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress --limit-output
+          }
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (Test-Path $nsis) {
+            $nsis | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          & (Join-Path $nsis 'makensis.exe') -VERSION
+
+      - name: Build x64 payload (MSVC)
+        shell: pwsh
+        run: |
+          cmake -S . -B build-win-x64 -G "Visual Studio 17 2022" -A x64
+          cmake --build build-win-x64 --config Release --parallel
+          if (-not (Test-Path 'build-win-x64/Release/RapidEditor.exe')) {
+            throw 'x64 build did not produce RapidEditor.exe'
+          }
+
+      - name: Set up llvm-mingw (ARM64 cross toolchain)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod -Headers @{ 'User-Agent' = 'RapidEditor-CI' } `
+            'https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest'
+          $asset = $rel.assets | Where-Object { $_.name -match 'ucrt-x86_64\.zip$' } |
+            Select-Object -First 1
+          if (-not $asset) { throw 'llvm-mingw ucrt-x86_64 asset not found' }
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile llvm-mingw.zip
+          Expand-Archive -Path llvm-mingw.zip -DestinationPath llvm-mingw -Force
+          $root = (Get-ChildItem -Path llvm-mingw -Directory | Select-Object -First 1).FullName
+          $bin = Join-Path $root 'bin'
+          if (-not (Test-Path (Join-Path $bin 'aarch64-w64-mingw32-clang.exe'))) {
+            throw "aarch64-w64-mingw32-clang.exe not found in $bin"
+          }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build ARM64 payload (cross)
+        id: arm64
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $tc = Join-Path (Get-Location) 'packaging/windows/llvm-mingw-aarch64.cmake'
+          cmake -S . -B build-win-arm64 -G Ninja "-DCMAKE_TOOLCHAIN_FILE=$tc" `
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-win-arm64 --parallel
+          if (-not (Test-Path 'build-win-arm64/RapidEditor.exe')) {
+            throw 'arm64 build did not produce RapidEditor.exe'
+          }
+
+      - name: Create NSIS installers
+        shell: pwsh
+        run: |
+          $x64 = Join-Path (Get-Location) 'build-win-x64/Release/RapidEditor.exe'
+          $arm = Join-Path (Get-Location) 'build-win-arm64/RapidEditor.exe'
+          if (-not (Test-Path $arm)) {
+            Write-Warning 'ARM64 cross build unavailable; producing x64-only installer.'
+            $arm = '-'
+          }
+          cmd /c "packaging\windows\make_installers.bat $env:VERSION `"$x64`" `"$arm`""
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
+          Get-ChildItem dist\*.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapideditor-windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  # A single universal binary (x86_64 + arm64 slices) means one .pkg works on
+  # Intel and Apple Silicon Macs with no architecture decision by the user.
+  macos:
+    needs: meta
+    runs-on: macos-15
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure Ninja
+        run: command -v ninja >/dev/null 2>&1 || brew install ninja
+      - name: Build universal .pkg
+        run: |
+          bash packaging/macos/build_pkg.sh "$VERSION" universal
+          ls -lh dist/*.pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapideditor-macos
+          path: dist/*.pkg
+          if-no-files-found: error
+
+  # An AppImage runtime is single-architecture, so build one per runner.
+  # install-linux.sh (attached to the release) picks the right one by uname -m.
+  linux:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      RE_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc libx11-dev libgl1-mesa-dev libxcursor-dev \
+            libxinerama-dev libxi-dev squashfs-tools curl
+      - name: Build AppImage
+        run: bash packaging/linux/build_appimage.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rapideditor-linux-${{ matrix.arch }}
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  release:
+    needs: [meta, windows, macos, linux]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach the adaptive Linux installer
+        run: |
+          cp packaging/linux/install.sh dist/install-linux.sh
+          chmod +x dist/install-linux.sh
+          ls -lh dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', needs.meta.outputs.version) }}
+          name: RapidEditor ${{ needs.meta.outputs.version }}
+          files: |
+            dist/*.exe
+            dist/*.pkg
+            dist/*.AppImage
+            dist/install-linux.sh
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

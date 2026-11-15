@@ -1,0 +1,107 @@
+--- a/include/cui/cui_app.h
++++ b/include/cui/cui_app.h
+@@ -99,6 +99,17 @@
+ /* Name of the active backend: "win32", "cocoa", "x11", "sdl2", "glfw". */
+ CUI_API const char *cui_app_backend(cui_app *app);
+ 
++/* Files the OS asks a running app to open (macOS Finder "Open With", Quick
++ * Actions, a drop on the Dock icon). These arrive as Apple Events instead of
++ * argv, so the Cocoa backend queues them here for the frame callback to drain.
++ * The queue is global: it can be queried before cui_app_create() and is safe
++ * to read at any point of the frame. Paths belong to CUI and stay valid until
++ * cui_app_clear_pending_files() is called. */
++CUI_API void cui_app_post_open_file(const char *utf8_path);  /* backends only */
++CUI_API int  cui_app_pending_file_count(void);
++CUI_API const char *cui_app_pending_file(int index);
++CUI_API void cui_app_clear_pending_files(void);
++
+ /* Native file dialogs. Blocking; returns true and writes the chosen path
+  * (UTF-8) to out when the user confirms. On Linux this uses zenity or
+  * kdialog when installed. Pass NULL as app to use the current app (handy in
+--- a/src/platform/cui_app.c
++++ b/src/platform/cui_app.c
+@@ -6,6 +6,34 @@
+ static void cui__app_set_clip(void *user, const char *utf8);
+ static const char *cui__app_get_clip(void *user);
+ 
++/* OS-delivered "open this file" requests (macOS Apple Events). A small global
++ * queue is used instead of the per-frame drop buffer because the events can
++ * arrive before cui_app_create() has made a window. All of this runs on the
++ * main thread, so no locking is needed. */
++#define CUI__PENDING_FILES_MAX 64
++static char *cui__pending_files[CUI__PENDING_FILES_MAX];
++static int cui__pending_files_count;
++
++void cui_app_post_open_file(const char *utf8_path) {
++    if (!utf8_path || !*utf8_path || cui__pending_files_count >= CUI__PENDING_FILES_MAX) return;
++    size_t n = strlen(utf8_path) + 1;
++    char *copy = (char *)malloc(n);
++    if (!copy) return;
++    memcpy(copy, utf8_path, n);
++    cui__pending_files[cui__pending_files_count++] = copy;
++}
++
++int cui_app_pending_file_count(void) { return cui__pending_files_count; }
++
++const char *cui_app_pending_file(int index) {
++    return (index >= 0 && index < cui__pending_files_count) ? cui__pending_files[index] : NULL;
++}
++
++void cui_app_clear_pending_files(void) {
++    for (int i = 0; i < cui__pending_files_count; i++) free(cui__pending_files[i]);
++    cui__pending_files_count = 0;
++}
++
+ static bool cui__env_is(const char *name, const char *value) {
+     const char *v = getenv(name);
+     return v && strcmp(v, value) == 0;
+--- a/src/platform/cui_app_cocoa.m
++++ b/src/platform/cui_app_cocoa.m
+@@ -209,6 +209,23 @@
+ 
+ @implementation CUIPlat
+ - (BOOL)windowShouldClose:(NSWindow *)w { (void)w; self.app->running = false; return NO; }
++/* Finder "Open With", Finder Quick Actions and drops on the Dock icon arrive
++ * as Apple Events, not as argv. Queue them so the app opens them on its next
++ * frame (see cui_app_pending_file_count() in cui_app.c). This is what makes a
++ * right-click "Open with RapidEditor" work on macOS, including when the app
++ * is already running. */
++- (BOOL)application:(NSApplication *)sender openFile:(NSString *)filename {
++    (void)sender;
++    cui_app_post_open_file(filename.fileSystemRepresentation);
++    cui__mac_wake();
++    return YES;
++}
++- (void)application:(NSApplication *)sender openFiles:(NSArray<NSString *> *)filenames {
++    (void)sender;
++    for (NSString *f in filenames) cui_app_post_open_file(f.fileSystemRepresentation);
++    cui__mac_wake();
++    [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
++}
+ /* Quit from the menu, Cmd-Q, the Dock or AppleScript ends cui_app_run (or makes cui_app_frame
+  * return false) the way closing the window does, so the code after it runs. AppKit's default
+  * would call exit() from inside the event loop. SDL2 and GLFW answer the same way. */
+@@ -301,10 +318,14 @@
+         [NSApplication sharedApplication];
+         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+         if (![NSApp mainMenu]) cui__mac_menu();
+-        [NSApp finishLaunching];
++        /* Install the delegate before finishLaunching: Apple Events asking the
++         * app to open documents are delivered during launch, and AppKit drops
++         * them when no delegate is listening yet. */
+         CUIPlat *p = [[CUIPlat alloc] init];
+         p.app = app;
+         p.cursor = CUI_CURSOR_ARROW;
++        if (!NSApp.delegate) NSApp.delegate = p;   /* an app that set its own delegate keeps it */
++        [NSApp finishLaunching];
+         NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
+         if (!app->desc.fixed_size) style |= NSWindowStyleMaskResizable;
+         NSRect frame = NSMakeRect(0, 0, app->desc.width, app->desc.height);
+@@ -314,7 +335,6 @@
+         w.contentMinSize = NSMakeSize(app->desc.min_width, app->desc.min_height);
+         w.acceptsMouseMovedEvents = YES;
+         w.delegate = p;
+-        if (!NSApp.delegate) NSApp.delegate = p;   /* an app that set its own delegate keeps it */
+         cui_color bg = app->ui->theme.colors[CUI_TOKEN_BACKGROUND];
+         w.backgroundColor = [NSColor colorWithSRGBRed:bg.r / 255.0 green:bg.g / 255.0 blue:bg.b / 255.0 alpha:1];
+         if (@available(macOS 10.14, *)) {

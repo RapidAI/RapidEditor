@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>          <string>zh_CN</string>
+  <key>CFBundleDisplayName</key>                <string>RapidEditor</string>
+  <key>CFBundleExecutable</key>                  <string>RapidEditor</string>
+  <key>CFBundleIdentifier</key>                 <string>com.rapidaire.rapideditor</string>
+  <key>CFBundleIconFile</key>                    <string>rapideditor.icns</string>
+  <key>CFBundleInfoDictionaryVersion</key>      <string>6.0</string>
+  <key>CFBundleName</key>                       <string>RapidEditor</string>
+  <key>CFBundlePackageType</key>                <string>APPL</string>
+  <key>CFBundleShortVersionString</key>         <string>__VERSION__</string>
+  <key>CFBundleVersion</key>                    <string>__VERSION__</string>
+  <key>LSMinimumSystemVersion</key>             <string>10.13</string>
+  <key>NSHighResolutionCapable</key>            <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSPrincipalClass</key>                   <string>NSApplication</string>
+
+  <!-- Makes "Open With > RapidEditor" appear in the Finder right-click menu.
+       public.data covers every file; the extra UTIs and extensions make the
+       association explicit for text/source files. LSHandlerRank=Alternate
+       means we never steal the user's default application. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>       <string>Text and source files</string>
+      <key>CFBundleTypeRole</key>       <string>Editor</string>
+      <key>LSHandlerRank</key>          <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.data</string>
+        <string>public.text</string>
+        <string>public.plain-text</string>
+        <string>public.source-code</string>
+        <string>public.shell-script</string>
+        <string>public.json</string>
+        <string>public.xml</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>txt</string><string>text</string><string>md</string><string>markdown</string>
+        <string>c</string><string>h</string><string>cpp</string><string>hpp</string>
+        <string>cc</string><string>cxx</string><string>cs</string><string>java</string>
+        <string>py</string><string>js</string><string>jsx</string><string>ts</string>
+        <string>tsx</string><string>rs</string><string>go</string><string>rb</string>
+        <string>php</string><string>json</string><string>xml</string><string>html</string>
+        <string>css</string><string>sh</string><string>bash</string><string>sql</string>
+        <string>csv</string><string>log</string><string>yml</string><string>yaml</string>
+        <string>toml</string><string>ini</string><string>cfg</string><string>conf</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>
