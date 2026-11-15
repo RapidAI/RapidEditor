@@ -48,13 +48,19 @@ python packaging/make_icons.py
 - macOS 用 `CMAKE_OSX_ARCHITECTURES` 直接产通用二进制，无需运行时判断。
 - Linux 的 AppImage 运行时是单架构 ELF，`install.sh` 用 `uname -m` 选择资产。
 
-## 为什么 Windows 的 ARM64 是交叉编译
+## 为什么 Windows 用 llvm-mingw 而不是 Visual Studio
 
-GitHub 提供 `windows-11-arm` runner，但其镜像上的原生 ARM64 编译工具链并不稳定可用。
-工作流改用 `llvm-mingw`（`aarch64-w64-mingw32-clang`）在 x64 runner 上交叉编译，
+`windows-latest` 的镜像不保证装了某个具体版本的 VS（实测 `Visual Studio 17 2022`
+生成器报 "could not find any instance of Visual Studio"）。工作流改用
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw)：一份工具链同时提供
+`x86_64-w64-mingw32-clang.exe` 和 `aarch64-w64-mingw32-clang.exe`，
+配合 `packaging/windows/llvm-mingw-x86_64.cmake` 与
+`llvm-mingw-aarch64.cmake`，在 x64 runner 上用 Ninja 一次编出两个架构。
+
 好处是同一个 job 内可以同时拿到两份二进制，从而产出一个**通用安装包**：
 `installer.nsi` 在 `.onInit` 检测本机架构，把匹配的 payload 改名为 `RapidEditor.exe`。
-如果工具链下载或交叉编译失败，该步骤 `continue-on-error`，仍会产出 x64 安装包。
+ARM64 步骤带 `continue-on-error`，若交叉编译出问题仍会产出 x64 安装包。
+本地实测两个 PE 的 machine 分别为 `0x8664`（x64）与 `0xaa64`（ARM64）。
 
 ## NSIS 编码
 

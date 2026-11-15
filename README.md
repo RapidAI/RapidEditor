@@ -69,7 +69,7 @@ git tag v1.0.0 && git push origin v1.0.0
 
 Job 说明：
 
-- `windows`：`windows-latest` 上用 MSVC 编 x64，再用 llvm-mingw 交叉编 ARM64，产出 3 个 NSIS 安装包；交叉工具链失败时降级为仅 x64 包，不阻断发布。
+- `windows`：`windows-latest` 上用 llvm-mingw 一次拿到 x64 与 ARM64 两份二进制（不依赖 Visual Studio），产出 3 个 NSIS 安装包；ARM64 编译失败时降级为仅 x64 包，不阻断发布。
 - `macos`：`macos-15` 上一次编译 universal 二进制，`pkgbuild` 制作 `.pkg`，内含 Quick Action。
 - `linux`：`ubuntu-24.04`（x86_64）与 `ubuntu-24.04-arm`（aarch64）各产一个 AppImage。
 - `release`：合并 artifact，附加 `install-linux.sh`，创建 Release。

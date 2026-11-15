@@ -35,7 +35,8 @@ packaging\windows\build_installer.bat 1.0.0
 
 脚本按 `PROCESSOR_ARCHITECTURE` 自动判定 x64 / ARM64（可用 `set RE_ARCH=x64` 覆盖），
 编译、暂存载荷并输出到 `dist\`。CI 里改用 `make_installers.bat <版本> <x64 exe> <arm64 exe>`，
-一次产出上面三个安装包；ARM64 载荷由 `llvm-mingw-aarch64.cmake` 交叉编译得到。
+一次产出上面三个安装包；两份载荷都由 llvm-mingw 编出，分别使用
+`llvm-mingw-x86_64.cmake` 与 `llvm-mingw-aarch64.cmake` 工具链文件，不依赖 Visual Studio。
 
 > `installer.nsi` 必须是 **带 BOM 的 UTF-8**：NSIS 3 默认按系统 ANSI 代码页读脚本，
 > 没有 BOM 时中文菜单文字会报 `Bad text encoding`。

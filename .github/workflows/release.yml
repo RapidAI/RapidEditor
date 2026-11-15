@@ -43,9 +43,9 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Building RapidEditor $V"
 
-  # One job produces the x64, arm64 and universal NSIS installers. The ARM64
-  # payload is cross-compiled with llvm-mingw, so no ARM64 Windows runner is
-  # required and a single universal installer can adapt at install time.
+  # One job produces the x64, arm64 and universal NSIS installers. Both
+  # payloads come from llvm-mingw (a single toolchain targeting all four
+  # Windows architectures), so no Visual Studio or ARM64 runner is needed.
   windows:
     needs: meta
     runs-on: windows-latest
@@ -66,17 +66,7 @@ jobs:
           }
           & (Join-Path $nsis 'makensis.exe') -VERSION
 
-      - name: Build x64 payload (MSVC)
-        shell: pwsh
-        run: |
-          cmake -S . -B build-win-x64 -G "Visual Studio 17 2022" -A x64
-          cmake --build build-win-x64 --config Release --parallel
-          if (-not (Test-Path 'build-win-x64/Release/RapidEditor.exe')) {
-            throw 'x64 build did not produce RapidEditor.exe'
-          }
-
-      - name: Set up llvm-mingw (ARM64 cross toolchain)
-        continue-on-error: true
+      - name: Set up llvm-mingw (x64 + ARM64 toolchain)
         shell: pwsh
         run: |
           $rel = Invoke-RestMethod -Headers @{ 'User-Agent' = 'RapidEditor-CI' } `
@@ -88,10 +78,21 @@ jobs:
           Expand-Archive -Path llvm-mingw.zip -DestinationPath llvm-mingw -Force
           $root = (Get-ChildItem -Path llvm-mingw -Directory | Select-Object -First 1).FullName
           $bin = Join-Path $root 'bin'
-          if (-not (Test-Path (Join-Path $bin 'aarch64-w64-mingw32-clang.exe'))) {
-            throw "aarch64-w64-mingw32-clang.exe not found in $bin"
+          foreach ($cc in @('x86_64-w64-mingw32-clang.exe', 'aarch64-w64-mingw32-clang.exe')) {
+            if (-not (Test-Path (Join-Path $bin $cc))) { throw "$cc not found in $bin" }
           }
           $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build x64 payload
+        shell: pwsh
+        run: |
+          $tc = Join-Path (Get-Location) 'packaging/windows/llvm-mingw-x86_64.cmake'
+          cmake -S . -B build-win-x64 -G Ninja "-DCMAKE_TOOLCHAIN_FILE=$tc" `
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-win-x64 --parallel
+          if (-not (Test-Path 'build-win-x64/RapidEditor.exe')) {
+            throw 'x64 build did not produce RapidEditor.exe'
+          }
 
       - name: Build ARM64 payload (cross)
         id: arm64
@@ -109,7 +110,7 @@ jobs:
       - name: Create NSIS installers
         shell: pwsh
         run: |
-          $x64 = Join-Path (Get-Location) 'build-win-x64/Release/RapidEditor.exe'
+          $x64 = Join-Path (Get-Location) 'build-win-x64/RapidEditor.exe'
           $arm = Join-Path (Get-Location) 'build-win-arm64/RapidEditor.exe'
           if (-not (Test-Path $arm)) {
             Write-Warning 'ARM64 cross build unavailable; producing x64-only installer.'
