@@ -31,6 +31,7 @@
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -53,6 +54,14 @@
 #define NP_DIR_MAX    400                              /* entries in the directory pane */
 #define NP_LOG_MAX    120                              /* lines kept in the output log */
 #define NP_HIT_MAX    300                              /* find results shown */
+#define NP_SESSION_MAX 16                              /* files restored from last run */
+#define NP_FF_DIR_MAX  64                              /* directories scanned per search */
+#define NP_FF_FILE_MAX 64                              /* file paths kept in results */
+#define NP_FF_MAX      400                             /* find-in-files result lines */
+#define NP_FF_SCAN_MAX 4000                            /* files opened at most per search */
+#define NP_FF_BYTES    (2 * 1024 * 1024)               /* per-file scan limit */
+#define NP_FF_ROW_MAX  512                             /* entries read per directory */
+#define NP_TL_MAX      8192                            /* lines per text transform */
 
 /* CUI stores an editor's caret/selection/undo history in its state table under
  * cui_make_id(id) ^ CUI__ED_SALT (see CUI/src/cui_editor.c). States untouched
@@ -206,6 +215,15 @@ typedef struct np_hit {
     char text[160];
 } np_hit;
 
+/* One matching line reported by "find in files". `file` indexes ff_paths,
+ * or is -1 when the file table is full (line kept only as a count). */
+typedef struct np_fhit {
+    int file;
+    int line;
+    int col;
+    char text[160];
+} np_fhit;
+
 typedef struct notepad {
     np_doc *docs[NP_DOC_MAX];
     int  count, active;
@@ -251,6 +269,26 @@ typedef struct notepad {
     np_hit hits[NP_HIT_MAX];
     int  hit_count;
     uint64_t hits_rev, hits_key;
+
+    /* EditPlus-style find in files ------------------------------------ */
+    bool dlg_find_files;
+    bool ff_case;
+    char ff_query[256];
+    char ff_pattern[256];
+    char ff_dir[NP_PATH_CAP];
+    char ff_paths[NP_FF_FILE_MAX][NP_PATH_CAP];
+    int  ff_count;                  /* files with at least one hit */
+    int  ff_files_seen;             /* files scanned in the last run */
+    int  ff_dirs_seen;              /* directories visited in the last run */
+    np_fhit ff_hits[NP_FF_MAX];
+    int  ff_hit_count;
+
+    /* Persisted between runs (config file) ----------------------------- */
+    char session[NP_SESSION_MAX][NP_PATH_CAP];
+    int  session_count;
+    bool make_backup;               /* keep a .bak copy when saving */
+    bool session_restore;           /* reopen last session at startup */
+    bool dark_valid;                /* dark came from the config file */
 } notepad;
 
 static notepad g;
@@ -287,7 +325,7 @@ static void np_logf(notepad *a, const char *fmt, ...) {
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto ||
-           a->dlg_help || a->dlg_about || a->dlg_lang;
+           a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files;
 }
 
 static np_doc *np_cur(notepad *a) {
@@ -718,8 +756,15 @@ static bool np_load_into(notepad *a, np_doc *d, const char *path) {
     return true;
 }
 
+/* Defined with the EditPlus-style additions further down. */
+static bool np_file_exists(const char *path);
+static void np_backup_file(const char *path);
+static void np_ff_run(notepad *a);
+
 static bool np_save(notepad *a, np_doc *d, const char *path) {
     size_t n = (size_t)d->len;
+    /* EditPlus-style backup: keep the previous content as path.bak. */
+    if (a->make_backup && np_file_exists(path)) np_backup_file(path);
     FILE *f = np_fopen_utf8(path, "wb");
     if (!f) {
         np_toast(a, "无法保存文件", path, CUI_TONE_DANGER);
@@ -1154,6 +1199,41 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
+    cui_dialog(ui, "在文件中查找", &a->dlg_find_files,
+               .description = "在目录里的所有文件中搜索文字", .width = 480) {
+        cui_column(ui, .width = CUI_FILL, .gap = 10) {
+            cui_input(ui, "ff-query", a->ff_query, sizeof a->ff_query,
+                      .label = "查找", .placeholder = "要查找的内容",
+                      .width = CUI_FILL, .autofocus = true);
+            cui_input(ui, "ff-dir", a->ff_dir, sizeof a->ff_dir,
+                      .label = "目录", .placeholder = "搜索的文件夹",
+                      .width = CUI_FILL);
+            cui_input(ui, "ff-pattern", a->ff_pattern, sizeof a->ff_pattern,
+                      .label = "文件类型", .placeholder = "例如 *.c;*.h（留空=全部文件）",
+                      .width = CUI_FILL);
+            cui_checkbox(ui, "区分大小写", &a->ff_case);
+            cui_text(ui, "自动跳过 .git、node_modules、build 等构建目录。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) a->dlg_find_files = false;
+            if (cui_button(ui, "搜索", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->ff_query[0])) {
+                np_ff_run(a);
+                a->show_output = true;
+                a->out_tab = 2;
+                a->dlg_find_files = false;
+                char msg[160];
+                snprintf(msg, sizeof msg, "扫描 %d 个目录 / %d 个文件，找到 %d 处",
+                         a->ff_dirs_seen, a->ff_files_seen, a->ff_hit_count);
+                np_logf(a, "文件搜索  “%s” 于 %s  ·  %s",
+                        a->ff_query, a->ff_dir, msg);
+                np_toast(a, a->ff_hit_count ? "文件搜索完成" : "没有找到匹配", msg,
+                         a->ff_hit_count ? CUI_TONE_SUCCESS : CUI_TONE_WARNING);
+            }
+        }
+    }
+
     cui_dialog(ui, "转到行", &a->dlg_goto,
                .description = "输入行号，或 行:列", .width = 360) {
         int flags = cui_input(ui, "goto-line", a->goto_buf, sizeof a->goto_buf,
@@ -1206,12 +1286,15 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "Ctrl Q          退出",
             "Ctrl F          查找（编辑器内置查找栏）",
             "Ctrl H          查找和替换",
+            "Ctrl Shift F    在文件中查找（目录搜索）",
+            "Ctrl Shift L    在当前文件中列出所有匹配行",
             "Ctrl G          转到行",
             "F5              插入日期和时间",
             "Ctrl Z / Y      撤销 / 重做",
             "Ctrl +/-        放大 / 缩小编辑器字号，Ctrl 0 重置",
             "Alt             激活菜单栏，方向键选择菜单项",
-            "编辑器内：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Tab 缩进"
+            "编辑器内：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Tab 缩进",
+            "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、括号跳转"
         };
         cui_column(ui, .width = CUI_FILL, .gap = 5) {
             for (size_t i = 0; i < sizeof lines / sizeof lines[0]; i++)
@@ -1280,6 +1363,10 @@ static void np_dir_join(char *out, size_t cap, const char *dir, const char *name
 }
 
 static void np_init_side_dir(notepad *a) {
+    if (a->side_dir[0]) {               /* restored from the config file */
+        a->side_reload = true;
+        return;
+    }
 #ifdef _WIN32
     wchar_t w[1024];
     DWORD n = GetCurrentDirectoryW(1024, w);
@@ -1327,10 +1414,587 @@ static void np_dir_refresh(notepad *a) {
     a->side_reload = false;
 }
 
+/* ------------------------------------------------------------------ */
+/* EditPlus-style additions: find in files, text transforms, cliptext,  */
+/* config persistence, backup and "open with system"                    */
+/* ------------------------------------------------------------------ */
+
+enum { TR_UPPER = 0, TR_LOWER, TR_SORT, TR_UNIQ, TR_STRIP, TR_NOEMPTY };
+
+static bool np_file_exists(const char *path) {
+#ifdef _WIN32
+    wchar_t w[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048) <= 0) return false;
+    struct _stat st;
+    return _wstat(w, &st) == 0;
+#else
+    struct stat st;
+    return stat(path, &st) == 0;
+#endif
+}
+
+/* ---- find in files ------------------------------------------------ */
+
+/* A single "pat" with '*' wildcards, case-insensitive. */
+static bool np_wild(const char *pat, const char *s) {
+    const char *star = NULL, *mark = NULL;
+    while (*s) {
+        if (*pat == '*') { star = ++pat; mark = s; }
+        else if (*pat && tolower((unsigned char)*pat) == tolower((unsigned char)*s)) {
+            pat++; s++;
+        } else if (star) {
+            pat = star; s = ++mark;
+        } else return false;
+    }
+    while (*pat == '*') pat++;
+    return !*pat;
+}
+
+/* ';'-separated patterns like "*.c;*.h". Empty means "every file". */
+static bool np_pattern_match(const char *pats, const char *name) {
+    if (!pats[0]) return true;
+    char buf[128];
+    const char *p = pats;
+    while (*p) {
+        const char *e = strchr(p, ';');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l < sizeof buf) {
+            memcpy(buf, p, l); buf[l] = 0;
+            if (np_wild(buf, name)) return true;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    return false;
+}
+
+/* Directories whose contents are skipped during a find-in-files sweep. */
+static const char *NP_FF_SKIP[] = {
+    ".git", ".svn", ".hg", ".idea", ".vs", "node_modules", "__pycache__",
+    ".venv", "venv", "build", "dist", "target", "Debug", "Release", NULL
+};
+
+/* Scan one file for the current query, appending hits (one per line). */
+static void np_ff_scan_file(notepad *a, const char *dir, const char *name) {
+    static char *ffbuf;                 /* reused across calls */
+    if (!ffbuf) {
+        ffbuf = (char *)malloc(NP_FF_BYTES + 1);
+        if (!ffbuf) return;
+    }
+    char full[NP_PATH_CAP];
+    np_dir_join(full, sizeof full, dir, name);
+    FILE *f = np_fopen_utf8(full, "rb");
+    if (!f) return;
+    size_t n = fread(ffbuf, 1, NP_FF_BYTES, f);
+    fclose(f);
+    ffbuf[n] = 0;
+    if (memchr(ffbuf, 0, n)) return;    /* binary: skip silently */
+
+    size_t qlen = strlen(a->ff_query);
+    int file_idx = -1;
+    bool overflow = false;
+    int line = 1, hit_line = 0;
+    size_t ls = 0;
+    for (size_t i = 0; i + qlen <= n; i++) {
+        if (np_match(ffbuf + i, a->ff_query, qlen, a->ff_case) && line != hit_line) {
+            hit_line = line;
+            if (file_idx < 0) {
+                if (a->ff_count < NP_FF_FILE_MAX) {
+                    file_idx = a->ff_count++;
+                    snprintf(a->ff_paths[file_idx], NP_PATH_CAP, "%s", full);
+                } else {
+                    overflow = true;
+                }
+            }
+            if (!overflow && a->ff_hit_count < NP_FF_MAX) {
+                np_fhit *h = &a->ff_hits[a->ff_hit_count++];
+                h->file = file_idx;
+                h->line = line;
+                h->col = (int)(i - ls) + 1;
+                size_t s2 = ls;
+                while (s2 < i && (ffbuf[s2] == ' ' || ffbuf[s2] == '\t')) s2++;
+                size_t e2 = s2;
+                while (e2 < n && ffbuf[e2] != '\n' && e2 - s2 < 140) e2++;
+                while (e2 > s2 && ((unsigned char)ffbuf[e2 - 1] & 0xC0) == 0x80) e2--;
+                snprintf(h->text, sizeof h->text, "%.*s", (int)(e2 - s2), ffbuf + s2);
+            }
+        }
+        if (ffbuf[i] == '\n') { line++; ls = i + 1; hit_line = 0; }
+        if (a->ff_hit_count >= NP_FF_MAX) break;
+    }
+}
+
+/* Breadth-first sweep of ff_dir. Stops at the result/file ceilings. */
+static void np_ff_run(notepad *a) {
+    a->ff_count = 0;
+    a->ff_hit_count = 0;
+    a->ff_files_seen = 0;
+    a->ff_dirs_seen = 0;
+    if (!a->ff_query[0]) return;
+
+    char dirs[NP_FF_DIR_MAX][NP_PATH_CAP];
+    snprintf(dirs[0], NP_PATH_CAP, "%s", a->ff_dir[0] ? a->ff_dir : ".");
+    int nd = 1, head = 0;
+
+    while (head < nd && a->ff_hit_count < NP_FF_MAX &&
+           a->ff_files_seen < NP_FF_SCAN_MAX) {
+        char dir[NP_PATH_CAP];
+        snprintf(dir, sizeof dir, "%s", dirs[head++]);
+        a->ff_dirs_seen++;
+
+        cui_file_entry ents[NP_FF_ROW_MAX];
+        static char names[NP_FF_ROW_MAX * 256];
+        int n = cui_fs_list(NULL, dir, ents, NP_FF_ROW_MAX,
+                            names, sizeof names, false);
+        if (n < 0) continue;
+        for (int i = 0; i < n; i++) {
+            if (a->ff_hit_count >= NP_FF_MAX ||
+                a->ff_files_seen >= NP_FF_SCAN_MAX) break;
+            if (ents[i].dir) {
+                bool skip = false;
+                for (int k = 0; NP_FF_SKIP[k]; k++)
+                    if (strcmp(ents[i].name, NP_FF_SKIP[k]) == 0) { skip = true; break; }
+                if (skip) continue;
+                if (nd < NP_FF_DIR_MAX)
+                    np_dir_join(dirs[nd++], NP_PATH_CAP, dir, ents[i].name);
+                continue;
+            }
+            if (!np_pattern_match(a->ff_pattern, ents[i].name)) continue;
+            a->ff_files_seen++;
+            np_ff_scan_file(a, dir, ents[i].name);
+            if (a->ff_hit_count >= NP_FF_MAX) break;
+        }
+    }
+}
+
+/* Jump to a find-in-files result: open the file and go to the line. */
+static void np_open_fhit(notepad *a, int idx) {
+    if (idx < 0 || idx >= a->ff_hit_count) return;
+    np_fhit *h = &a->ff_hits[idx];
+    if (h->file < 0 || h->file >= a->ff_count) return;
+    if (!np_open_path(a, a->ff_paths[h->file], true)) return;
+    np_doc *d = np_cur(a);
+    if (d) cui_code_editor_goto(a->ui, d->editor_id, h->line, h->col);
+}
+
+/* ---- text transforms ---------------------------------------------- */
+
+/* Replace [s,e) with `ins` in one undoable-ish edit and place the caret. */
+static void np_splice(notepad *a, np_doc *d, int s, int e,
+                      const char *ins, size_t n) {
+    int len = d->len;
+    s = NP_MAX(0, NP_MIN(s, len));
+    e = NP_MAX(s, NP_MIN(e, len));
+    if (!np_ensure_cap(d, (size_t)len - (size_t)(e - s) + n + 1)) {
+        np_toast(a, "文本已满", "已达到 256 MB 上限", CUI_TONE_WARNING);
+        return;
+    }
+    memmove(d->text + s + (int)n, d->text + e, (size_t)(len - e) + 1);
+    if (n) memcpy(d->text + s, ins, n);
+    np_text_changed(a, d);
+    cui_code_editor_select(a->ui, d->editor_id, s + (int)n, s + (int)n);
+}
+
+/* Current selection, if any. */
+static bool np_selection(const np_doc *d, int *out_s, int *out_e) {
+    if (d->caret == d->anchor) return false;
+    int s = NP_MIN(d->caret, d->anchor), e = NP_MAX(d->caret, d->anchor);
+    int len = d->len;
+    s = NP_MAX(0, NP_MIN(s, len));
+    e = NP_MAX(s, NP_MIN(e, len));
+    if (s == e) return false;
+    *out_s = s; *out_e = e;
+    return true;
+}
+
+/* Whole lines covering the selection, or the caret's line. The range
+ * always includes the trailing newline when the line has one. */
+static bool np_line_range(const np_doc *d, int *out_s, int *out_e) {
+    int len = d->len;
+    int s, e;
+    if (d->caret != d->anchor) {
+        s = NP_MIN(d->caret, d->anchor);
+        e = NP_MAX(d->caret, d->anchor);
+        s = NP_MAX(0, NP_MIN(s, len));
+        e = NP_MAX(s, NP_MIN(e, len));
+    } else {
+        s = e = NP_MAX(0, NP_MIN(d->caret, len));
+    }
+    while (s > 0 && d->text[s - 1] != '\n') s--;
+    while (e < len && d->text[e] != '\n') e++;
+    if (e < len) e++;
+    if (s >= e) return false;
+    *out_s = s; *out_e = e;
+    return true;
+}
+
+static bool np_is_word(unsigned char c) {
+    return c >= 0x80 || isalnum(c) || c == '_';
+}
+
+/* Uppercase / lowercase the selection, or the word under the caret. */
+static void np_case_transform(notepad *a, np_doc *d, bool upper) {
+    int s, e;
+    if (!np_selection(d, &s, &e)) {
+        int i = NP_MAX(0, NP_MIN(d->caret, d->len));
+        s = i;
+        while (s > 0 && np_is_word((unsigned char)d->text[s - 1])) s--;
+        e = i;
+        while (e < d->len && np_is_word((unsigned char)d->text[e])) e++;
+        if (s == e) {
+            np_toast(a, "没有可转换的文字", "选中一段文字，或把光标放在单词上",
+                     CUI_TONE_INFO);
+            return;
+        }
+    }
+    if (!np_ensure_tmp(d, (size_t)(e - s) + 1)) return;
+    for (int i = s; i < e; i++) {
+        unsigned char c = (unsigned char)d->text[i];
+        d->tmp[i - s] = c < 0x80 ? (char)(upper ? toupper(c) : tolower(c)) : (char)c;
+    }
+    np_splice(a, d, s, e, d->tmp, (size_t)(e - s));
+}
+
+static int np_row_cmp(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+/* Sort / dedupe / trim / remove empty lines. Sort and dedupe need a
+ * selection; trim and remove-empty fall back to the whole document. */
+static void np_line_transform(notepad *a, np_doc *d, int mode) {
+    int ls, le;
+    if (!np_line_range(d, &ls, &le)) {
+        np_toast(a, "没有可处理的行", "文档为空", CUI_TONE_INFO);
+        return;
+    }
+    if (d->caret == d->anchor) {
+        if (mode == TR_SORT || mode == TR_UNIQ) {
+            np_toast(a, "先选中要处理的行", "排序与去重作用于选中的行", CUI_TONE_INFO);
+            return;
+        }
+        ls = 0; le = d->len;                /* whole document */
+    }
+    int span = le - ls;
+    if (!np_ensure_tmp(d, (size_t)span + 2)) {
+        np_toast(a, "内存不足", "无法分配转换缓冲区", CUI_TONE_WARNING);
+        return;
+    }
+    char *work = d->tmp;
+    memcpy(work, d->text + ls, (size_t)span);
+    work[span] = 0;
+    int nlines = 1;
+    for (int i = 0; i < span; i++)
+        if (work[i] == '\n') nlines++;
+    if (nlines > NP_TL_MAX) {
+        np_toast(a, "选区太大", "最多支持 8192 行", CUI_TONE_WARNING);
+        return;
+    }
+    char *rows[NP_TL_MAX];
+    int nr = 0;
+    rows[nr++] = work;
+    for (int i = 0; i < span; i++)
+        if (work[i] == '\n') { work[i] = 0; rows[nr++] = work + i + 1; }
+
+    if (mode == TR_SORT) {
+        qsort(rows, (size_t)nr, sizeof rows[0], np_row_cmp);
+    } else if (mode == TR_UNIQ) {
+        int w = 1;
+        for (int i = 1; i < nr; i++)
+            if (strcmp(rows[i], rows[w - 1]) != 0) rows[w++] = rows[i];
+        nr = w;
+    } else if (mode == TR_STRIP) {
+        for (int i = 0; i < nr; i++) {
+            size_t l = strlen(rows[i]);
+            while (l && (rows[i][l - 1] == ' ' || rows[i][l - 1] == '\t'))
+                rows[i][--l] = 0;
+        }
+    } else if (mode == TR_NOEMPTY) {
+        int w = 0;
+        for (int i = 0; i < nr; i++)
+            if (rows[i][0]) rows[w++] = rows[i];
+        nr = w;
+    }
+
+    bool had_nl = d->text[le - 1] == '\n';
+    size_t total = 0;
+    for (int i = 0; i < nr; i++) total += strlen(rows[i]) + 1;
+    if (nr && !had_nl) total--;
+    char *join = (char *)malloc(total + 1);
+    if (!join) {
+        np_toast(a, "内存不足", "无法分配转换缓冲区", CUI_TONE_WARNING);
+        return;
+    }
+    size_t o = 0;
+    for (int i = 0; i < nr; i++) {
+        size_t l = strlen(rows[i]);
+        memcpy(join + o, rows[i], l);
+        o += l;
+        if (i + 1 < nr || had_nl) join[o++] = '\n';
+    }
+    join[o] = 0;
+    np_splice(a, d, ls, le, join, o);
+    free(join);
+}
+
+/* Jump between matching (), [] and {} around the caret. */
+static void np_goto_bracket(notepad *a, np_doc *d) {
+    static const char open[] = "([{", close[] = ")]}";
+    int len = d->len;
+    if (!len) return;
+    int pos = -1;
+    for (int k = 0; k < 2 && pos < 0; k++)
+        if (d->caret + k < len && strchr("([{)]}", d->text[d->caret + k]))
+            pos = d->caret + k;
+    if (pos < 0 && d->caret > 0 && strchr("([{)]}", d->text[d->caret - 1]))
+        pos = d->caret - 1;
+    if (pos < 0) {
+        np_toast(a, "光标附近没有括号", "把光标放在 ( [ { ) ] } 上再试",
+                 CUI_TONE_INFO);
+        return;
+    }
+    char c = d->text[pos];
+    int depth = 0, match = -1;
+    const char *io = strchr(open, c);
+    if (io) {
+        char want = close[io - open];
+        for (int i = pos; i < len && match < 0; i++) {
+            char t = d->text[i];
+            if (t == c) depth++;
+            else if (t == want && --depth == 0) match = i;
+        }
+    } else {
+        char want = open[strchr(close, c) - close];
+        for (int i = pos; i >= 0 && match < 0; i--) {
+            char t = d->text[i];
+            if (t == c) depth++;
+            else if (t == want && --depth == 0) match = i;
+        }
+    }
+    if (match < 0) {
+        np_toast(a, "没有找到配对的括号", "括号不匹配或未闭合", CUI_TONE_INFO);
+        return;
+    }
+    cui_code_editor_select(a->ui, d->editor_id, pos, match + 1);
+}
+
+/* ---- cliptext (snippet library) ------------------------------------ */
+
+typedef struct np_clip {
+    const char *group;
+    const char *label;
+    const char *text;
+} np_clip;
+
+static const np_clip NP_CLIPS[] = {
+    { "通用", "分隔线", "/* ------------------------------------------------------------------ */" },
+    { "通用", "TODO 注释", "// TODO: " },
+    { "通用", "文件头注释", "/* 文件名：\n * 说明：\n * 日期：" },
+    { "HTML", "页面骨架",
+      "<!DOCTYPE html>\n<html lang=\"zh\">\n<head>\n  <meta charset=\"UTF-8\">\n  <title>标题</title>\n</head>\n<body>\n\n</body>\n</html>" },
+    { "HTML", "表格", "<table>\n  <tr><th>列</th></tr>\n  <tr><td>值</td></tr>\n</table>" },
+    { "HTML", "链接", "<a href=\"#\"></a>" },
+    { "C", "main 函数", "int main(int argc, char **argv) {\n\n    return 0;\n}" },
+    { "C", "for 循环", "for (int i = 0; i < n; i++) {\n\n}" },
+    { "C", "函数模板", "static int func(int x) {\n\n}" },
+    { "Python", "main 入口", "def main():\n    pass\n\n\nif __name__ == \"__main__\":\n    main()" },
+    { "Python", "class 模板", "class Name:\n    def __init__(self):\n        pass" },
+    { "Python", "try/except", "try:\n    pass\nexcept Exception as e:\n    print(e)" },
+    { "Shell", "脚本头", "#!/bin/sh\nset -e" },
+    { "Shell", "case 分支", "case \"$1\" in\n    start)\n        ;;\n    *)\n        ;;\nesac" },
+};
+#define NP_CLIP_COUNT ((int)(sizeof NP_CLIPS / sizeof NP_CLIPS[0]))
+
+/* ---- config file (settings, recents, session) ----------------------- */
+
+static void np_config_dir(char *out, size_t cap) {
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (!base || !*base) base = getenv("USERPROFILE");
+    if (!base || !*base) base = ".";
+    snprintf(out, cap, "%s\\RapidEditor", base);
+    wchar_t w[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, out, -1, w, 2048) > 0)
+        CreateDirectoryW(w, NULL);      /* fails harmlessly if it exists */
+#else
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) snprintf(out, cap, "%s/rapideditor", xdg);
+    else {
+        const char *h = getenv("HOME");
+        if (!h || !*h) h = ".";
+        snprintf(out, cap, "%s/.config/rapideditor", h);
+    }
+    mkdir(out, 0755);                   /* fails harmlessly if it exists */
+#endif
+}
+
+static void np_config_path(char *out, size_t cap) {
+    char dir[NP_PATH_CAP];
+    np_config_dir(dir, sizeof dir);
+#ifdef _WIN32
+    snprintf(out, cap, "%s\\config.ini", dir);
+#else
+    snprintf(out, cap, "%s/config.ini", dir);
+#endif
+}
+
+static void np_config_load(notepad *a) {
+    char path[NP_PATH_CAP];
+    np_config_path(path, sizeof path);
+    FILE *f = np_fopen_utf8(path, "rb");
+    if (!f) return;
+    char line[NP_PATH_CAP + 128];
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        char *eq = strchr(line, '=');
+        if (!eq || eq == line) continue;
+        *eq = 0;
+        const char *key = line, *val = eq + 1;
+        if (!strcmp(key, "dark")) {
+            a->dark = atoi(val) != 0;
+            a->dark_valid = true;
+        } else if (!strcmp(key, "accent")) {
+            int v = atoi(val);
+            if (v >= 0 && v < CUI_ACCENT_COUNT) a->accent = v;
+        } else if (!strcmp(key, "font")) {
+            int v = atoi(val);
+            if (v >= NP_FONT_MIN && v <= NP_FONT_MAX) a->font_size = v;
+        } else if (!strcmp(key, "line_numbers")) a->line_numbers = atoi(val) != 0;
+        else if (!strcmp(key, "show_status")) a->show_status = atoi(val) != 0;
+        else if (!strcmp(key, "show_sidebar")) a->show_sidebar = atoi(val) != 0;
+        else if (!strcmp(key, "show_output")) a->show_output = atoi(val) != 0;
+        else if (!strcmp(key, "follow_active")) a->follow_active = atoi(val) != 0;
+        else if (!strcmp(key, "default_crlf")) a->default_crlf = atoi(val) != 0;
+        else if (!strcmp(key, "make_backup")) a->make_backup = atoi(val) != 0;
+        else if (!strcmp(key, "session_restore")) a->session_restore = atoi(val) != 0;
+        else if (!strcmp(key, "match_case")) a->match_case = atoi(val) != 0;
+        else if (!strcmp(key, "find")) snprintf(a->find_query, sizeof a->find_query, "%s", val);
+        else if (!strcmp(key, "replace")) snprintf(a->replace_with, sizeof a->replace_with, "%s", val);
+        else if (!strcmp(key, "workdir")) np_dir_set(a, val);
+        else if (!strncmp(key, "recent", 6)) {
+            int i = atoi(key + 6);
+            if (i >= 0 && i < NP_RECENT_MAX && val[0]) {
+                snprintf(a->recent[i], NP_PATH_CAP, "%s", val);
+                if (i + 1 > a->recent_count) a->recent_count = i + 1;
+            }
+        } else if (!strncmp(key, "session", 7)) {
+            int i = atoi(key + 7);
+            if (i >= 0 && i < NP_SESSION_MAX && val[0]) {
+                snprintf(a->session[i], NP_PATH_CAP, "%s", val);
+                if (i + 1 > a->session_count) a->session_count = i + 1;
+            }
+        }
+    }
+    fclose(f);
+}
+
+/* Called once when the app loop exits (any exit path: menu, window close). */
+static void np_config_save(notepad *a) {
+    char path[NP_PATH_CAP];
+    np_config_path(path, sizeof path);
+    FILE *f = np_fopen_utf8(path, "wb");
+    if (!f) return;
+    a->session_count = 0;
+    for (int i = 0; i < a->count && a->session_count < NP_SESSION_MAX; i++) {
+        np_doc *d = a->docs[i];
+        if (d->path[0] && !d->dirty)
+            snprintf(a->session[a->session_count++], NP_PATH_CAP, "%s", d->path);
+    }
+    fprintf(f, "dark=%d\naccent=%d\nfont=%d\n",
+            a->dark ? 1 : 0, a->accent, a->font_size);
+    fprintf(f, "line_numbers=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n",
+            a->line_numbers ? 1 : 0, a->show_status ? 1 : 0,
+            a->show_sidebar ? 1 : 0, a->show_output ? 1 : 0);
+    fprintf(f, "follow_active=%d\ndefault_crlf=%d\nmake_backup=%d\n"
+               "session_restore=%d\nmatch_case=%d\n",
+            a->follow_active ? 1 : 0, a->default_crlf ? 1 : 0,
+            a->make_backup ? 1 : 0, a->session_restore ? 1 : 0,
+            a->match_case ? 1 : 0);
+    fprintf(f, "find=%s\nreplace=%s\nworkdir=%s\n",
+            a->find_query, a->replace_with, a->side_dir);
+    for (int i = 0; i < a->recent_count; i++)
+        fprintf(f, "recent%d=%s\n", i, a->recent[i]);
+    for (int i = 0; i < a->session_count; i++)
+        fprintf(f, "session%d=%s\n", i, a->session[i]);
+    fclose(f);
+}
+
+/* ---- backup & system open ------------------------------------------- */
+
+/* Copy `path` to `path.bak` before it is overwritten by a save. */
+static void np_backup_file(const char *path) {
+    char bak[NP_PATH_CAP];
+    snprintf(bak, sizeof bak, "%s.bak", path);
+    FILE *in = np_fopen_utf8(path, "rb");
+    if (!in) return;
+    FILE *out = np_fopen_utf8(bak, "wb");
+    if (!out) { fclose(in); return; }
+    char chunk[64 * 1024];
+    size_t m;
+    while ((m = fread(chunk, 1, sizeof chunk, in)) > 0)
+        fwrite(chunk, 1, m, out);
+    fclose(in);
+    fclose(out);
+}
+
+/* Single-quote for sh; Windows goes through ShellExecuteW instead. */
+static void np_shell_quote(const char *s, char *out, size_t cap) {
+    size_t o = 0;
+    if (o < cap) out[o++] = '\'';
+    for (; *s && o + 5 < cap; s++) {
+        if (*s == '\'') {
+            out[o++] = '\''; out[o++] = '\\'; out[o++] = '\''; out[o++] = '\'';
+        } else {
+            out[o++] = *s;
+        }
+    }
+    if (o < cap) out[o++] = '\'';
+    out[o] = 0;
+}
+
+/* Open with the system default program, or reveal the file in its folder. */
+static void np_system_open(notepad *a, const char *path, bool locate) {
+    if (!path || !path[0]) return;
+#ifdef _WIN32
+    wchar_t w[2048], params[2200];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048) <= 0) return;
+    if (locate) {
+        lstrcpynW(params, L"/select,\"", 2100);
+        lstrcatW(params, w);
+        lstrcatW(params, L"\"");
+        ShellExecuteW(NULL, L"open", L"explorer.exe", params, NULL, SW_SHOWNORMAL);
+    } else {
+        ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+    }
+#else
+    char q[NP_PATH_CAP + 8], cmd[NP_PATH_CAP * 2 + 64];
+    if (locate) {
+        char dir[NP_PATH_CAP];
+        np_dir_of(path, dir, sizeof dir);
+        np_shell_quote(dir, q, sizeof q);
+#if defined(__APPLE__)
+        snprintf(cmd, sizeof cmd, "open -R %s", q);
+#else
+        snprintf(cmd, sizeof cmd, "xdg-open %s", q);
+#endif
+    } else {
+        np_shell_quote(path, q, sizeof q);
+#if defined(__APPLE__)
+        snprintf(cmd, sizeof cmd, "open %s", q);
+#else
+        snprintf(cmd, sizeof cmd, "xdg-open %s", q);
+#endif
+    }
+    if (system(cmd) == -1)
+        np_toast(a, "无法打开", "调用系统命令失败", CUI_TONE_DANGER);
+#endif
+    np_logf(a, "%s  %s", locate ? "定位到目录" : "系统打开", path);
+}
+
 static void np_sidebar(cui_ctx *ui, notepad *a) {
     if (a->side_reload) np_dir_refresh(a);
     np_doc *cur = np_cur(a);
-    static const char *tab_names[3] = { "目录", "文档", "最近" };
+    static const char *tab_names[4] = { "目录", "文档", "最近", "片段" };
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                .bg = CUI_COLOR_SURFACE_MUTED, .gap = 0, .pad = 0) {
@@ -1362,7 +2026,7 @@ static void np_sidebar(cui_ctx *ui, notepad *a) {
             }
         }
 
-        cui_tabs(ui, "side_tabs", tab_names, 3, &a->side_tab, .full_width = true);
+        cui_tabs(ui, "side_tabs", tab_names, 4, &a->side_tab, .full_width = true);
 
         if (a->side_tab == 0) {
             /* cui_text is plain text: it does not strip an "###id" suffix. */
@@ -1409,6 +2073,21 @@ static void np_sidebar(cui_ctx *ui, notepad *a) {
                     if (cui_list_item(ui, label, .icon = CUI_ICON_FILE_TEXT,
                                       .trailing = tail, .selected = (i == a->active)))
                         np_activate(a, i, true);
+                }
+            } else if (a->side_tab == 3) {
+                /* EditPlus's cliptext window: click a snippet to insert it. */
+                const char *last_group = NULL;
+                for (int i = 0; i < NP_CLIP_COUNT; i++) {
+                    const np_clip *c = &NP_CLIPS[i];
+                    if (last_group == NULL || strcmp(last_group, c->group) != 0) {
+                        last_group = c->group;
+                        cui_text(ui, c->group, .size = 11,
+                                 .color = CUI_COLOR_TEXT_MUTED, .nowrap = true);
+                    }
+                    char label[160];
+                    snprintf(label, sizeof label, "%s###clip%d", c->label, i);
+                    if (cui_list_item(ui, label, .icon = CUI_ICON_COPY))
+                        np_insert_at_caret(a, c->text);
                 }
             } else {
                 for (int i = 0; i < a->recent_count; i++) {
@@ -1480,14 +2159,21 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
             if (cui_button(ui, "查找结果", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_SEARCH,
                            .selected = a->out_tab == 0)) a->out_tab = 0;
+            if (cui_button(ui, "文件搜索", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_FOLDER_OPEN,
+                           .selected = a->out_tab == 2)) a->out_tab = 2;
             if (cui_button(ui, "消息", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_TERMINAL,
                            .selected = a->out_tab == 1)) a->out_tab = 1;
             cui_spacer(ui);
-            char info[128];
+            char info[192];
             if (a->out_tab == 0)
                 snprintf(info, sizeof info, "“%s”  %d 处",
                          a->find_query[0] ? a->find_query : "未设置查找词", a->hit_count);
+            else if (a->out_tab == 2)
+                snprintf(info, sizeof info, "“%s”  %d 处  ·  %d 个文件 / %d 个目录",
+                         a->ff_query[0] ? a->ff_query : "未设置查找词",
+                         a->ff_hit_count, a->ff_files_seen, a->ff_dirs_seen);
             else
                 snprintf(info, sizeof info, "%d 条", a->msg_count);
             cui_text(ui, info, .size = 11, .nowrap = true,
@@ -1495,6 +2181,7 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
             if (cui_icon_button(ui, CUI_ICON_TRASH_2, .size = CUI_SIZE_SM,
                                 .variant = CUI_BUTTON_GHOST, .tooltip = "清空")) {
                 if (a->out_tab == 1) a->msg_count = 0;
+                else if (a->out_tab == 2) { a->ff_hit_count = 0; a->ff_count = 0; }
                 else { a->hit_count = 0; a->hits_rev = 0; }
             }
             if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM,
@@ -1524,6 +2211,27 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                                           .trailing = num) && d)
                             cui_code_editor_select(a->ui, d->editor_id, h->offset,
                                                    h->offset + (int)strlen(a->find_query));
+                    }
+                }
+            } else if (a->out_tab == 2) {
+                if (!a->ff_query[0]) {
+                    cui_text(ui, "用「搜索 → 在文件中查找…」(Ctrl+Shift+F) 在整个目录里搜索文字。",
+                             .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                } else if (!a->ff_hit_count) {
+                    cui_text(ui, "没有找到匹配行。", .size = 12,
+                             .color = CUI_COLOR_TEXT_MUTED);
+                } else {
+                    for (int i = 0; i < a->ff_hit_count; i++) {
+                        np_fhit *h = &a->ff_hits[i];
+                        const char *fname = h->file >= 0 && h->file < a->ff_count
+                                            ? np_base(a->ff_paths[h->file]) : "?";
+                        char label[384], num[48];
+                        snprintf(label, sizeof label, "%s:%d: %s###ffhit%d",
+                                 fname, h->line, h->text, i);
+                        snprintf(num, sizeof num, "第 %d 行", h->line);
+                        if (cui_list_item(ui, label, .icon = CUI_ICON_SEARCH,
+                                          .trailing = num))
+                            np_open_fhit(a, i);
                     }
                 }
             } else {
@@ -1640,7 +2348,13 @@ static void np_frame(cui_ctx *ui, void *user) {
     if (!a->boot_done) {
         a->boot_done = true;
         np_load_fonts(ui, a);
-        a->dark = cui_get_theme_mode(ui) == CUI_THEME_DARK;
+        if (a->dark_valid) {            /* persisted choice wins over system */
+            cui_app_follow_system_theme(NULL, false);
+            cui_set_theme(ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
+        } else {
+            a->dark = cui_get_theme_mode(ui) == CUI_THEME_DARK;
+        }
+        cui_set_accent(ui, (cui_accent)a->accent);
 #ifdef _WIN32
         np_install_close_hook();
 #endif
@@ -1703,6 +2417,10 @@ static void np_frame(cui_ctx *ui, void *user) {
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) a->show_sidebar = !a->show_sidebar;
         if (cui_key_pressed(ui, CUI_KEY_F7)) a->show_output = !a->show_output;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) {
+            a->dlg_find_files = true;
+            if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
+        }
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_L)) {
             a->show_output = true;
             a->out_tab = 0;
             a->hits_rev = 0;
@@ -1781,6 +2499,22 @@ static void np_frame(cui_ctx *ui, void *user) {
                         np_insert_at_caret(a, stamp);
                 }
                 cui_menu_separator(ui);
+                cui_menu_label(ui, "转换");
+                if (cui_menu_item(ui, "转为大写", .icon = CUI_ICON_ARROW_UP))
+                    np_case_transform(a, d, true);
+                if (cui_menu_item(ui, "转为小写", .icon = CUI_ICON_ARROW_DOWN))
+                    np_case_transform(a, d, false);
+                if (cui_menu_item(ui, "排序选中的行 (A→Z)", .icon = CUI_ICON_LIST))
+                    np_line_transform(a, d, TR_SORT);
+                if (cui_menu_item(ui, "去除相邻重复行", .icon = CUI_ICON_CHECK_CHECK))
+                    np_line_transform(a, d, TR_UNIQ);
+                if (cui_menu_item(ui, "删除空行", .icon = CUI_ICON_MINUS))
+                    np_line_transform(a, d, TR_NOEMPTY);
+                if (cui_menu_item(ui, "剪裁行尾空白", .icon = CUI_ICON_SLIDERS_HORIZONTAL))
+                    np_line_transform(a, d, TR_STRIP);
+                if (cui_menu_item(ui, "转到匹配的括号", .icon = CUI_ICON_CHEVRONS_UP_DOWN))
+                    np_goto_bracket(a, d);
+                cui_menu_separator(ui);
                 if (cui_menu_item(ui, "清空内容", .icon = CUI_ICON_TRASH_2,
                                   .danger = true, .disabled = !d->text[0])) {
                     d->text[0] = 0;
@@ -1799,8 +2533,13 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "转到行…", .icon = CUI_ICON_ARROW_RIGHT, .shortcut = "Ctrl G"))
                     a->dlg_goto = true;
                 cui_menu_separator(ui);
-                if (cui_menu_item(ui, "在当前文件中查找", .icon = CUI_ICON_LIST,
+                if (cui_menu_item(ui, "在文件中查找…", .icon = CUI_ICON_FOLDER_OPEN,
                                   .shortcut = "Ctrl Shift F")) {
+                    a->dlg_find_files = true;
+                    if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
+                }
+                if (cui_menu_item(ui, "在当前文件中查找", .icon = CUI_ICON_LIST,
+                                  .shortcut = "Ctrl Shift L")) {
                     a->show_output = true;
                     a->out_tab = 0;
                     a->hits_rev = 0;
@@ -1813,7 +2552,23 @@ static void np_frame(cui_ctx *ui, void *user) {
                     a->msg_count = 0;
                     a->hit_count = 0;
                     a->hits_rev = 0;
+                    a->ff_hit_count = 0;
+                    a->ff_count = 0;
                 }
+            }
+
+            cui_menu_bar_menu(ui, "工具") {
+                if (cui_menu_item(ui, "用系统默认程序打开", .icon = CUI_ICON_EXTERNAL_LINK,
+                                  .disabled = !d->path[0]))
+                    np_system_open(a, d->path, false);
+                if (cui_menu_item(ui, "打开文件所在目录", .icon = CUI_ICON_FOLDER,
+                                  .disabled = !d->path[0]))
+                    np_system_open(a, d->path, true);
+                cui_menu_separator(ui);
+                if (cui_menu_item(ui, "保存时创建 .bak 备份", .checked = a->make_backup))
+                    a->make_backup = !a->make_backup;
+                if (cui_menu_item(ui, "启动时恢复上次会话", .checked = a->session_restore))
+                    a->session_restore = !a->session_restore;
             }
 
             cui_menu_bar_menu(ui, "视图") {
@@ -1921,12 +2676,17 @@ static void np_frame(cui_ctx *ui, void *user) {
                 np_open_find(a);
             if (cui_toolbar_button(ui, CUI_ICON_REFRESH_CW, .tooltip = "替换", .shortcut = "Ctrl H"))
                 a->dlg_replace = true;
-            if (cui_toolbar_button(ui, CUI_ICON_LIST, .tooltip = "在当前文件中查找…",
-                                   .shortcut = "Ctrl Shift F")) {
+            if (cui_toolbar_button(ui, CUI_ICON_LIST, .tooltip = "在当前文件中列出匹配",
+                                   .shortcut = "Ctrl Shift L")) {
                 a->show_output = true;
                 a->out_tab = 0;
                 a->hits_rev = 0;
                 if (!a->find_query[0]) np_open_find(a);
+            }
+            if (cui_toolbar_button(ui, CUI_ICON_FOLDER_OPEN, .tooltip = "在文件中查找…",
+                                   .shortcut = "Ctrl Shift F")) {
+                a->dlg_find_files = true;
+                if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
             }
             if (cui_toolbar_button(ui, CUI_ICON_CODE, .tooltip = "语法高亮语言…"))
                 np_open_lang_dialog(a);
@@ -2058,10 +2818,13 @@ int main(int argc, char **argv) {
     g.side_tab = 0;
     g.out_tab = 1;           /* start on the message log */
     g.last_active = -1;
+    g.make_backup = true;
+    g.session_restore = true;
 #ifdef _WIN32
     g.default_crlf = true;
 #endif
-    np_init_side_dir(&g);
+    np_config_load(&g);      /* overrides the defaults above, restores UI state */
+    np_init_side_dir(&g);    /* no-op when the config carried a workdir */
     np_doc_new(&g);          /* the initial empty tab */
 
 #ifdef _WIN32
@@ -2080,7 +2843,14 @@ int main(int argc, char **argv) {
         snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", argv[i]);
 #endif
 
-    return cui_app_run(&(cui_app_desc){
+    /* No files on the command line: reopen the last session (unsaved and
+     * untitled documents were never recorded, so nothing is lost). */
+    if (g.startup_count == 0 && g.session_restore) {
+        for (int i = 0; i < g.session_count && g.startup_count < NP_DOC_MAX; i++)
+            snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", g.session[i]);
+    }
+
+    int rc = cui_app_run(&(cui_app_desc){
         .title = "未命名 - RapidEditor",
         .width = 1120, .height = 760,
         .min_width = 620, .min_height = 460,
@@ -2088,4 +2858,6 @@ int main(int argc, char **argv) {
         .accent = CUI_ACCENT_BLUE,
         .follow_system_theme = true
     }, np_frame, &g);
+    np_config_save(&g);      /* settings, recents and the open-file session */
+    return rc;
 }

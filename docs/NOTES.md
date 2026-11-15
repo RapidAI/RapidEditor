@@ -67,3 +67,37 @@ ARM64 步骤带 `continue-on-error`，若交叉编译出问题仍会产出 x64 �
 `packaging/windows/installer.nsi` 必须是 **带 BOM 的 UTF-8**。NSIS 3 默认按系统 ANSI
 代码页读取 `.nsi`；没有 BOM 时中文菜单文字会报 `Bad text encoding`，在英文 runner 上同样如此。
 `.bat` 文件则刻意保持纯 ASCII，避免 cmd 代码页问题。
+
+## EditPlus 风格增强（第二轮）
+
+### 配置文件
+
+位置：Windows `%APPDATA%\RapidEditor\config.ini`；macOS
+`~/Library/Application Support/RapidEditor/config.ini`；Linux
+`$XDG_CONFIG_HOME/rapideditor/config.ini`（缺省 `~/.config/rapideditor`）。
+`np_config_load()` 在 `main()` 里任何 UI 初始化之前调用；`np_config_save()` 在
+`cui_app_run()` 返回后调用，所以菜单退出、窗口关闭（含 macOS 直接点红点）都会保存。
+`dark_valid` 标记配置里是否记录过主题：记录过就覆盖系统主题，否则跟随系统。
+
+会话恢复：保存时只记录**有路径且不脏**的文档；启动时命令行没有文件才恢复，
+命令行文件优先。所以未保存的内容永远不会被"恢复"出来，也不会丢。
+
+### 在文件中查找
+
+目录遍历直接用 CUI 的 `cui_fs_list`（它内部已处理 Windows 宽字符路径），不再自写
+dirent / FindFirstFileW。BFS 队列上限 64 个目录、每目录 512 项；结果上限 400 行、
+64 个文件、扫描 4000 个文件、单文件 2 MB；含 NUL 的文件按二进制跳过。每行只记第一条
+命中。点击结果 → `np_open_path`（已打开就切标签）→ `cui_code_editor_goto` 跳行。
+
+### 文本转换
+
+全部通过 `np_splice()`（一次 memmove + memcpy + `np_text_changed`）完成，CUI 的行索引
+与撤销栈由 revision 机制重建。行管线在 `d->tmp` 里拆分 NUL 结尾的行指针数组，
+排序 / 去重 / 剪尾 / 删空行后重组。`TR_SORT` / `TR_UNIQ` 需要选区；
+`TR_STRIP` / `TR_NOEMPTY` 无选区时作用于全文。大小写转换只改 ASCII 字节，
+多字节 UTF-8 原样保留。
+
+### 快捷键语义调整
+
+`Ctrl+Shift+F` 从「当前文件列出匹配」改为 EditPlus 的「在文件中查找」；
+原功能移到 `Ctrl+Shift+L`。帮助对话框已同步。
