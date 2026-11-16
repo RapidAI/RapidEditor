@@ -18,6 +18,7 @@
  */
 #include <cui/cui.h>
 #include <cui/cui_app.h>
+#include "np_preview.h"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -289,6 +290,16 @@ typedef struct notepad {
     np_fhit ff_hits[NP_FF_MAX];
     int  ff_hit_count;
 
+    /* Unified preview panel -------------------------------------------- */
+    bool show_preview;             /* right-hand preview visible */
+    float preview_ratio;           /* editor's share when preview is open */
+    np_preview_kind preview_kind;  /* resolved from the active document */
+    np_tex_job tex_job;            /* LaTeX compile / PDF render worker */
+    np_http_server web_server;     /* built-in loopback server for HTML */
+    cui_texture preview_tex;       /* current PDF page texture */
+    int  preview_tex_page;         /* page index currently loaded */
+    char preview_owner[NP_PATH_CAP]; /* doc path the preview belongs to */
+
     /* Persisted between runs (config file) ----------------------------- */
     char session[NP_SESSION_MAX][NP_PATH_CAP];
     int  session_count;
@@ -298,6 +309,9 @@ typedef struct notepad {
 } notepad;
 
 static notepad g;
+
+/* Forward decls for the unified preview (defined near np_workspace). */
+static void np_preview_release_tex_image(notepad *a);
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -353,7 +367,7 @@ static void np_toast(notepad *a, const char *title, const char *desc, cui_tone t
 static void np_update_title(notepad *a) {
     np_doc *d = np_cur(a);
     char title[NP_PATH_CAP + 128];
-    snprintf(title, sizeof title, "%s%s%s - 记事本 (CUI)",
+    snprintf(title, sizeof title, "%s%s%s - RapidEditor",
              d && d->dirty ? "*" : "",
              d && d->path[0] ? np_base(d->path) : "未命名",
              d && d->is_hex ? " [十六进制]" : "");
@@ -934,6 +948,14 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
                 np_enc_name(d->enc), d->crlf ? "CRLF" : "LF");
     }
     np_toast(a, "已保存", path, CUI_TONE_SUCCESS);
+    /* "Save to recompile": force the LaTeX preview to rebuild from the
+     * freshly written file on the next frame. */
+    if (np_preview_detect(path) == NP_PREVIEW_LATEX && a->show_preview) {
+        np_preview_release_tex_image(a);
+        np_tex_job_free(&a->tex_job);
+        np_tex_job_init(&a->tex_job);
+        a->preview_owner[0] = 0;          /* sync() will start a new compile */
+    }
     return true;
 }
 
@@ -1537,6 +1559,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "Ctrl H          查找和替换",
             "Ctrl Shift F    在文件中查找（目录搜索）",
             "F1              快捷键帮助  / F7 输出窗口",
+            "Ctrl Shift P    预览面板（Markdown 实时 / LaTeX·PDF 编译 / HTML Web）",
             "Ctrl Shift L    在当前文件中列出所有匹配行",
             "Ctrl G          转到行",
             "F5              插入日期和时间",
@@ -1558,10 +1581,11 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
-    cui_dialog(ui, "关于 记事本", &a->dlg_about,
-               .description = "用 CUI 写的多文档记事本", .width = 440) {
+    cui_dialog(ui, "关于 RapidEditor", &a->dlg_about,
+               .description = "由 Dr.Daniel（RapidAI）开发的多文档编辑器", .width = 440) {
         cui_column(ui, .width = CUI_FILL, .gap = 6) {
-            cui_text(ui, "CUI Notepad 2.0", .size = 16, .font = CUI_FONT_MEDIUM);
+            cui_text(ui, "RapidEditor 2.0", .size = 16, .font = CUI_FONT_MEDIUM);
+            cui_text(ui, "作者：Dr.Daniel（RapidAI）", .size = 12);
             cui_text(ui, "界面：yappologistic/CUI（C99, MIT, 自绘组件）", .size = 12);
             cui_text(ui, "多标签编辑：cui_doc_tabs + 每个文档独立的 cui_code_editor 状态；", .size = 12);
             cui_text(ui, "打开文件时按扩展名 / 文件名 / shebang 自动选择语法，可手动覆盖。", .size = 12);
@@ -2121,6 +2145,11 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "show_status")) a->show_status = atoi(val) != 0;
         else if (!strcmp(key, "show_sidebar")) a->show_sidebar = atoi(val) != 0;
         else if (!strcmp(key, "show_output")) a->show_output = atoi(val) != 0;
+        else if (!strcmp(key, "show_preview")) a->show_preview = atoi(val) != 0;
+        else if (!strcmp(key, "preview_ratio")) {
+            float r = (float)atof(val);
+            if (r >= 0.2f && r <= 0.85f) a->preview_ratio = r;
+        }
         else if (!strcmp(key, "follow_active")) a->follow_active = atoi(val) != 0;
         else if (!strcmp(key, "default_crlf")) a->default_crlf = atoi(val) != 0;
         else if (!strcmp(key, "make_backup")) a->make_backup = atoi(val) != 0;
@@ -2160,9 +2189,11 @@ static void np_config_save(notepad *a) {
     }
     fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\n",
             a->dark ? 1 : 0, a->accent, a->font_size, a->density);
-    fprintf(f, "line_numbers=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n",
+    fprintf(f, "line_numbers=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n"
+               "show_preview=%d\npreview_ratio=%.4f\n",
             a->line_numbers ? 1 : 0, a->show_status ? 1 : 0,
-            a->show_sidebar ? 1 : 0, a->show_output ? 1 : 0);
+            a->show_sidebar ? 1 : 0, a->show_output ? 1 : 0,
+            a->show_preview ? 1 : 0, a->preview_ratio);
     fprintf(f, "follow_active=%d\ndefault_crlf=%d\nmake_backup=%d\n"
                "session_restore=%d\nmatch_case=%d\nsystem_theme=%d\n",
             a->follow_active ? 1 : 0, a->default_crlf ? 1 : 0,
@@ -2674,6 +2705,258 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     }
 }
 
+/* ---- Unified preview ------------------------------------------------ */
+
+/* Resolve whether the active document can be previewed, and start/stop the
+ * async worker when the document or its content changes. */
+static np_preview_kind np_preview_for_doc(notepad *a, np_doc *d) {
+    if (!d || d->is_hex) return NP_PREVIEW_OFF;
+    np_preview_kind k = np_preview_detect(d->path);
+    if (k == NP_PREVIEW_OFF) {
+        /* Untitled buffers: sniff markdown/LaTeX from their text. */
+        if (d->len > 0) {
+            if (strstr(d->text, "\\documentclass") || strstr(d->text, "\\begin{document}"))
+                k = NP_PREVIEW_LATEX;
+            else if (strstr(d->text, "\n# ") || strstr(d->text, "**") ||
+                     strstr(d->text, "```"))
+                k = NP_PREVIEW_MARKDOWN;
+        }
+    }
+    return k;
+}
+
+static void np_preview_stop_http(notepad *a) {
+    if (np_http_running(&a->web_server)) np_http_stop(&a->web_server);
+}
+
+static void np_preview_release_tex_image(notepad *a) {
+    if (a->preview_tex) {
+        cui_image_destroy(a->ui, a->preview_tex);
+        a->preview_tex = 0;
+        a->preview_tex_page = 0;
+    }
+}
+
+/* Called each frame while the preview is open. Kicks off compilation on
+ * demand (first open, file switch, or a save bumped content_rev) and keeps
+ * the HTTP server pointed at the active HTML file's directory. */
+static void np_preview_sync(notepad *a, np_doc *d) {
+    if (!d) return;
+    np_preview_kind k = np_preview_for_doc(a, d);
+    a->preview_kind = k;
+
+    bool owner_changed = strcmp(a->preview_owner, d->path) != 0;
+
+    if (k == NP_PREVIEW_LATEX && d->path[0]) {
+        /* Compile on first open / doc switch only. Subsequent rebuilds are
+         * driven by Ctrl+S (np_save resets the job) or the manual button --
+         * NOT on every keystroke, per the "save + manual" policy. */
+        if (owner_changed || a->tex_job.state == 0) {
+            np_preview_release_tex_image(a);
+            np_tex_job_free(&a->tex_job);       /* join any old worker */
+            np_tex_job_init(&a->tex_job);
+            np_tex_compile(&a->tex_job, d->path);
+            a->tex_job.content_seen = d->content_rev;
+            snprintf(a->preview_owner, sizeof a->preview_owner, "%s", d->path);
+        }
+    } else if (k == NP_PREVIEW_PDF && d->path[0]) {
+        if (owner_changed || a->tex_job.state == 0) {
+            np_preview_release_tex_image(a);
+            np_tex_job_free(&a->tex_job);
+            np_tex_job_init(&a->tex_job);
+            np_tex_render_pdf(&a->tex_job, d->path);
+            a->tex_job.content_seen = d->content_rev;
+            snprintf(a->preview_owner, sizeof a->preview_owner, "%s", d->path);
+        }
+    } else if (k == NP_PREVIEW_HTML && d->path[0]) {
+        if (owner_changed || !np_http_running(&a->web_server)) {
+            np_preview_stop_http(a);
+            char dir[NP_PATH_CAP];
+            np_dir_of(d->path, dir, sizeof dir);
+            np_http_start(&a->web_server, dir);
+            snprintf(a->preview_owner, sizeof a->preview_owner, "%s", d->path);
+        }
+    } else {
+        if (owner_changed) {
+            np_preview_stop_http(a);
+            /* Release a stale PDF page texture when leaving a tex/pdf doc. */
+            np_preview_release_tex_image(a);
+            a->preview_owner[0] = 0;
+        }
+    }
+}
+
+/* Right-hand pane. Renders the three preview kinds into the same slot. */
+static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
+    np_preview_sync(a, d);
+
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6,
+               .bg = CUI_COLOR_SURFACE) {
+        char head[160];
+        snprintf(head, sizeof head, "预览 · %s", np_preview_kind_name(a->preview_kind));
+        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+            cui_text(ui, head, .size = 12, .font = CUI_FONT_MEDIUM);
+            cui_spacer(ui);
+            if (cui_button(ui, "折叠", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_PANEL_LEFT,
+                           .tooltip = "折叠预览面板"))
+                a->show_preview = false;
+        }
+        cui_separator(ui);
+
+        np_preview_kind k = a->preview_kind;
+        if (k == NP_PREVIEW_OFF) {
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                       .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER, .gap = 8) {
+                cui_text(ui, "此文件类型没有可用预览", .size = 13,
+                         .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, "支持 Markdown（实时）、LaTeX / PDF（编译预览）、HTML（Web 预览）",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            }
+        } else if (k == NP_PREVIEW_MARKDOWN) {
+            /* cui_markdown re-parses from the frame arena every frame: the
+             * view updates live as the left editor's buffer changes. */
+            cui_scroll(ui, .id = "md-preview", .width = CUI_FILL, .height = CUI_FILL,
+                       .pad = 6) {
+                cui_markdown(ui, "md-preview-doc", d->text, .length = d->len,
+                             .width = CUI_FILL);
+            }
+        } else if (k == NP_PREVIEW_LATEX) {
+            int st = a->tex_job.state;
+            if (st == 1) {
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                           .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER, .gap = 10) {
+                    cui_spinner(ui, 22);
+                    cui_text(ui, "正在用 LaTeX 编译并渲染 PDF…", .size = 12);
+                    cui_text(ui, "首次编译可能需要几秒，界面仍可操作。", .size = 11,
+                             .color = CUI_COLOR_TEXT_MUTED);
+                }
+            } else if (st == 2 && a->tex_job.pages > 0) {
+                int page = NP_MIN(NP_MAX(a->preview_tex_page ? a->preview_tex_page : 1, 1),
+                                  a->tex_job.pages);
+                char page_path[NP_PATH_CAP];
+                if (!a->preview_tex || a->preview_tex_page != page) {
+                    if (np_tex_page_path(&a->tex_job, page, page_path, sizeof page_path)) {
+                        np_preview_release_tex_image(a);
+                        int iw = 0, ih = 0;
+                        cui_texture t = cui_image_load(ui, page_path, &iw, &ih);
+                        if (t) {
+                            a->preview_tex = t;
+                            a->preview_tex_page = page;
+                        }
+                    }
+                }
+                cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                    if (cui_button(ui, "上一页", .size = CUI_SIZE_SM,
+                                   .disabled = page <= 1)) {
+                        np_preview_release_tex_image(a);
+                        a->preview_tex_page = page - 1;
+                    }
+                    char pg[48];
+                    snprintf(pg, sizeof pg, "%d / %d", page, a->tex_job.pages);
+                    cui_text(ui, pg, .size = 12, .font = CUI_FONT_MONO);
+                    if (cui_button(ui, "下一页", .size = CUI_SIZE_SM,
+                                   .disabled = page >= a->tex_job.pages)) {
+                        np_preview_release_tex_image(a);
+                        a->preview_tex_page = page + 1;
+                    }
+                    cui_spacer(ui);
+                    if (cui_button(ui, "重新编译", .size = CUI_SIZE_SM,
+                                   .icon = CUI_ICON_REFRESH_CW, .disabled = !d->path[0])) {
+                        np_preview_release_tex_image(a);
+                        np_tex_job_free(&a->tex_job);
+                        np_tex_job_init(&a->tex_job);
+                        np_tex_compile(&a->tex_job, d->path);
+                        a->tex_job.content_seen = d->content_rev;
+                    }
+                }
+                if (a->preview_tex) {
+                    int iw = 0, ih = 0;
+                    char page_path[NP_PATH_CAP];
+                    np_tex_page_path(&a->tex_job, page, page_path, sizeof page_path);
+                    /* image_viewer owns zoom/pan; sizes come from a fresh probe. */
+                    cui_texture probe = 0;
+                    (void)probe; (void)iw; (void)ih; (void)page_path;
+                    cui_image(ui, a->preview_tex, .width = CUI_FILL, .height = CUI_FILL);
+                }
+            } else {
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                           .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER, .gap = 8) {
+                    cui_text(ui, "预览失败", .size = 13, .font = CUI_FONT_MEDIUM,
+                             .color = CUI_COLOR_DANGER);
+                    if (a->tex_job.log[0])
+                        cui_text(ui, a->tex_job.log, .size = 11, .nowrap = false,
+                                 .font = CUI_FONT_MONO, .color = CUI_COLOR_TEXT_MUTED);
+                }
+            }
+        } else if (k == NP_PREVIEW_PDF) {
+            int st = a->tex_job.state;
+            if (st == 1) {
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                           .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER, .gap = 10) {
+                    cui_spinner(ui, 22);
+                    cui_text(ui, "正在渲染 PDF…", .size = 12);
+                }
+            } else if (st == 2 && a->tex_job.pages > 0) {
+                int page = NP_MIN(NP_MAX(a->preview_tex_page ? a->preview_tex_page : 1, 1),
+                                  a->tex_job.pages);
+                char page_path[NP_PATH_CAP];
+                if (!a->preview_tex || a->preview_tex_page != page) {
+                    np_preview_release_tex_image(a);
+                    if (np_tex_page_path(&a->tex_job, page, page_path, sizeof page_path)) {
+                        int iw = 0, ih = 0;
+                        a->preview_tex = cui_image_load(ui, page_path, &iw, &ih);
+                        if (a->preview_tex) a->preview_tex_page = page;
+                    }
+                }
+                cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                    if (cui_button(ui, "上一页", .size = CUI_SIZE_SM, .disabled = page <= 1)) {
+                        np_preview_release_tex_image(a); a->preview_tex_page = page - 1;
+                    }
+                    char pg[48];
+                    snprintf(pg, sizeof pg, "%d / %d", page, a->tex_job.pages);
+                    cui_text(ui, pg, .size = 12, .font = CUI_FONT_MONO);
+                    if (cui_button(ui, "下一页", .size = CUI_SIZE_SM, .disabled = page >= a->tex_job.pages)) {
+                        np_preview_release_tex_image(a); a->preview_tex_page = page + 1;
+                    }
+                }
+                if (a->preview_tex)
+                    cui_image(ui, a->preview_tex, .width = CUI_FILL, .height = CUI_FILL);
+            } else {
+                cui_text(ui, a->tex_job.log[0] ? a->tex_job.log : "PDF 渲染失败。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED, .font = CUI_FONT_MONO);
+            }
+        } else if (k == NP_PREVIEW_HTML) {
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 10, .pad = 6) {
+                cui_text(ui, "本地 Web 预览", .size = 13, .font = CUI_FONT_MEDIUM);
+                cui_text(ui, "使用内建 HTTP 服务器提供当前文件所在目录，"
+                             "以真正的 Web 方式加载（而非直接打开文件）。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+                if (np_http_running(&a->web_server)) {
+                    char url[512], base[128];
+                    const char *name = d->path[0] ? np_base(d->path) : "index.html";
+                    snprintf(base, sizeof base, "%s", name);
+                    snprintf(url, sizeof url, "http://127.0.0.1:%d/%s",
+                             a->web_server.port, base);
+                    cui_input(ui, "web-preview-url", url, sizeof url, .read_only = true,
+                              .width = CUI_FILL);
+                    if (cui_button(ui, "在 WebView 窗口打开", .icon = CUI_ICON_EXTERNAL_LINK,
+                                   .variant = CUI_BUTTON_PRIMARY))
+                        np_webview_open(url);
+                    if (cui_button(ui, "系统默认浏览器", .size = CUI_SIZE_SM,
+                                   .variant = CUI_BUTTON_GHOST))
+                        np_open_url(url);
+                } else {
+                    cui_text(ui, "无法启动本地 HTTP 服务器。", .size = 12,
+                             .color = CUI_COLOR_DANGER);
+                }
+                cui_text(ui, "提示：修改并保存 HTML 后，在预览窗口刷新即可看到更新。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            }
+        }
+    }
+}
+
 /* Document strip + editor + the optional output pane. Returns the document
  * that ended up active (the tab strip can change it this frame). */
 static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
@@ -2710,19 +2993,42 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
         np_doc *d = np_cur(a);
         bool welcome = a->count == 1 && !d->is_hex && !a->welcome_dismissed &&
                        np_blank_untitled(d);
-        if (a->show_output) {
-            cui_split(ui, "np_out_split", &a->out_ratio, .vertical = true,
-                      .min_first = 140, .min_second = 100) {
+
+        /* Foldable preview on the right: editor | preview. Both branches
+         * render the editor exactly once so CUI editor state stays stable. */
+        bool previewable = a->show_preview && !welcome && !d->is_hex;
+        if (previewable) {
+            cui_split(ui, "np_preview_split", &a->preview_ratio, .vertical = false,
+                      .min_first = 300, .min_second = 260) {
+                /* left: editor (+ optional bottom output pane) */
+                if (a->show_output) {
+                    cui_split(ui, "np_out_split", &a->out_ratio, .vertical = true,
+                              .min_first = 140, .min_second = 100) {
+                        np_editor_pane(ui, a, d);
+                        cui_split_next(ui);
+                        np_output_panel(ui, a);
+                    }
+                } else {
+                    np_editor_pane(ui, a, d);
+                }
+                cui_split_next(ui);
+                np_preview_pane(ui, a, d);
+            }
+        } else {
+            if (a->show_output) {
+                cui_split(ui, "np_out_split", &a->out_ratio, .vertical = true,
+                          .min_first = 140, .min_second = 100) {
+                    if (welcome) np_welcome_pane(ui, a);
+                    else if (d->is_hex) np_hex_pane(ui, a, d);
+                    else np_editor_pane(ui, a, d);
+                    cui_split_next(ui);
+                    np_output_panel(ui, a);
+                }
+            } else {
                 if (welcome) np_welcome_pane(ui, a);
                 else if (d->is_hex) np_hex_pane(ui, a, d);
                 else np_editor_pane(ui, a, d);
-                cui_split_next(ui);
-                np_output_panel(ui, a);
             }
-        } else {
-            if (welcome) np_welcome_pane(ui, a);
-            else if (d->is_hex) np_hex_pane(ui, a, d);
-            else np_editor_pane(ui, a, d);
         }
     }
     return np_cur(a);
@@ -2812,6 +3118,8 @@ static void np_frame(cui_ctx *ui, void *user) {
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) a->show_sidebar = !a->show_sidebar;
         if (cui_key_pressed(ui, CUI_KEY_F7)) a->show_output = !a->show_output;
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P))
+            a->show_preview = !a->show_preview;
         if (cui_key_pressed(ui, CUI_KEY_F1)) a->dlg_help = true;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) {
             a->dlg_find_files = true;
@@ -2852,33 +3160,8 @@ static void np_frame(cui_ctx *ui, void *user) {
     /* Top chrome ------------------------------------------------------ */
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                .bg = CUI_COLOR_BACKGROUND, .gap = 0) {
-        /* Brand row: identity, current mode and quick help. */
-        cui_row(ui, .width = CUI_FILL, .gap = 9, .pad_x = 12, .pad_y = 4,
-                .bg = CUI_COLOR_SURFACE, .align = CUI_ALIGN_CENTER) {
-            cui_box(ui, .width = CUI_PX(24), .height = CUI_PX(24), .radius = 7,
-                    .bg = CUI_COLOR_ACCENT, .align = CUI_ALIGN_CENTER,
-                    .justify = CUI_JUSTIFY_CENTER) {
-                cui_text(ui, "R", .size = 14, .font = CUI_FONT_MEDIUM,
-                         .color = CUI_COLOR_ACCENT_FOREGROUND);
-            }
-            cui_text(ui, "RapidEditor", .size = 14, .font = CUI_FONT_MEDIUM);
-            cui_badge(ui, "v1.1.3", .size = CUI_SIZE_SM, .tone = CUI_TONE_NEUTRAL);
-            cui_separator(ui);
-            cui_text(ui, "文本 · 十六进制编辑器", .size = 11,
-                     .color = CUI_COLOR_TEXT_MUTED);
-            cui_spacer(ui);
-            const char *dens[3] = { "舒适", "紧凑", "宽松" };
-            char dens_label[48];
-            snprintf(dens_label, sizeof dens_label, "密度：%s", dens[a->density]);
-            if (cui_button(ui, dens_label, .size = CUI_SIZE_SM,
-                           .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_SLIDERS_HORIZONTAL,
-                           .tooltip = "点击切换界面密度"))
-                a->density = (a->density + 1) % 3;
-            if (cui_button(ui, "快捷键", .size = CUI_SIZE_SM,
-                           .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_KEYBOARD,
-                           .tooltip = "F1 打开快捷键帮助"))
-                a->dlg_help = true;
-        }
+        /* Brand identity lives in the OS title bar / window icon now; the
+         * density and help controls remain in the View menu and toolbar. */
         cui_column(ui, .width = CUI_FILL, .bg = CUI_COLOR_SURFACE, .gap = 0) {
         cui_menu_bar(ui, "menubar", .no_border = true) {
             cui_menu_bar_menu(ui, "文件") {
@@ -3034,6 +3317,13 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "目录 / 工作区侧栏", .icon = CUI_ICON_PANEL_LEFT,
                                   .shortcut = "Ctrl B", .checked = a->show_sidebar))
                     a->show_sidebar = !a->show_sidebar;
+                {
+                    char pv[96];
+                    snprintf(pv, sizeof pv, "预览面板（%s）", np_preview_kind_name(np_preview_for_doc(a, d)));
+                    if (cui_menu_item(ui, pv, .icon = CUI_ICON_EYE,
+                                      .shortcut = "Ctrl Shift P", .checked = a->show_preview))
+                        a->show_preview = !a->show_preview;
+                }
                 if (cui_menu_item(ui, "目录跟随当前文件", .icon = CUI_ICON_BOOKMARK,
                                   .checked = a->follow_active))
                     a->follow_active = !a->follow_active;
@@ -3182,12 +3472,21 @@ static void np_frame(cui_ctx *ui, void *user) {
                                .toggle = &a->show_sidebar);
             cui_toolbar_button(ui, CUI_ICON_TERMINAL, .tooltip = "输出窗口  F7",
                                .toggle = &a->show_output);
+            cui_toolbar_button(ui, CUI_ICON_EYE,
+                               .tooltip = "预览面板  Ctrl Shift P（Markdown/LaTeX/PDF/Web）",
+                               .toggle = &a->show_preview);
             cui_toolbar_separator(ui);
             if (cui_toolbar_button(ui, CUI_ICON_ZOOM_OUT, .tooltip = "缩小字号"))
                 a->font_size = NP_MAX(NP_FONT_MIN, a->font_size - 1);
             if (cui_toolbar_button(ui, CUI_ICON_ZOOM_IN, .tooltip = "放大字号"))
                 a->font_size = NP_MIN(NP_FONT_MAX, a->font_size + 1);
             cui_toolbar_spacer(ui);
+            if (cui_toolbar_button(ui, CUI_ICON_SLIDERS_HORIZONTAL,
+                                   .tooltip = "切换界面密度（舒适/紧凑/宽松）"))
+                a->density = (a->density + 1) % 3;
+            if (cui_toolbar_button(ui, CUI_ICON_KEYBOARD,
+                                   .tooltip = "快捷键帮助  F1"))
+                a->dlg_help = true;
             if (cui_toolbar_button(ui, a->dark ? CUI_ICON_SUN : CUI_ICON_MOON,
                                    .tooltip = a->dark ? "浅色模式" : "深色模式")) {
                 a->dark = !a->dark;
@@ -3229,14 +3528,17 @@ static void np_frame(cui_ctx *ui, void *user) {
                 char tabcnt[48];
                 snprintf(tabcnt, sizeof tabcnt, "· %d/%d 标签###tabs", a->active + 1, a->count);
                 cui_status_bar_text(ui, tabcnt, .tone = CUI_TONE_INFO);
-                char panes[64];
-                snprintf(panes, sizeof panes, "%s%s%s###panes",
+                char panes[80];
+                snprintf(panes, sizeof panes, "%s%s%s%s%s%s###panes",
                          a->show_sidebar ? "侧栏" : "",
-                         a->show_sidebar && a->show_output ? " · " : "",
-                         a->show_output ? "输出" : "");
-                if (!a->show_sidebar && !a->show_output)
+                         (a->show_sidebar && (a->show_output || a->show_preview)) ? " · " : "",
+                         a->show_output ? "输出" : "",
+                         (a->show_preview && a->show_output) ? " · " : "",
+                         a->show_preview ? "预览" : "",
+                         "");
+                if (!a->show_sidebar && !a->show_output && !a->show_preview)
                     snprintf(panes, sizeof panes, "单栏###panes");
-                if (cui_status_bar_item(ui, panes, .tooltip = "点击：切换侧栏；Ctrl+B / F7 分别控制侧栏和输出窗口"))
+                if (cui_status_bar_item(ui, panes, .tooltip = "点击：切换侧栏；Ctrl+B 侧栏 / F7 输出 / Ctrl Shift P 预览"))
                     a->show_sidebar = !a->show_sidebar;
                 cui_status_bar_spacer(ui);
                 if (d->is_hex) {
@@ -3322,6 +3624,10 @@ int main(int argc, char **argv) {
     g.show_sidebar = true;
     g.show_output = true;
     g.follow_active = true;
+    g.show_preview = true;
+    g.preview_ratio = 0.58f;
+    np_tex_job_init(&g.tex_job);
+    np_http_init(&g.web_server);
     g.side_ratio = 0.22f;
     g.out_ratio = 0.76f;
     g.side_tab = 0;
@@ -3368,5 +3674,7 @@ int main(int argc, char **argv) {
         .follow_system_theme = true
     }, np_frame, &g);
     np_config_save(&g);      /* settings, recents and the open-file session */
+    np_preview_stop_http(&g);
+    np_tex_job_free(&g.tex_job);
     return rc;
 }

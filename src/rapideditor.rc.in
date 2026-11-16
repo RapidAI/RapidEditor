@@ -1,0 +1,5 @@
+/* Windows executable resources: embed the app icon so it shows in the
+ * title bar, taskbar and Alt+Tab without needing a separate .ico file.
+ * CUI's Win32 backend loads MAKEINTRESOURCE(1) as the window class icon,
+ * so the icon resource ID must be 1. */
+1 ICON "@RE_ICON_ABS@"

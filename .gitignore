@@ -1,6 +1,7 @@
 # Build directories
 build/
 build-*/
+build[0-9]*/
 out/
 cmake-build-*/
 *.obj
