@@ -30,10 +30,15 @@ case "$MODE" in
 esac
 
 BUILD="$ROOT/build-macos-$TAG"
-echo "==> Building RapidEditor ($OARCH) ..."
+# Minimum OS is macOS 15 (Sequoia). Passed explicitly rather than relying on
+# the runner's SDK default so the .pkg's compatibility is deterministic.
+: "${MACOS_DEPLOYMENT_TARGET:=15.0}"
+export MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET"
+echo "==> Building RapidEditor ($OARCH), macOS >= $MACOS_DEPLOYMENT_TARGET ..."
 cmake -S "$ROOT" -B "$BUILD" -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_OSX_ARCHITECTURES="$OARCH"
+      -DCMAKE_OSX_ARCHITECTURES="$OARCH" \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET"
 cmake --build "$BUILD" --parallel
 
 EXE="$BUILD/RapidEditor"

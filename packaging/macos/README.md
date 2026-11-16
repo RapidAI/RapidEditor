@@ -8,6 +8,17 @@ packaging/macos/build_pkg.sh 1.0.0 arm64
 
 产物：`dist/RapidEditor-<版本>-macos-universal.pkg`。
 
+## 系统版本要求（macOS 15+）
+
+最低系统版本与构建 runner 都锁定在 **macOS 15**：
+
+- **runner**：CI 用 `runs-on: macos-15`（固定标签，不会降级到 14/13 或随 `macos-latest` 漂移）。
+- **最低部署版本**：`build_pkg.sh` 显式设置
+  `MACOSX_DEPLOYMENT_TARGET=15.0` / `-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0`，
+  因此生成的二进制与 `.pkg` 只能在 macOS 15 及以上安装运行。
+
+两者都写死而不是依赖 runner SDK 默认值，保证 `.pkg` 的兼容性可复现、不会因 CI 镜像更新而改变。
+
 ## 架构自适应
 
 `CMAKE_OSX_ARCHITECTURES="x86_64;arm64"` 一次编译出通用二进制（`lipo -archs` 可核对），
