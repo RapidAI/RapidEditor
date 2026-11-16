@@ -68,13 +68,13 @@ jobs:
 
       - name: Set up llvm-mingw (x64 + ARM64 toolchain)
         shell: pwsh
+        env:
+          # Pinned to a release verified locally. Querying /releases/latest
+          # anonymously hits GitHub's 60 req/h API limit on shared runners.
+          LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-x86_64.zip
         run: |
-          $rel = Invoke-RestMethod -Headers @{ 'User-Agent' = 'RapidEditor-CI' } `
-            'https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest'
-          $asset = $rel.assets | Where-Object { $_.name -match 'ucrt-x86_64\.zip$' } |
-            Select-Object -First 1
-          if (-not $asset) { throw 'llvm-mingw ucrt-x86_64 asset not found' }
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile llvm-mingw.zip
+          Invoke-WebRequest -Uri $env:LLVM_MINGW_URL -OutFile llvm-mingw.zip `
+            -MaximumRetryCount 5 -RetryIntervalSec 10
           Expand-Archive -Path llvm-mingw.zip -DestinationPath llvm-mingw -Force
           $root = (Get-ChildItem -Path llvm-mingw -Directory | Select-Object -First 1).FullName
           $bin = Join-Path $root 'bin'
