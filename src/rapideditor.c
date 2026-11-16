@@ -200,6 +200,8 @@ typedef struct np_doc {
     unsigned uid;                       /* stable tab identity */
     bool dirty;
     bool crlf;
+    bool is_hex;                        /* binary file: shown in the hex editor */
+    cui_hex_selection hexsel;           /* hex view selection (per document) */
     bool lang_manual;                   /* user picked a language explicitly */
     int  lang;
     int  enc;
@@ -269,6 +271,8 @@ typedef struct notepad {
     np_hit hits[NP_HIT_MAX];
     int  hit_count;
     uint64_t hits_rev, hits_key;
+    bool dlg_hexgoto;
+    char hexgoto_buf[24];
 
     /* EditPlus-style find in files ------------------------------------ */
     bool dlg_find_files;
@@ -324,7 +328,7 @@ static void np_logf(notepad *a, const char *fmt, ...) {
 }
 
 static bool np_any_dialog(const notepad *a) {
-    return a->dlg_confirm || a->dlg_replace || a->dlg_goto ||
+    return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
            a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files;
 }
 
@@ -347,9 +351,10 @@ static void np_toast(notepad *a, const char *title, const char *desc, cui_tone t
 static void np_update_title(notepad *a) {
     np_doc *d = np_cur(a);
     char title[NP_PATH_CAP + 128];
-    snprintf(title, sizeof title, "%s%s - 记事本 (CUI)",
+    snprintf(title, sizeof title, "%s%s%s - 记事本 (CUI)",
              d && d->dirty ? "*" : "",
-             d && d->path[0] ? np_base(d->path) : "未命名");
+             d && d->path[0] ? np_base(d->path) : "未命名",
+             d && d->is_hex ? " [十六进制]" : "");
     if (strcmp(title, a->title) != 0) {
         snprintf(a->title, sizeof a->title, "%s", title);
         cui_app_set_title(NULL, a->title);
@@ -499,6 +504,11 @@ static void np_add_recent(notepad *a, const char *path) {
 
 static void np_stats(np_doc *d) {
     if (!d || d->stats_rev == d->content_rev) return;   /* 100 MB is not counted every frame */
+    if (d->is_hex) {                    /* binary: word/char counts are meaningless */
+        d->chars = d->words = 0;
+        d->stats_rev = d->content_rev;
+        return;
+    }
     int chars = 0, words = 0;
     bool in_word = false;
     for (const unsigned char *p = (const unsigned char *)d->text; *p; p++) {
@@ -725,6 +735,7 @@ static bool np_load_into(notepad *a, np_doc *d, const char *path) {
 
     snprintf(d->path, sizeof d->path, "%s", path);
     d->dirty = false;
+    d->is_hex = false;
     d->enc = enc;
     d->crlf = had_crlf;
     d->len = (int)o;
@@ -756,6 +767,73 @@ static bool np_load_into(notepad *a, np_doc *d, const char *path) {
     return true;
 }
 
+/* Heuristic: a NUL byte anywhere in the first 8 KiB, or more than a tenth of
+ * control bytes that never appear in text, marks the file as binary. */
+static bool np_sniff_binary(const char *path) {
+    FILE *f = np_fopen_utf8(path, "rb");
+    if (!f) return false;
+    unsigned char buf[8192];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    if (n == 0) return false;
+    int ctrl = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = buf[i];
+        if (c == 0) return true;
+        if (c < 0x09 || (c > 0x0D && c < 0x20 && c != 0x1B)) ctrl++;
+    }
+    return ctrl * 10 > (int)n;
+}
+
+/* Load a file byte-for-byte for the hex editor: no encoding conversion, no
+ * line normalization, no syntax. The buffer stays NUL terminated at len. */
+static bool np_load_binary(notepad *a, np_doc *d, const char *path) {
+    FILE *f = np_fopen_utf8(path, "rb");
+    if (!f) {
+        np_toast(a, "无法打开文件", path, CUI_TONE_DANGER);
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long n = ftell(f);
+    if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    size_t to_read = (size_t)n;
+    bool truncated = to_read > NP_LOAD_MAX;
+    if (truncated) to_read = NP_LOAD_MAX;
+    if (!np_ensure_cap(d, to_read + 2)) {
+        fclose(f);
+        np_toast(a, "内存不足", "无法为该文件分配缓冲区", CUI_TONE_DANGER);
+        return false;
+    }
+    size_t got = fread(d->text, 1, to_read, f);
+    fclose(f);
+    d->text[got] = 0;
+    d->file_size = (size_t)n;
+    snprintf(d->path, sizeof d->path, "%s", path);
+    d->is_hex = true;
+    d->dirty = false;
+    d->enc = ENC_UTF8;
+    d->crlf = false;
+    d->lang = NP_LANG_TEXT;
+    d->lang_manual = false;
+    d->len = (int)got;
+    d->rev++;
+    d->content_rev++;
+    memset(&d->hexsel, 0, sizeof d->hexsel);
+    np_bump_editor(a, d);
+    np_add_recent(a, path);
+    np_update_title(a);
+    {
+        char sz[48];
+        np_size_str(sz, sizeof sz, (size_t)n);
+        np_logf(a, "打开（十六进制）  %s  ·  %s", np_base(path), sz);
+    }
+    if (truncated)
+        np_toast(a, "文件过大，已截断", "单次最多载入 240 MB", CUI_TONE_WARNING);
+    else if (!a->quiet)
+        np_toast(a, "已按十六进制打开", path, CUI_TONE_SUCCESS);
+    return true;
+}
+
 /* Defined with the EditPlus-style additions further down. */
 static bool np_file_exists(const char *path);
 static void np_backup_file(const char *path);
@@ -769,6 +847,27 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
     if (!f) {
         np_toast(a, "无法保存文件", path, CUI_TONE_DANGER);
         return false;
+    }
+    if (d->is_hex) {
+        /* Binary documents: write the raw bytes exactly as they are. */
+        bool ok = n == 0 || fwrite(d->text, 1, n, f) == n;
+        fclose(f);
+        if (!ok) {
+            np_toast(a, "保存失败", "写入文件时出错", CUI_TONE_DANGER);
+            return false;
+        }
+        bool renamed = strcmp(d->path, path) != 0;
+        (void)renamed;
+        snprintf(d->path, sizeof d->path, "%s", path);
+        d->dirty = false;
+        d->file_size = n;
+        np_add_recent(a, path);
+        np_update_title(a);
+        char sz[48];
+        np_size_str(sz, sizeof sz, n);
+        np_logf(a, "保存（十六进制）  %s  ·  %s", np_base(path), sz);
+        np_toast(a, "已保存", path, CUI_TONE_SUCCESS);
+        return true;
     }
     if (d->enc == ENC_UTF8_BOM) fwrite("\xEF\xBB\xBF", 1, 3, f);
     bool ok = true;
@@ -901,7 +1000,12 @@ static bool np_open_path(notepad *a, const char *path, bool focus_editor) {
         idx = a->count - 1;
     }
 
-    if (!np_load_into(a, d, path)) {
+    if (np_sniff_binary(path)) {
+        if (!np_load_binary(a, d, path)) {
+            if (fresh) np_close_doc(a, idx);
+            return false;
+        }
+    } else if (!np_load_into(a, d, path)) {
         if (fresh) np_close_doc(a, idx);
         return false;
     }
@@ -1072,6 +1176,102 @@ static void np_do_goto(notepad *a) {
     if (col < 1) col = 1;
     cui_code_editor_goto(a->ui, d->editor_id, line, col);
     a->dlg_goto = false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Hex editor helpers (010 Editor style)                               */
+/* ------------------------------------------------------------------ */
+
+/* "1F", "1f2e", "0x1F2E" — hex, like 010 Editor. Leading/trailing
+ * whitespace is ignored. */
+static bool np_hex_parse_offset(const char *s, size_t *out) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    if (!n) return false;
+    if (n >= 2 && (s[0] == '0') && (s[1] == 'x' || s[1] == 'X')) { s += 2; n -= 2; }
+    unsigned long long v = 0;
+    for (size_t i = 0; i < n; i++) {
+        int c;
+        char ch = s[i];
+        if (ch >= '0' && ch <= '9') c = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') c = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') c = ch - 'A' + 10;
+        else return false;
+        if (v > (0xFFFFFFFFFFFFFFFFULL - c) / 16) return false;   /* overflow */
+        v = v * 16 + (unsigned)c;
+    }
+    if (!out) return false;
+    *out = (size_t)v;
+    return true;
+}
+
+static void np_hex_do_goto(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || !d->is_hex) return;
+    size_t off;
+    if (!np_hex_parse_offset(a->hexgoto_buf, &off)) {
+        np_toast(a, "偏移格式不对", "请输入十六进制，如 1A2B 或 0x1A2B", CUI_TONE_WARNING);
+        return;
+    }
+    if (d->len > 0 && off >= (size_t)d->len) {
+        off = (size_t)d->len - 1;
+        np_toast(a, "偏移超出文件末尾", "已跳到最后一个字节", CUI_TONE_INFO);
+    }
+    if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, off);
+    a->dlg_hexgoto = false;
+}
+
+/* Copy the hex selection to the clipboard: as "AA BB CC" or as ASCII with
+ * dots for the bytes that cannot be printed. */
+static void np_hex_copy(notepad *a, np_doc *d, bool ascii) {
+    if (!a->ui) return;
+    size_t start = d->hexsel.start, len = d->hexsel.length;
+    if (start >= (size_t)d->len) len = 0;
+    if (start + len > (size_t)d->len) len = (size_t)d->len - start;
+    if (!len) {
+        np_toast(a, "没有选中的字节", "先在十六进制视图中点击或拖选", CUI_TONE_INFO);
+        return;
+    }
+    char *buf = (char *)malloc(len * 4 + 4);
+    if (!buf) return;
+    size_t o = 0;
+    if (ascii) {
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)d->text[start + i];
+            buf[o++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+        }
+    } else {
+        for (size_t i = 0; i < len; i++)
+            o += (size_t)snprintf(buf + o, len * 4 + 4 - o, "%02X%s",
+                                  (unsigned char)d->text[start + i],
+                                  i + 1 < len ? " " : "");
+    }
+    buf[o] = 0;
+    cui_set_clipboard_text(a->ui, buf);
+    free(buf);
+    char msg[96];
+    snprintf(msg, sizeof msg, "%zu 字节已复制为%s", len, ascii ? "ASCII" : "十六进制");
+    np_toast(a, "复制成功", msg, CUI_TONE_SUCCESS);
+}
+
+/* Switch the current document between the text editor and the hex editor by
+ * reloading it from disk. Refuses unsaved changes so nothing is lost. */
+static void np_hex_reopen(notepad *a, bool as_hex) {
+    np_doc *d = np_cur(a);
+    if (!d) return;
+    if (!d->path[0]) {
+        np_toast(a, "尚未保存到文件", "只有已保存的文件能在两种模式间切换", CUI_TONE_WARNING);
+        return;
+    }
+    if (d->dirty) {
+        np_toast(a, "有未保存的修改", "请先保存（Ctrl S）再切换编辑模式", CUI_TONE_WARNING);
+        return;
+    }
+    if (as_hex == d->is_hex) return;
+    bool ok = as_hex ? np_load_binary(a, d, d->path) : np_load_into(a, d, d->path);
+    if (ok) np_toast(a, as_hex ? "已切换到十六进制编辑" : "已切换到文本编辑",
+                     d->path, CUI_TONE_SUCCESS);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1246,6 +1446,18 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
+    cui_dialog(ui, "转到偏移", &a->dlg_hexgoto,
+               .description = "跳到十六进制视图的指定字节（十六进制）", .width = 360) {
+        int flags = cui_input(ui, "hexgoto-off", a->hexgoto_buf, sizeof a->hexgoto_buf,
+                              .label = "偏移", .placeholder = "例如 1A2B 或 0x1A2B",
+                              .width = CUI_FILL, .autofocus = true);
+        if (flags & CUI_SUBMITTED) np_hex_do_goto(a);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) a->dlg_hexgoto = false;
+            if (cui_button(ui, "跳转", .variant = CUI_BUTTON_PRIMARY)) np_hex_do_goto(a);
+        }
+    }
+
     cui_dialog(ui, "语法高亮", &a->dlg_lang,
                .description = "为当前文档选择语言，或按扩展名自动识别", .width = 400) {
         const char *items[NP_LANG_COUNT];
@@ -1294,7 +1506,10 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "Ctrl +/-        放大 / 缩小编辑器字号，Ctrl 0 重置",
             "Alt             激活菜单栏，方向键选择菜单项",
             "编辑器内：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Tab 缩进",
-            "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、括号跳转"
+            "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、括号跳转",
+            "十六进制模式：二进制文件自动打开，或「文件 → 以十六进制模式重新打开」",
+            "十六进制内：点击/拖选字节、方向键移动、键入十六进制覆盖、Ctrl C 复制",
+            "十六进制内：Ctrl G 转到偏移、Ctrl A 全选、Ctrl Shift C 复制为 ASCII"
         };
         cui_column(ui, .width = CUI_FILL, .gap = 5) {
             for (size_t i = 0; i < sizeof lines / sizeof lines[0]; i++)
@@ -2291,6 +2506,44 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     }
 }
 
+/* 010 Editor style pane: offsets, hex bytes and ASCII, fully editable —
+ * typing hex digits overwrites the byte under the cursor. cui_hex_view owns
+ * all of the interaction (selection, arrows, copy, virtual scrolling); we
+ * only feed it our buffer, track edits and wire the goto field. */
+static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            int flags = cui_input(ui, "hex-goto", a->hexgoto_buf, sizeof a->hexgoto_buf,
+                                  .placeholder = "偏移（十六进制，如 1A2B）",
+                                  .width = 220);
+            if (flags & CUI_SUBMITTED) np_hex_do_goto(a);
+            if (cui_button(ui, "跳转", .size = CUI_SIZE_SM)) np_hex_do_goto(a);
+            cui_spacer(ui);
+            if (cui_button(ui, "转到文本编辑", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_FILE_TEXT))
+                np_hex_reopen(a, false);
+            char info[96];
+            snprintf(info, sizeof info, "%d 字节###hexsize", d->len);
+            cui_text(ui, info, .size = 12, .color = CUI_COLOR_TEXT_MUTED,
+                     .font = CUI_FONT_MONO);
+        }
+        cui_text(ui, "点击/拖选字节 · 方向键移动 · 键入十六进制覆盖 · Ctrl C 复制 · Ctrl Home/End 首尾",
+                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        cui_hex_result r = cui_hex_view(ui, d->editor_id,
+                                        (const uint8_t *)d->text, (size_t)d->len,
+                                        &d->hexsel,
+                                        .edit = (uint8_t *)d->text,
+                                        .height = -1,
+                                        .size = (float)a->font_size - 2);
+        if (r.edited) {
+            d->dirty = true;
+            d->content_rev++;          /* file size never changes here */
+            np_update_title(a);
+        }
+        np_keep_editors(a, ui);        /* keep the sibling tabs' text editors alive */
+    }
+}
+
 /* Document strip + editor + the optional output pane. Returns the document
  * that ended up active (the tab strip can change it this frame). */
 static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
@@ -2302,11 +2555,13 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
             snprintf(t->tab_title, sizeof t->tab_title, "%s###npdoc%u", name, t->uid);
             char sz[48];
             np_size_str(sz, sizeof sz, t->path[0] ? t->file_size : (size_t)t->len);
-            snprintf(t->tab_tip, sizeof t->tab_tip, "%s  ·  %s  ·  %s%s",
+            snprintf(t->tab_tip, sizeof t->tab_tip, "%s%s  ·  %s  ·  %s%s",
+                     t->is_hex ? "[十六进制] " : "",
                      t->path[0] ? t->path : "尚未保存到文件", sz,
-                     NP_LANGS[t->lang].label, t->dirty ? "  ·  未保存" : "");
+                     t->is_hex ? "二进制" : NP_LANGS[t->lang].label,
+                     t->dirty ? "  ·  未保存" : "");
             tabs[i] = (cui_doc_tab){ .title = t->tab_title,
-                                     .icon = CUI_ICON_FILE_TEXT,
+                                     .icon = t->is_hex ? CUI_ICON_CPU : CUI_ICON_FILE_TEXT,
                                      .tooltip = t->tab_tip,
                                      .dirty = t->dirty };
         }
@@ -2326,12 +2581,14 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
         if (a->show_output) {
             cui_split(ui, "np_out_split", &a->out_ratio, .vertical = true,
                       .min_first = 140, .min_second = 100) {
-                np_editor_pane(ui, a, d);
+                if (d->is_hex) np_hex_pane(ui, a, d);
+                else np_editor_pane(ui, a, d);
                 cui_split_next(ui);
                 np_output_panel(ui, a);
             }
         } else {
-            np_editor_pane(ui, a, d);
+            if (d->is_hex) np_hex_pane(ui, a, d);
+            else np_editor_pane(ui, a, d);
         }
     }
     return np_cur(a);
@@ -2402,7 +2659,11 @@ static void np_frame(cui_ctx *ui, void *user) {
 
         if (!cui_wants_keyboard(ui)) {
             if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_F)) np_open_find(a);
-            if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_G)) a->dlg_goto = true;
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_G)) {
+                np_doc *cd = np_cur(a);
+                if (cd && cd->is_hex) a->dlg_hexgoto = true;
+                else a->dlg_goto = true;
+            }
         }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_EQUAL) ||
             cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_EQUAL))
@@ -2471,6 +2732,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "全部保存", .icon = CUI_ICON_LAYERS))
                     np_save_all(a);
                 cui_menu_separator(ui);
+                if (cui_menu_item(ui, d->is_hex ? "以文本模式重新打开" : "以十六进制模式重新打开",
+                                  .icon = CUI_ICON_CPU, .disabled = !d->path[0]))
+                    np_hex_reopen(a, !d->is_hex);
                 if (cui_menu_item(ui, "关闭当前标签", .icon = CUI_ICON_X, .shortcut = "Ctrl W"))
                     np_request_close(a, a->active);
                 if (a->recent_count) {
@@ -2489,6 +2753,30 @@ static void np_frame(cui_ctx *ui, void *user) {
             }
 
             cui_menu_bar_menu(ui, "编辑") {
+                if (d->is_hex) {
+                    char sel[96];
+                    size_t sl = d->hexsel.length;
+                    if (d->hexsel.start >= (size_t)d->len) sl = 0;
+                    snprintf(sel, sizeof sel, "已选 %zu 字节（0x%zX 起）", sl, d->hexsel.start);
+                    cui_menu_label(ui, sel);
+                    cui_menu_separator(ui);
+                    if (cui_menu_item(ui, "复制选区（十六进制）", .icon = CUI_ICON_COPY,
+                                      .disabled = !sl))
+                        np_hex_copy(a, d, false);
+                    if (cui_menu_item(ui, "复制选区（ASCII）", .icon = CUI_ICON_COPY,
+                                      .disabled = !sl))
+                        np_hex_copy(a, d, true);
+                    if (cui_menu_item(ui, "转到偏移…", .icon = CUI_ICON_ARROW_RIGHT,
+                                      .shortcut = "Ctrl G"))
+                        a->dlg_hexgoto = true;
+                    if (cui_menu_item(ui, "全选字节", .disabled = !d->len)) {
+                        d->hexsel.start = 0;
+                        d->hexsel.length = (size_t)d->len;
+                        d->hexsel.cursor = 0;
+                    }
+                    cui_menu_separator(ui);
+                    cui_menu_label(ui, "十六进制编辑：键入数字直接覆盖字节，不改变文件大小");
+                } else {
                 if (cui_menu_item(ui, "全选", .shortcut = "Ctrl A"))
                     cui_code_editor_select(ui, d->editor_id, 0, d->len);
                 if (cui_menu_item(ui, "插入日期/时间", .icon = CUI_ICON_CLOCK, .shortcut = "F5")) {
@@ -2523,9 +2811,15 @@ static void np_frame(cui_ctx *ui, void *user) {
                 }
                 cui_menu_separator(ui);
                 cui_menu_label(ui, "撤销 Ctrl Z   重做 Ctrl Y / Ctrl Shift Z");
+                }
             }
 
             cui_menu_bar_menu(ui, "搜索") {
+                if (d->is_hex) {
+                    if (cui_menu_item(ui, "转到偏移…", .icon = CUI_ICON_ARROW_RIGHT,
+                                      .shortcut = "Ctrl G"))
+                        a->dlg_hexgoto = true;
+                } else {
                 if (cui_menu_item(ui, "查找…", .icon = CUI_ICON_SEARCH, .shortcut = "Ctrl F"))
                     np_open_find(a);
                 if (cui_menu_item(ui, "查找和替换…", .icon = CUI_ICON_REFRESH_CW, .shortcut = "Ctrl H"))
@@ -2533,17 +2827,18 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "转到行…", .icon = CUI_ICON_ARROW_RIGHT, .shortcut = "Ctrl G"))
                     a->dlg_goto = true;
                 cui_menu_separator(ui);
-                if (cui_menu_item(ui, "在文件中查找…", .icon = CUI_ICON_FOLDER_OPEN,
-                                  .shortcut = "Ctrl Shift F")) {
-                    a->dlg_find_files = true;
-                    if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
-                }
                 if (cui_menu_item(ui, "在当前文件中查找", .icon = CUI_ICON_LIST,
                                   .shortcut = "Ctrl Shift L")) {
                     a->show_output = true;
                     a->out_tab = 0;
                     a->hits_rev = 0;
                     if (!a->find_query[0]) np_open_find(a);
+                }
+                }
+                if (cui_menu_item(ui, "在文件中查找…", .icon = CUI_ICON_FOLDER_OPEN,
+                                  .shortcut = "Ctrl Shift F")) {
+                    a->dlg_find_files = true;
+                    if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
                 }
                 if (cui_menu_item(ui, "显示输出窗口", .icon = CUI_ICON_TERMINAL,
                                   .shortcut = "F7", .checked = a->show_output))
@@ -2611,6 +2906,11 @@ static void np_frame(cui_ctx *ui, void *user) {
             }
 
             cui_menu_bar_menu(ui, "文档") {
+                if (d->is_hex) {
+                    cui_menu_label(ui, "当前：十六进制（二进制文件）");
+                    cui_menu_separator(ui);
+                    cui_menu_label(ui, "语法高亮在十六进制模式下不可用");
+                } else {
                 char cur[64];
                 snprintf(cur, sizeof cur, "当前：%s%s", NP_LANGS[d->lang].label,
                          d->lang_manual ? "（手动）" : "（自动）");
@@ -2636,9 +2936,13 @@ static void np_frame(cui_ctx *ui, void *user) {
                     d->lang = np_detect_lang(d->path, d->text);
                     d->lang_manual = false;
                 }
+                }
             }
 
             cui_menu_bar_menu(ui, "格式") {
+                if (d->is_hex) {
+                    cui_menu_label(ui, "十六进制模式：字节级编辑，无换行符与编码概念");
+                } else {
                 cui_menu_label(ui, "等宽网格：长行横向滚动，不自动换行");
                 cui_menu_separator(ui);
                 char nl[64];
@@ -2649,6 +2953,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, en)) d->enc = (d->enc + 1) % 3;
                 cui_menu_separator(ui);
                 cui_menu_label(ui, "以上两项只作用于当前标签");
+                }
             }
 
             cui_menu_bar_menu(ui, "帮助") {
@@ -2690,6 +2995,10 @@ static void np_frame(cui_ctx *ui, void *user) {
             }
             if (cui_toolbar_button(ui, CUI_ICON_CODE, .tooltip = "语法高亮语言…"))
                 np_open_lang_dialog(a);
+            if (cui_toolbar_button(ui, CUI_ICON_CPU,
+                                   .tooltip = d->is_hex ? "切换到文本编辑"
+                                                        : "以十六进制模式重新打开"))
+                np_hex_reopen(a, !d->is_hex);
             cui_toolbar_separator(ui);
             cui_toolbar_button(ui, CUI_ICON_PANEL_LEFT,
                                .tooltip = "目录 / 工作区侧栏  Ctrl B",
@@ -2748,6 +3057,22 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_status_bar_item(ui, panes, .tooltip = "点击：切换侧栏；Ctrl+B / F7 分别控制侧栏和输出窗口"))
                     a->show_sidebar = !a->show_sidebar;
                 cui_status_bar_spacer(ui);
+                if (d->is_hex) {
+                    char hx[96];
+                    snprintf(hx, sizeof hx, "偏移 0x%zX###hexpos", d->hexsel.cursor);
+                    if (cui_status_bar_item(ui, hx, .tooltip = "点击：转到偏移…"))
+                        a->dlg_hexgoto = true;
+                    if (d->hexsel.length) {
+                        char sel[64];
+                        snprintf(sel, sizeof sel, "已选 %zu 字节###hexsel", d->hexsel.length);
+                        cui_status_bar_text(ui, sel, .tone = CUI_TONE_INFO);
+                    }
+                    char sz[48];
+                    np_size_str(sz, sizeof sz, (size_t)d->len);
+                    char count2[128];
+                    snprintf(count2, sizeof count2, "共 %d 字节 · %s###hexcount", d->len, sz);
+                    cui_status_bar_text(ui, count2);
+                } else {
                 if (d->find_matches > 0) {
                     char find[64];
                     snprintf(find, sizeof find, "匹配 %d/%d###find",
@@ -2787,6 +3112,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                 snprintf(nl, sizeof nl, "%s###nl", d->crlf ? "CRLF" : "LF");
                 if (cui_status_bar_item(ui, nl, .tooltip = "点击切换换行符"))
                     d->crlf = !d->crlf;
+                }
                 char fs[32];
                 snprintf(fs, sizeof fs, "%d pt###font", a->font_size);
                 if (cui_status_bar_item(ui, fs, .tooltip = "点击重置字号"))
