@@ -11,19 +11,38 @@
 `installer.nsi` 的 `.onInit` 用 NSIS 的 `IsNativeARM64` / `RunningX64` 检测本机架构：
 通用安装包会把匹配的二进制改名为 `RapidEditor.exe`，单一架构包装错机器时直接给出提示并退出，不会留下半安装状态。
 
-## 右键菜单
+## 右键菜单与文件关联
 
-安装时写入（卸载时删除）：
+安装时写入（卸载时全部删除）：
 
 ```
-HKCR\*\shell\RapidEditor            (默认) = 用 RapidEditor 打开
-HKCR\*\shell\RapidEditor            Icon    = <安装目录>\RapidEditor.exe,0
-HKCR\*\shell\RapidEditor\command    (默认) = "<安装目录>\RapidEditor.exe" "%1"
-HKCR\txtfile\shell\RapidEditor      ...
+HKCR\*\shell\RapidEditor                        (默认) = 用 RapidEditor 打开
+HKCR\txtfile\shell\RapidEditor                  ...
+HKCR\SystemFileAssociations\.txt\shell\RapidEditor     ...   （每个常用文本类型一条）
+HKCR\SystemFileAssociations\.md\shell\RapidEditor      ...
+HKCR\SystemFileAssociations\.json\shell\RapidEditor    ...
+... （共 89 种扩展名）
+HKCR\Applications\RapidEditor.exe               FriendlyAppName / shell\open\command
 ```
 
-`*` 覆盖所有文件，`txtfile` 额外覆盖文本文档类；**不会修改默认打开方式**。
-主程序用 `CommandLineToArgvW` 读取宽字符命令行，中文路径也能正确打开。
+每条右键项都包含：
+
+```
+(默认) = 用 RapidEditor 打开
+Icon    = <安装目录>\RapidEditor.exe,0
+command = "<安装目录>\RapidEditor.exe" "%1"
+```
+
+- `*` 覆盖所有文件，`txtfile` 覆盖文本文档类。
+- `SystemFileAssociations\<扩展名>` 为常用文本/配置/代码文件逐个加上右键项，
+  覆盖 txt、log、md、json、yaml、toml、ini、csv、html、css、js、ts、c/c++、
+  py、go、rs、java、sh、bat、sql、diff 等 89 种扩展名；完整列表见 `installer.nsi`
+  里的 `TEXT_EXTS`。
+- `Applications\RapidEditor.exe` 让 RapidEditor 出现在 Windows“打开方式”列表中。
+
+这些都**不会修改默认打开方式和文件图标**。扩展名列表只维护在 `TEXT_EXTS` 一处，
+安装和卸载共用同一个遍历函数。主程序用 `CommandLineToArgvW` 读取宽字符命令行，
+中文路径也能正确打开。
 
 ## 本地构建
 

@@ -59,9 +59,16 @@ VIAddVersionKey /LANG=2052 "LegalCopyright"  "Copyright (c) RapidAI"
 VIAddVersionKey /LANG=2052 "FileVersion"     "${PRODUCT_VERSION}"
 
 ; ---------------------------------------------------------------------------
-; Right-click verb. HKCR\* puts "用 RapidEditor 打开" on every file; txtfile
-; covers the plain-text class explicitly. The user's default app is untouched.
+; Right-click verbs.
+;   HKCR\*                              -> every file
+;   HKCR\txtfile                        -> the plain-text class explicitly
+;   HKCR\SystemFileAssociations\.ext    -> each common text/code type below
+; SystemFileAssociations is the documented place to attach a verb to an
+; extension without taking over its ProgID, so the user's default app and
+; file icons are never changed. The extension list lives in TEXT_EXTS only.
 ; ---------------------------------------------------------------------------
+!define TEXT_EXTS "txt text log md markdown rst adoc org tex json jsonc json5 yaml yml toml ini cfg conf properties env csv tsv xml xsl xsd html htm xhtml css scss less sass js jsx mjs cjs ts tsx vue svelte c h cpp hpp cc cxx hxx cs java kt kts scala go rs py pyw rb php pl pm lua sh bash zsh fish ps1 bat cmd sql swift m mm r dart groovy gradle asm s v vhdl diff patch gitignore gitattributes editorconfig dockerfile makefile cmake lock"
+
 !macro ADD_CONTEXT_MENU KEY
   WriteRegStr HKCR "${KEY}\shell\RapidEditor" "" "用 RapidEditor 打开"
   WriteRegStr HKCR "${KEY}\shell\RapidEditor" "Icon" "$INSTDIR\${APP_EXE},0"
@@ -71,6 +78,50 @@ VIAddVersionKey /LANG=2052 "FileVersion"     "${PRODUCT_VERSION}"
 !macro DEL_CONTEXT_MENU KEY
   DeleteRegKey HKCR "${KEY}\shell\RapidEditor"
 !macroend
+
+Var /GLOBAL RE_ExtRest
+Var /GLOBAL RE_ExtTok
+Var /GLOBAL RE_ExtOp
+
+; Walks TEXT_EXTS and adds/removes the per-extension verb.
+; $RE_ExtOp is "add" or "del"; callers run with the correct SetRegView.
+; Generated twice so the uninstaller gets its own un.RE_TextExtAssoc.
+!macro RE_DEFINE_TEXT_EXT_ASSOC UN
+Function ${UN}RE_TextExtAssoc
+  StrCpy $RE_ExtRest "${TEXT_EXTS}"
+  RE_TextExt_loop:
+    StrLen $0 $RE_ExtRest
+    StrCmp $0 0 RE_TextExt_done
+    StrCpy $1 0
+  RE_TextExt_scan:
+    IntCmp $1 $0 RE_TextExt_last RE_TextExt_continue RE_TextExt_last
+  RE_TextExt_continue:
+    StrCpy $2 $RE_ExtRest 1 $1
+    StrCmp $2 " " RE_TextExt_found
+    IntOp $1 $1 + 1
+    Goto RE_TextExt_scan
+  RE_TextExt_found:
+    StrCpy $RE_ExtTok $RE_ExtRest $1
+    IntOp $1 $1 + 1
+    StrCpy $RE_ExtRest $RE_ExtRest "" $1
+    Goto RE_TextExt_use
+  RE_TextExt_last:
+    StrCpy $RE_ExtTok $RE_ExtRest
+    StrCpy $RE_ExtRest ""
+  RE_TextExt_use:
+    ${If} $RE_ExtOp == "del"
+      DeleteRegKey HKCR "SystemFileAssociations\.$RE_ExtTok\shell\RapidEditor"
+    ${Else}
+      WriteRegStr HKCR "SystemFileAssociations\.$RE_ExtTok\shell\RapidEditor" "" "用 RapidEditor 打开"
+      WriteRegStr HKCR "SystemFileAssociations\.$RE_ExtTok\shell\RapidEditor" "Icon" "$INSTDIR\${APP_EXE},0"
+      WriteRegStr HKCR "SystemFileAssociations\.$RE_ExtTok\shell\RapidEditor\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+    ${EndIf}
+    Goto RE_TextExt_loop
+  RE_TextExt_done:
+FunctionEnd
+!macroend
+!insertmacro RE_DEFINE_TEXT_EXT_ASSOC ""
+!insertmacro RE_DEFINE_TEXT_EXT_ASSOC "un."
 
 ; $R0 = x64 | arm64 | x86. Checked before anything is written, so a wrong-arch
 ; installer exits with a clear message instead of leaving a broken install.
@@ -143,15 +194,25 @@ Section "RapidEditor" SEC_MAIN
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" \
                    "URLInfoAbout"    "${PRODUCT_WEB_SITE}"
 
-  ; Right-click on any file -> Open with RapidEditor
+  ; Right-click: any file, the text-file class, and all common text/code types.
   !insertmacro ADD_CONTEXT_MENU "*"
   !insertmacro ADD_CONTEXT_MENU "txtfile"
+  StrCpy $RE_ExtOp "add"
+  Call RE_TextExtAssoc
+
+  ; Register as a known editor so Windows lists it under "Open with".
+  ; This does not change the user's default association.
+  WriteRegStr HKCR "Applications\${APP_EXE}" "FriendlyAppName" "${PRODUCT_NAME}"
+  WriteRegStr HKCR "Applications\${APP_EXE}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
 SectionEnd
 
 Section "Uninstall"
   SetRegView 64
   !insertmacro DEL_CONTEXT_MENU "*"
   !insertmacro DEL_CONTEXT_MENU "txtfile"
+  StrCpy $RE_ExtOp "del"
+  Call un.RE_TextExtAssoc
+  DeleteRegKey HKCR "Applications\${APP_EXE}"
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\bin-x64.tmp"
