@@ -2862,7 +2862,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                          .color = CUI_COLOR_ACCENT_FOREGROUND);
             }
             cui_text(ui, "RapidEditor", .size = 14, .font = CUI_FONT_MEDIUM);
-            cui_badge(ui, "v1.1.1", .size = CUI_SIZE_SM, .tone = CUI_TONE_NEUTRAL);
+            cui_badge(ui, "v1.1.2", .size = CUI_SIZE_SM, .tone = CUI_TONE_NEUTRAL);
             cui_separator(ui);
             cui_text(ui, "文本 · 十六进制编辑器", .size = 11,
                      .color = CUI_COLOR_TEXT_MUTED);

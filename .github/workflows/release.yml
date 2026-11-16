@@ -20,9 +20,13 @@ on:
 permissions:
   contents: write
 
+# Do not cancel an in-progress tag/release run when a branch push arrives.
+# A cancelled macOS job previously forced a manual release with stale pkg
+# metadata. Let runs finish; serialise tag pushes instead to limit runner
+# contention.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   meta:
