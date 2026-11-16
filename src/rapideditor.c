@@ -242,6 +242,8 @@ typedef struct notepad {
     bool boot_done, fonts_ready, dark, line_numbers, show_status, default_crlf;
     bool quiet;                         /* no "opened" toasts while loading startup files */
     int  accent, font_size;
+    int  density;                       /* 0 comfortable, 1 compact, 2 spacious */
+    bool welcome_dismissed;             /* hide the start screen on an empty session */
     int  pending_action, pending_doc;
 
     /* dialogs */
@@ -1274,6 +1276,16 @@ static void np_hex_reopen(notepad *a, bool as_hex) {
                      d->path, CUI_TONE_SUCCESS);
 }
 
+/* Open dialog that forces hex mode (the normal Open dialog auto-detects). */
+static void np_open_hex_dialog(notepad *a) {
+    char p[NP_PATH_CAP];
+    if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+            .kind = CUI_FILE_OPEN, .title = "以十六进制方式打开文件",
+            .filter_name = "所有文件", .filter = "*" },
+            p, sizeof p) && np_open_path(a, p, true))
+        np_hex_reopen(a, true);
+}
+
 /* ------------------------------------------------------------------ */
 /* Fonts: CUI's embedded fonts cover Latin, so add a CJK fallback       */
 /* ------------------------------------------------------------------ */
@@ -1295,6 +1307,31 @@ static void np_load_fonts(cui_ctx *ui, notepad *a) {
             cui_font_add_fallback(ui, (cui_font)role, f);
         break;
     }
+}
+
+/* Tighter radii, calmer elevation and a controlled type scale give the stock
+ * CUI widgets a professional editor feel. Applied every frame so a system
+ * theme change or a set_theme() call cannot silently reset the settings. */
+static void np_apply_theme(cui_ctx *ui, const notepad *a) {
+    cui_theme *t = cui_theme_get(ui);
+    if (!t) return;
+    t->radius_control = 8;
+    t->radius_panel = 13;
+    t->radius_surface = 18;
+    t->control_sm = a->density == 1 ? 26 : a->density == 2 ? 34 : 29;
+    t->control_md = a->density == 1 ? 32 : a->density == 2 ? 42 : 36;
+    t->control_lg = a->density == 1 ? 40 : a->density == 2 ? 50 : 44;
+    t->text_xs = 11;
+    t->text_sm = 12;
+    t->text_body = 13;
+    t->text_lg = 15;
+    t->heading[0] = 32; t->heading[1] = 26; t->heading[2] = 21; t->heading[3] = 16;
+    t->shadow_resting[0] = (cui_shadow){ 0, 2, 0, 0.04f };
+    t->shadow_resting[1] = (cui_shadow){ 2, 8, 0, 0.05f };
+    t->shadow_raised[0]   = (cui_shadow){ 2, 8, -2, 0.08f };
+    t->shadow_raised[1]   = (cui_shadow){ 8, 20, -6, 0.10f };
+    t->shadow_floating[0] = (cui_shadow){ 6, 18, -4, 0.12f };
+    t->shadow_floating[1] = (cui_shadow){ 16, 44, -12, 0.18f };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1499,6 +1536,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "Ctrl F          查找（编辑器内置查找栏）",
             "Ctrl H          查找和替换",
             "Ctrl Shift F    在文件中查找（目录搜索）",
+            "F1              快捷键帮助  / F7 输出窗口",
             "Ctrl Shift L    在当前文件中列出所有匹配行",
             "Ctrl G          转到行",
             "F5              插入日期和时间",
@@ -2068,12 +2106,17 @@ static void np_config_load(notepad *a) {
         if (!strcmp(key, "dark")) {
             a->dark = atoi(val) != 0;
             a->dark_valid = true;
+        } else if (!strcmp(key, "system_theme")) {
+            if (atoi(val)) a->dark_valid = false;   /* follow OS, ignore saved dark */
         } else if (!strcmp(key, "accent")) {
             int v = atoi(val);
             if (v >= 0 && v < CUI_ACCENT_COUNT) a->accent = v;
         } else if (!strcmp(key, "font")) {
             int v = atoi(val);
             if (v >= NP_FONT_MIN && v <= NP_FONT_MAX) a->font_size = v;
+        } else if (!strcmp(key, "density")) {
+            int v = atoi(val);
+            if (v >= 0 && v <= 2) a->density = v;
         } else if (!strcmp(key, "line_numbers")) a->line_numbers = atoi(val) != 0;
         else if (!strcmp(key, "show_status")) a->show_status = atoi(val) != 0;
         else if (!strcmp(key, "show_sidebar")) a->show_sidebar = atoi(val) != 0;
@@ -2115,16 +2158,16 @@ static void np_config_save(notepad *a) {
         if (d->path[0] && !d->dirty)
             snprintf(a->session[a->session_count++], NP_PATH_CAP, "%s", d->path);
     }
-    fprintf(f, "dark=%d\naccent=%d\nfont=%d\n",
-            a->dark ? 1 : 0, a->accent, a->font_size);
+    fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\n",
+            a->dark ? 1 : 0, a->accent, a->font_size, a->density);
     fprintf(f, "line_numbers=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n",
             a->line_numbers ? 1 : 0, a->show_status ? 1 : 0,
             a->show_sidebar ? 1 : 0, a->show_output ? 1 : 0);
     fprintf(f, "follow_active=%d\ndefault_crlf=%d\nmake_backup=%d\n"
-               "session_restore=%d\nmatch_case=%d\n",
+               "session_restore=%d\nmatch_case=%d\nsystem_theme=%d\n",
             a->follow_active ? 1 : 0, a->default_crlf ? 1 : 0,
             a->make_backup ? 1 : 0, a->session_restore ? 1 : 0,
-            a->match_case ? 1 : 0);
+            a->match_case ? 1 : 0, a->dark_valid ? 0 : 1);
     fprintf(f, "find=%s\nreplace=%s\nworkdir=%s\n",
             a->find_query, a->replace_with, a->side_dir);
     for (int i = 0; i < a->recent_count; i++)
@@ -2374,9 +2417,19 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
             if (cui_button(ui, "查找结果", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_SEARCH,
                            .selected = a->out_tab == 0)) a->out_tab = 0;
+            if (a->hit_count) {
+                char n[16];
+                snprintf(n, sizeof n, "%d", a->hit_count);
+                cui_badge(ui, n, .size = CUI_SIZE_SM, .tone = CUI_TONE_INFO);
+            }
             if (cui_button(ui, "文件搜索", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_FOLDER_OPEN,
                            .selected = a->out_tab == 2)) a->out_tab = 2;
+            if (a->ff_hit_count) {
+                char n[16];
+                snprintf(n, sizeof n, "%d", a->ff_hit_count);
+                cui_badge(ui, n, .size = CUI_SIZE_SM, .tone = CUI_TONE_INFO);
+            }
             if (cui_button(ui, "消息", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_TERMINAL,
                            .selected = a->out_tab == 1)) a->out_tab = 1;
@@ -2461,12 +2514,88 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
     }
 }
 
+/* Thin IDE-style breadcrumb above the content area. */
+static void np_doc_breadcrumb(cui_ctx *ui, notepad *a, np_doc *d) {
+    (void)a;
+    cui_row(ui, .width = CUI_FILL, .gap = 8, .pad_x = 6, .pad_y = 2) {
+        if (d->path[0]) {
+            char dir[NP_PATH_CAP], crumb[NP_PATH_CAP + 64];
+            np_dir_of(d->path, dir, sizeof dir);
+            const char *base = np_base(dir);
+            if (base[0])
+                snprintf(crumb, sizeof crumb, "%s  /  %s###crumb", base, np_base(d->path));
+            else
+                snprintf(crumb, sizeof crumb, "%s###crumb", d->path);
+            cui_text(ui, crumb, .size = 11, .color = CUI_COLOR_TEXT_MUTED,
+                     .nowrap = true, .font = CUI_FONT_MONO);
+        } else {
+            cui_text(ui, "未命名文档###crumb", .size = 11,
+                     .color = CUI_COLOR_TEXT_MUTED);
+        }
+        cui_spacer(ui);
+        if (d->dirty)
+            cui_badge(ui, "未保存", .tone = CUI_TONE_WARNING, .size = CUI_SIZE_SM,
+                      .dot = true);
+        if (d->is_hex)
+            cui_badge(ui, "HEX", .tone = CUI_TONE_VIOLET, .size = CUI_SIZE_SM);
+        else
+            cui_badge(ui, NP_LANGS[d->lang].label, .tone = CUI_TONE_INFO,
+                      .size = CUI_SIZE_SM);
+    }
+}
+
+/* Start screen shown for an empty, untouched session — quick entry points
+ * instead of a blank editor with a tiny placeholder. */
+static void np_welcome_pane(cui_ctx *ui, notepad *a) {
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+               .gap = 14, .align = CUI_ALIGN_CENTER,
+               .justify = CUI_JUSTIFY_CENTER, .pad = 24) {
+        cui_box(ui, .width = CUI_PX(56), .height = CUI_PX(56),
+                .bg = CUI_COLOR_ACCENT, .radius = 16,
+                .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER) {
+            cui_text(ui, "R", .size = 28, .font = CUI_FONT_MEDIUM,
+                     .color = CUI_COLOR_ACCENT_FOREGROUND);
+        }
+        cui_text(ui, "RapidEditor", .size = 26, .font = CUI_FONT_MEDIUM);
+        cui_text(ui, "专业的文本与十六进制编辑器 · 大文件、UTF-8、跨平台、右键打开",
+                 .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        cui_gap(ui, 6);
+        cui_row(ui, .gap = 10) {
+            if (cui_button(ui, "打开文件", .icon = CUI_ICON_FOLDER_OPEN,
+                           .variant = CUI_BUTTON_PRIMARY))
+                np_open_dialog(a);
+            if (cui_button(ui, "十六进制打开", .icon = CUI_ICON_CPU))
+                np_open_hex_dialog(a);
+            if (cui_button(ui, "直接开始输入", .icon = CUI_ICON_SQUARE_PEN)) {
+                a->welcome_dismissed = true;
+                np_activate(a, a->active, true);
+            }
+        }
+        cui_text(ui, "Ctrl+O 打开   ·   Ctrl+N 新建   ·   Ctrl+Shift+F 在文件中查找   ·   F1 快捷键",
+                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        if (a->recent_count) {
+            cui_separator(ui);
+            cui_text(ui, "最近打开", .size = 12, .font = CUI_FONT_MEDIUM);
+            for (int i = 0; i < a->recent_count && i < 5; i++) {
+                char label[NP_PATH_CAP + 32];
+                snprintf(label, sizeof label, "%s##welcome-recent%d",
+                         np_base(a->recent[i]), i);
+                if (cui_button(ui, label, .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_HISTORY,
+                               .full_width = true))
+                    np_open_path(a, a->recent[i], true);
+            }
+        }
+    }
+}
+
 static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     /* Keep a little headroom so ordinary typing never hits the ceiling. */
     if ((size_t)d->len + 8192 > d->cap)
         np_ensure_cap(d, (size_t)d->len + 65536 + 1);
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 0) {
+        np_doc_breadcrumb(ui, a, d);
         cui_code_editor_result r = cui_code_editor(
             ui, d->editor_id, d->text, d->cap,
             .lang = NP_LANGS[d->lang].id,
@@ -2512,6 +2641,7 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
  * only feed it our buffer, track edits and wire the goto field. */
 static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
+        np_doc_breadcrumb(ui, a, d);
         cui_row(ui, .width = CUI_FILL, .gap = 6) {
             int flags = cui_input(ui, "hex-goto", a->hexgoto_buf, sizeof a->hexgoto_buf,
                                   .placeholder = "偏移（十六进制，如 1A2B）",
@@ -2578,16 +2708,20 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
         }
 
         np_doc *d = np_cur(a);
+        bool welcome = a->count == 1 && !d->is_hex && !a->welcome_dismissed &&
+                       np_blank_untitled(d);
         if (a->show_output) {
             cui_split(ui, "np_out_split", &a->out_ratio, .vertical = true,
                       .min_first = 140, .min_second = 100) {
-                if (d->is_hex) np_hex_pane(ui, a, d);
+                if (welcome) np_welcome_pane(ui, a);
+                else if (d->is_hex) np_hex_pane(ui, a, d);
                 else np_editor_pane(ui, a, d);
                 cui_split_next(ui);
                 np_output_panel(ui, a);
             }
         } else {
-            if (d->is_hex) np_hex_pane(ui, a, d);
+            if (welcome) np_welcome_pane(ui, a);
+            else if (d->is_hex) np_hex_pane(ui, a, d);
             else np_editor_pane(ui, a, d);
         }
     }
@@ -2601,6 +2735,7 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
 static void np_frame(cui_ctx *ui, void *user) {
     notepad *a = (notepad *)user;
     a->ui = ui;
+    np_apply_theme(ui, a);
 
     if (!a->boot_done) {
         a->boot_done = true;
@@ -2677,6 +2812,7 @@ static void np_frame(cui_ctx *ui, void *user) {
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) a->show_sidebar = !a->show_sidebar;
         if (cui_key_pressed(ui, CUI_KEY_F7)) a->show_output = !a->show_output;
+        if (cui_key_pressed(ui, CUI_KEY_F1)) a->dlg_help = true;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) {
             a->dlg_find_files = true;
             if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
@@ -2713,10 +2849,38 @@ static void np_frame(cui_ctx *ui, void *user) {
     }
     if (pending) cui_app_clear_pending_files();
 
-    /* Menu bar -------------------------------------------------------- */
+    /* Top chrome ------------------------------------------------------ */
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                .bg = CUI_COLOR_BACKGROUND, .gap = 0) {
-        cui_menu_bar(ui, "menubar") {
+        /* Brand row: identity, current mode and quick help. */
+        cui_row(ui, .width = CUI_FILL, .gap = 9, .pad_x = 12, .pad_y = 4,
+                .bg = CUI_COLOR_SURFACE, .align = CUI_ALIGN_CENTER) {
+            cui_box(ui, .width = CUI_PX(24), .height = CUI_PX(24), .radius = 7,
+                    .bg = CUI_COLOR_ACCENT, .align = CUI_ALIGN_CENTER,
+                    .justify = CUI_JUSTIFY_CENTER) {
+                cui_text(ui, "R", .size = 14, .font = CUI_FONT_MEDIUM,
+                         .color = CUI_COLOR_ACCENT_FOREGROUND);
+            }
+            cui_text(ui, "RapidEditor", .size = 14, .font = CUI_FONT_MEDIUM);
+            cui_badge(ui, "v1.0", .size = CUI_SIZE_SM, .tone = CUI_TONE_NEUTRAL);
+            cui_separator(ui);
+            cui_text(ui, "文本 · 十六进制编辑器", .size = 11,
+                     .color = CUI_COLOR_TEXT_MUTED);
+            cui_spacer(ui);
+            const char *dens[3] = { "舒适", "紧凑", "宽松" };
+            char dens_label[48];
+            snprintf(dens_label, sizeof dens_label, "密度：%s", dens[a->density]);
+            if (cui_button(ui, dens_label, .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_SLIDERS_HORIZONTAL,
+                           .tooltip = "点击切换界面密度"))
+                a->density = (a->density + 1) % 3;
+            if (cui_button(ui, "快捷键", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_KEYBOARD,
+                           .tooltip = "F1 打开快捷键帮助"))
+                a->dlg_help = true;
+        }
+        cui_column(ui, .width = CUI_FILL, .bg = CUI_COLOR_SURFACE, .gap = 0) {
+        cui_menu_bar(ui, "menubar", .no_border = true) {
             cui_menu_bar_menu(ui, "文件") {
                 if (cui_menu_item(ui, "新建标签", .icon = CUI_ICON_SQUARE_PEN, .shortcut = "Ctrl N")) {
                     if (np_doc_new(a)) np_activate(a, a->count - 1, true);
@@ -2885,12 +3049,25 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "深色模式", .icon = CUI_ICON_MOON, .checked = a->dark)) {
                     a->dark = !a->dark;
+                    a->dark_valid = true;
                     cui_app_follow_system_theme(NULL, false);
                     cui_set_theme(ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
+                }
+                if (cui_menu_item(ui, "跟随系统主题", .checked = !a->dark_valid)) {
+                    a->dark_valid = false;
+                    cui_app_follow_system_theme(NULL, true);
+                    a->dark = cui_get_theme_mode(ui) == CUI_THEME_DARK;
                 }
                 if (cui_menu_item(ui, "切换强调色", .icon = CUI_ICON_PALETTE)) {
                     a->accent = (a->accent + 1) % CUI_ACCENT_COUNT;
                     cui_set_accent(ui, (cui_accent)a->accent);
+                }
+                {
+                    static const char *dens[3] = { "舒适", "紧凑", "宽松" };
+                    char label[64];
+                    snprintf(label, sizeof label, "界面密度：%s", dens[a->density]);
+                    if (cui_menu_item(ui, label, .icon = CUI_ICON_SLIDERS_HORIZONTAL))
+                        a->density = (a->density + 1) % 3;
                 }
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "放大字号", .icon = CUI_ICON_ZOOM_IN, .shortcut = "Ctrl +"))
@@ -2963,7 +3140,7 @@ static void np_frame(cui_ctx *ui, void *user) {
         }
 
         /* Toolbar ----------------------------------------------------- */
-        cui_toolbar(ui, "tools") {
+        cui_toolbar(ui, "tools", .style = CUI_TOOLBAR_PLAIN, .no_border = true) {
             if (cui_toolbar_button(ui, CUI_ICON_PLUS, .tooltip = "新建标签", .shortcut = "Ctrl N")) {
                 if (np_doc_new(a)) np_activate(a, a->count - 1, true);
             }
@@ -3014,10 +3191,12 @@ static void np_frame(cui_ctx *ui, void *user) {
             if (cui_toolbar_button(ui, a->dark ? CUI_ICON_SUN : CUI_ICON_MOON,
                                    .tooltip = a->dark ? "浅色模式" : "深色模式")) {
                 a->dark = !a->dark;
+                a->dark_valid = true;
                 cui_app_follow_system_theme(NULL, false);
                 cui_set_theme(ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
             }
         }
+        }   /* top chrome surface */
 
         /* Main workspace: directory pane | (tabs + editor + output pane).
          * Both dividers are draggable; the ratios live in the app state. */
@@ -3039,6 +3218,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                     cui_status_bar_text(ui, "未保存", .icon = CUI_ICON_DOT, .tone = CUI_TONE_WARNING);
                 else
                     cui_status_bar_text(ui, "已保存", .icon = CUI_ICON_CHECK, .tone = CUI_TONE_SUCCESS);
+                cui_status_bar_text(ui, d->is_hex ? "HEX###modechip" : "TEXT###modechip",
+                                    .icon = d->is_hex ? CUI_ICON_CPU : CUI_ICON_FILE_TEXT,
+                                    .tone = d->is_hex ? CUI_TONE_VIOLET : CUI_TONE_INFO);
                 char path[256 + 32];
                 snprintf(path, sizeof path, "%s###path",
                          d->path[0] ? np_base(d->path) : "未命名文档");
@@ -3133,6 +3315,7 @@ int main(int argc, char **argv) {
     g.line_numbers = true;
     g.show_status = true;
     g.accent = CUI_ACCENT_BLUE;
+    g.density = 0;
     g.match_case = false;
     g.pending_action = ACT_NONE;
     g.pending_doc = -1;
