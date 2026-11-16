@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(RapidEditor
-    VERSION 1.1.0
+    VERSION 1.1.1
     DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
     HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
     LANGUAGES C)

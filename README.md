@@ -71,7 +71,7 @@ cmake -S . -B build -G Ninja -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
 | 手动触发 | 可指定版本号、勾选是否发布 |
 
 ```sh
-git tag v1.1.0 && git push origin v1.1.0
+git tag v1.1.1 && git push origin v1.1.1
 ```
 
 Job 说明：
