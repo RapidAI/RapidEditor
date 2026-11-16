@@ -46,7 +46,7 @@ cmake -S . -B build -G Ninja -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
 
 | 平台 | 格式 | 脚本 | 架构策略 | 右键菜单 |
 | --- | --- | --- | --- | --- |
-| Windows | NSIS `.exe` | `packaging/windows/build_installer.bat` | `windows-universal` 一个包内含 x64 + ARM64 两份二进制；安装时用 `IsNativeARM64` / `RunningX64` 自动选 | `HKCR\*` + `HKCR\SystemFileAssociations\.ext`（89 种常用文本/代码类型）+「打开方式」注册：「用 RapidEditor 打开」 |
+| Windows | NSIS `.exe`（MUI2 标准安装向导） | `packaging/windows/build_installer.bat` | `windows-universal` 一个包内含 x64 + ARM64 两份二进制；安装时用 `IsNativeARM64` / `RunningX64` 自动选 | `HKCR\*` + `HKCR\SystemFileAssociations\.ext`（89 种常用文本/代码类型）+「打开方式」注册：「用 RapidEditor 打开」 |
 | macOS | `.pkg` | `packaging/macos/build_pkg.sh` | 一份 `x86_64;arm64` 通用二进制，Intel / Apple Silicon 通用 | Finder 右键「打开方式 → RapidEditor」+「快速操作 / 用 RapidEditor 打开」 |
 | Linux | `.AppImage` | `packaging/linux/build_appimage.sh` | 分别产出 `x86_64` / `aarch64` 两个包，`install-linux.sh` 按 `uname -m` 自动选 | `.desktop` MimeType 关联「打开方式」+ `file-manager/actions` 右键动作 |
 
@@ -71,7 +71,7 @@ cmake -S . -B build -G Ninja -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
 | 手动触发 | 可指定版本号、勾选是否发布 |
 
 ```sh
-git tag v1.1.2 && git push origin v1.1.2
+git tag v1.1.3 && git push origin v1.1.3
 ```
 
 Job 说明：

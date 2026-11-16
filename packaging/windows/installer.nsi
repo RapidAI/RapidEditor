@@ -18,6 +18,7 @@ Unicode true
 
 !include "LogicLib.nsh"
 !include "x64.nsh"
+!include "MUI2.nsh"
 
 !ifndef PRODUCT_VERSION
   !define PRODUCT_VERSION "1.0.0"
@@ -57,6 +58,45 @@ VIAddVersionKey /LANG=2052 "FileDescription" "${PRODUCT_NAME} Installer"
 VIAddVersionKey /LANG=2052 "CompanyName"     "${PRODUCT_PUBLISHER}"
 VIAddVersionKey /LANG=2052 "LegalCopyright"  "Copyright (c) RapidAI"
 VIAddVersionKey /LANG=2052 "FileVersion"     "${PRODUCT_VERSION}"
+
+; ---------------------------------------------------------------------------
+; Modern UI (MUI2) -- a standard install wizard instead of the bare NSIS
+; "extract" window. Full page flow:
+;   Welcome -> License -> Components -> Directory -> Install -> Finish
+; Uninstall gets its own wizard: Welcome -> Confirm -> Install -> Finish.
+; ---------------------------------------------------------------------------
+!define MUI_ICON                    "${RE_ASSETS}\rapideditor.ico"
+!define MUI_UNICON                  "${RE_ASSETS}\rapideditor.ico"
+!define MUI_WELCOMEPAGE_TITLE       "欢迎安装 ${PRODUCT_NAME}"
+!define MUI_WELCOMEPAGE_TEXT        "本向导将引导你完成 ${PRODUCT_NAME} ${PRODUCT_VERSION} 的安装。$\r$\n$\r$\n它会根据本机架构自动安装匹配的版本，并添加「用 RapidEditor 打开」右键菜单。$\r$\n$\r$\n点击「下一步」继续。"
+!define MUI_LICENSEPAGE_TEXT_TOP    "请仔细阅读以下许可协议（MIT License）："
+!define MUI_COMPONENTSPAGE_TEXT_TOP "选择要安装的组件，然后点击「下一步」。"
+!define MUI_COMPONENTSPAGE_TEXT_COMPLIST "组件："
+!define MUI_DIRECTORYPAGE_TEXT_TOP  "选择 ${PRODUCT_NAME} 的安装目录。"
+!define MUI_FINISHPAGE_TITLE        "${PRODUCT_NAME} 安装完成"
+!define MUI_FINISHPAGE_TEXT         "${PRODUCT_NAME} ${PRODUCT_VERSION} 已成功安装。$\r$\n$\r$\n点击「完成」退出向导。"
+!define MUI_FINISHPAGE_RUN          "$INSTDIR\${APP_EXE}"
+!define MUI_FINISHPAGE_RUN_TEXT     "立即运行 ${PRODUCT_NAME}"
+!define MUI_UNWELCOMEPAGE_TITLE     "卸载 ${PRODUCT_NAME}"
+!define MUI_UNWELCOMEPAGE_TEXT      "本向导将从计算机中移除 ${PRODUCT_NAME}。$\r$\n$\r$\n点击「下一步」继续。"
+
+; Install wizard pages
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
+!insertmacro MUI_PAGE_COMPONENTS
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+; Uninstall wizard pages
+!insertmacro MUI_UNPAGE_WELCOME
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_UNPAGE_FINISH
+
+; Language must be inserted after the page macros. Simplified Chinese matches
+; the Chinese wizard text above; the UTF-8 BOM at file top keeps it intact.
+!insertmacro MUI_LANGUAGE "SimpChinese"
 
 ; ---------------------------------------------------------------------------
 ; Right-click verbs.
@@ -150,7 +190,8 @@ Function .onInit
   ${EndIf}
 FunctionEnd
 
-Section "RapidEditor" SEC_MAIN
+Section "RapidEditor 主程序 (必需)" SEC_MAIN
+  SectionIn RO  ; required -- always installed, cannot be unchecked
   SetRegView 64
   SetOutPath "$INSTDIR"
 
@@ -206,6 +247,18 @@ Section "RapidEditor" SEC_MAIN
   WriteRegStr HKCR "Applications\${APP_EXE}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
 SectionEnd
 
+Section "创建桌面快捷方式" SEC_DESKTOP
+  CreateShortCut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${APP_EXE}" \
+                 "" "$INSTDIR\${APP_EXE}" 0
+SectionEnd
+
+Section "创建开始菜单快捷方式" SEC_STARTMENU
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${APP_EXE}" \
+                 "" "$INSTDIR\${APP_EXE}" 0
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\卸载 ${PRODUCT_NAME}.lnk" \
+                 "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
+SectionEnd
+
 Section "Uninstall"
   SetRegView 64
   !insertmacro DEL_CONTEXT_MENU "*"
@@ -213,6 +266,11 @@ Section "Uninstall"
   StrCpy $RE_ExtOp "del"
   Call un.RE_TextExtAssoc
   DeleteRegKey HKCR "Applications\${APP_EXE}"
+
+  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\卸载 ${PRODUCT_NAME}.lnk"
+  RMDir  "$SMPROGRAMS\${PRODUCT_NAME}"
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\bin-x64.tmp"
