@@ -28,6 +28,7 @@ typedef struct {
     bool pending_up;  /* deferred release after collapsing a drag selection */
     Uint32 tdown_ms;
     float tdown_x, tdown_y;   /* first finger down pos, logical pts */
+    bool ime_seen;    /* a focused text field asked for IME this frame */
 } cui__sdl;
 
 static cui__sdl *cui__s(cui_app *app) { return app->plat; }
@@ -95,7 +96,27 @@ static void cui__sdl_text_input_rect(void *user, cui_rect caret) {
     if (r.w < 1) r.w = 1;
     if (r.h < 1) r.h = 1;
     SDL_SetTextInputRect(&r);
+#ifdef __ANDROID__
+    /* Only a focused text field calls this (cui_textedit gates it on focus).
+     * Mark the frame so the end-of-frame sync keeps the IME alive; when no
+     * field is focused the sync hides the soft keyboard instead. */
+    cui__sdl *s = cui__s((cui_app *)user);
+    if (s) s->ime_seen = true;
+#endif
     if (!SDL_IsTextInputActive()) SDL_StartTextInput();
+}
+
+/* Desktop leaves text input on for type-ahead outside text fields. On Android
+ * that pins the soft keyboard open forever, so end each frame by disabling it
+ * unless a focused field actually requested it. */
+static void cui__sdl_ime_sync(cui_app *app) {
+#ifdef __ANDROID__
+    cui__sdl *s = cui__s(app);
+    if (s && !s->ime_seen && SDL_IsTextInputActive()) SDL_StopTextInput();
+    if (s) s->ime_seen = false;
+#else
+    (void)app;
+#endif
 }
 
 bool cui__plat_init(cui_app *app) {
@@ -162,8 +183,12 @@ bool cui__plat_init(cui_app *app) {
     /* Text input stays on while the window is open, not only while a text field has
      * focus: type-ahead in lists, trees and the file browser, the one-time code input,
      * the hex editor and the shortcut recorder read typed characters without being a
-     * text field, and SDL delivers no SDL_TEXTINPUT while text input is off. */
+     * text field, and SDL delivers no SDL_TEXTINPUT while text input is off.
+     * Android is the exception: a permanently active IME pins the soft keyboard
+     * open, so there cui__sdl_ime_sync ties it to text-field focus instead. */
+#ifndef __ANDROID__
     SDL_StartTextInput();
+#endif
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
     cui_platform_iface pi;
     memset(&pi, 0, sizeof pi);
@@ -204,7 +229,9 @@ bool cui__plat_gl_create(cui_app *app, bool vsync) {
                                   app->desc.width, app->desc.height, flags);
         if (s->win) {
             SDL_SetWindowMinimumSize(s->win, app->desc.min_width, app->desc.min_height);
+#ifndef __ANDROID__
             SDL_StartTextInput();
+#endif
             SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
         }
         return false;
@@ -215,10 +242,11 @@ bool cui__plat_gl_create(cui_app *app, bool vsync) {
 }
 
 void *cui__plat_gl_proc(const char *name) { return SDL_GL_GetProcAddress(name); }
-void cui__plat_gl_swap(cui_app *app) { SDL_GL_SwapWindow(cui__s(app)->win); }
+void cui__plat_gl_swap(cui_app *app) { SDL_GL_SwapWindow(cui__s(app)->win); cui__sdl_ime_sync(app); }
 
 void cui__plat_present(cui_app *app, const void *bgra, int w, int h, int stride) {
     cui__sdl *s = cui__s(app);
+    cui__sdl_ime_sync(app);
     SDL_Surface *dst = SDL_GetWindowSurface(s->win);
     if (!dst) return;
     SDL_Surface *src = SDL_CreateRGBSurfaceWithFormatFrom((void *)bgra, w, h, 32, stride, SDL_PIXELFORMAT_ARGB8888);

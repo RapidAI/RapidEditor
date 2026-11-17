@@ -512,7 +512,10 @@ static void cui__edit_follow_caret(cui__edit_frame *c, const cui__edit_result *r
         float total = c->nlines * c->line_h;
         if (e->scroll_y > total - area.h) e->scroll_y = CUI_MAX(0, total - area.h);
     }
-    if (ui->platform.set_text_input_rect) {
+    /* Only the focused field reports its caret: on Android this is the signal
+     * that keeps the soft keyboard up. Unfocused fields calling it would make
+     * the IME look permanently active. */
+    if (res->focused && ui->platform.set_text_input_rect) {
         cui_rect cr = area;
         if (!c->multiline) cr.x = area.x + cui__x_at(ui, &c->measure, c->buf, len, e->cursor) - e->scroll_x;
         else if (c->nlines > 0) {   /* the caret's line, so the candidate list opens under it, not under the whole area */
