@@ -21,6 +21,12 @@
 #include "np_preview.h"
 #include "np_webview.h"
 #include "np_font_bundle.h"
+#include "np_updater.h"
+
+/* App version for the update check. Keep in sync with versionName in
+ * android/app/build.gradle (single source of truth for the Android build
+ * is there; this macro drives the GitHub tag comparison). */
+#define NP_APP_VERSION "1.2.0"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -262,6 +268,9 @@ typedef struct notepad {
 
     /* dialogs */
     bool dlg_confirm, dlg_replace, dlg_goto, dlg_help, dlg_about, dlg_lang;
+    bool dlg_update;                    /* Android: check GitHub Releases */
+    char update_buf[512];               /* scratch lines for the update dialog */
+    int  upd_last_check, upd_last_dl;   /* poll caches: request redraw on flip */
     char find_query[256];
     char replace_with[256];
     char goto_buf[32];
@@ -363,8 +372,27 @@ static void np_logf(notepad *a, const char *fmt, ...) {
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
-           a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files;
+           a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
+           a->dlg_update;
 }
+
+#ifdef __ANDROID__
+/* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
+ * Unknown shapes (letters beyond the v prefix) fall back to inequality. */
+static bool np_update_tag_is_newer(const char *tag) {
+    if (!tag || !tag[0]) return false;
+    int cur[3] = {0, 0, 0}, lat[3] = {0, 0, 0};
+    const char *v = NP_APP_VERSION;
+    if (*v == 'v' || *v == 'V') v++;
+    if (*tag == 'v' || *tag == 'V') tag++;
+    bool cur_ok = sscanf(v, "%d.%d.%d", &cur[0], &cur[1], &cur[2]) >= 1;
+    bool lat_ok = sscanf(tag, "%d.%d.%d", &lat[0], &lat[1], &lat[2]) >= 1;
+    if (!cur_ok || !lat_ok) return strcmp(v, tag) != 0;
+    for (int i = 0; i < 3; i++)
+        if (lat[i] != cur[i]) return lat[i] > cur[i];
+    return false;
+}
+#endif
 
 static np_doc *np_cur(notepad *a) {
     if (a->count == 0) return NULL;
@@ -1714,6 +1742,87 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY)) a->dlg_about = false;
         }
     }
+
+#ifdef __ANDROID__
+    /* Software update: poll the np_updater state machine each frame. The
+     * network and the installer run in Java threads; the dialog just mirrors
+     * their state. */
+    cui_dialog(ui, "检查更新", &a->dlg_update,
+               .description = "从 GitHub Releases 获取 RapidEditor 最新版", .width = 440) {
+        cui_column(ui, .width = CUI_FILL, .gap = 6) {
+            int cs = np_updater_check_state();
+            int ds = np_updater_dl_state();
+            /* The states flip on Java worker threads; CUI only redraws on
+             * demand, so request a frame whenever something changed. */
+            if (cs != a->upd_last_check || ds != a->upd_last_dl) {
+                a->upd_last_check = cs;
+                a->upd_last_dl = ds;
+                cui_request_redraw(ui);
+            }
+            if (ds == NP_UPD_DL_RUNNING) cui_request_redraw(ui);  /* live progress */
+            if (cs == NP_UPD_RUNNING) {
+                cui_text(ui, "正在连接 GitHub…", .size = 12);
+            } else if (cs == NP_UPD_FAILED) {
+                cui_text(ui, "检查失败", .size = 14, .font = CUI_FONT_MEDIUM);
+                cui_text(ui, np_updater_check_error(), .size = 12);
+                cui_text(ui, "请确认设备可以访问 github.com。", .size = 12);
+            } else if (cs == NP_UPD_OK) {
+                const char *tag = np_updater_latest_tag();
+                if (!tag[0]) {
+                    cui_text(ui, "Release 数据不完整（未找到 tag_name）。", .size = 12);
+                } else if (!np_update_tag_is_newer(tag)) {
+                    cui_text(ui, "已是最新版本", .size = 14, .font = CUI_FONT_MEDIUM);
+                    snprintf(a->update_buf, sizeof a->update_buf,
+                             "当前版本 %s（最新 %s）", NP_APP_VERSION, tag);
+                    cui_text(ui, a->update_buf, .size = 12);
+                } else if (!np_updater_apk_url()[0]) {
+                    snprintf(a->update_buf, sizeof a->update_buf,
+                             "发现新版本 %s，但 Release 未附带 .apk 安装包。", tag);
+                    cui_text(ui, a->update_buf, .size = 12);
+                } else {
+                    snprintf(a->update_buf, sizeof a->update_buf,
+                             "发现新版本 %s（当前 %s）", tag, NP_APP_VERSION);
+                    cui_text(ui, a->update_buf, .size = 14, .font = CUI_FONT_MEDIUM);
+                    int ds = np_updater_dl_state();
+                    if (ds == NP_UPD_DL_IDLE) {
+                        cui_text(ui, "点击下方按钮下载并安装（约 7 MB）。", .size = 12);
+                    } else if (ds == NP_UPD_DL_RUNNING) {
+                        int pc = np_updater_dl_progress();
+                        snprintf(a->update_buf, sizeof a->update_buf, "下载中 %d%%", pc);
+                        cui_text(ui, a->update_buf, .size = 12);
+                        cui_progress(ui, (float)pc / 100.0f);
+                    } else if (ds == NP_UPD_DL_DONE) {
+                        cui_text(ui, "下载完成。点击「安装」后请在系统弹窗中确认。", .size = 12);
+                        cui_text(ui, "首次安装会要求允许「安装未知应用」。", .size = 12);
+                    } else if (ds == NP_UPD_DL_FAILED) {
+                        cui_text(ui, "下载失败", .size = 14, .font = CUI_FONT_MEDIUM);
+                        cui_text(ui, np_updater_dl_error(), .size = 12);
+                    }
+                }
+            }
+        }
+        cui_dialog_footer(ui) {
+            int cs2 = np_updater_check_state();
+            int ds2 = np_updater_dl_state();            /* Re-check is offered whenever the background job has settled. */
+            if (cs2 != NP_UPD_RUNNING && ds2 != NP_UPD_DL_RUNNING) {
+                if (cui_button(ui, "重新检查"))
+                    np_updater_start_check();
+            }
+            if (cs2 == NP_UPD_OK && np_update_tag_is_newer(np_updater_latest_tag())
+                && np_updater_apk_url()[0]
+                && (ds2 == NP_UPD_DL_IDLE || ds2 == NP_UPD_DL_FAILED)
+                && cui_button(ui, "下载并安装", .variant = CUI_BUTTON_PRIMARY)) {
+                np_updater_start_download();
+            }
+            if (cs2 == NP_UPD_OK && np_update_tag_is_newer(np_updater_latest_tag())
+                && np_updater_apk_url()[0] && ds2 == NP_UPD_DL_DONE
+                && cui_button(ui, "安装", .variant = CUI_BUTTON_PRIMARY)) {
+                np_updater_install();
+            }
+            if (cui_button(ui, "关闭")) a->dlg_update = false;
+        }
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -3640,6 +3749,12 @@ static void np_frame(cui_ctx *ui, void *user) {
 
             cui_menu_bar_menu(ui, "帮助") {
                 if (cui_menu_item(ui, "快捷键", .icon = CUI_ICON_KEYBOARD)) a->dlg_help = true;
+#ifdef __ANDROID__
+                if (cui_menu_item(ui, "检查更新…", .icon = CUI_ICON_DOWNLOAD)) {
+                    a->dlg_update = true;
+                    np_updater_start_check();
+                }
+#endif
                 if (cui_menu_item(ui, "关于", .icon = CUI_ICON_INFO)) a->dlg_about = true;
             }
         }

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The updater downloads update.apk into the app's internal files dir
+     (SDL_AndroidGetInternalStoragePath); FileProvider shares it with the
+     system installer as a content:// URI. -->
+<paths>
+    <files-path name="updates" path="." />
+</paths>

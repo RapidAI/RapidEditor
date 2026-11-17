@@ -2,6 +2,9 @@
  *
  * No GL headers or loader library are needed: the few functions used are
  * resolved through the loader passed to cui_gl_create. */
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #include "../cui_internal.h"
 #include "cui/cui_render.h"
 
@@ -244,6 +247,11 @@ cui_gl_renderer *cui_gl_create(cui_gl_loader loader) {
         for (size_t i = 0; i < sizeof soft / sizeof *soft; i++) if (strstr(rend, soft[i])) r->software = true;
     }
     r->es = ver && strstr(ver, "OpenGL ES") != NULL;
+#ifdef __ANDROID__
+    __android_log_print(ANDROID_LOG_INFO, "CUI",
+                        "GL renderer: ver='%s' rend='%s' es=%d software=%d",
+                        ver ? ver : "?", rend ? rend : "?", r->es, r->software);
+#endif
     if (ver && !r->es) {
         int major = 0, minor = 0;
         if (sscanf(ver, "%d.%d", &major, &minor) == 2 && (major < 3 || (major == 3 && minor < 3))) {

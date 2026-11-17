@@ -14,6 +14,18 @@ def sdl2Source = (project.findProperty('RE_SDL2_SOURCE')
 def targetAbis = ((project.findProperty('RE_ABIS') ?: 'arm64-v8a') as String)
         .split(',').collect { it.trim() }
 
+// Release version injected by CI; falls back to the dev default. versionCode
+// is derived so side-load upgrades always accept newer versions.
+def appVersion = (project.findProperty('RE_VERSION') ?: '1.2.0') as String
+def verParts = appVersion.split('\\.')*.toInteger()
+while (verParts.size() < 3) verParts << 0
+def appCode = verParts[0] * 1000000L + verParts[1] * 1000L + verParts[2]
+
+dependencies {
+    // FileProvider for handing the downloaded update APK to the installer.
+    implementation 'androidx.core:core:1.13.1'
+}
+
 android {
     namespace 'com.rapidaire.rapideditor'
     compileSdk 35
@@ -23,8 +35,8 @@ android {
         applicationId 'com.rapidaire.rapideditor'
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '1.2.0'
+        versionCode appCode as int
+        versionName appVersion
 
         ndk {
             abiFilters.addAll(targetAbis)
@@ -54,9 +66,22 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        release {
+            // One committed keystore keeps side-load upgrades installable:
+            // Android rejects an update APK signed differently from the
+            // installed build, so CI must not generate an ephemeral key.
+            storeFile rootProject.file('release.keystore')
+            storePassword 'rapideditor'
+            keyAlias 'rapideditor'
+            keyPassword 'rapideditor'
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release
         }
     }
 }
