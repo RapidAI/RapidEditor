@@ -82,9 +82,9 @@ elseif(APPLE)
     # WKWebView (WebKit.framework, part of macOS).
     list(APPEND RE_SOURCES src/np_webview_cocoa.mm)
 elseif(ANDROID)
-    # Android pad: no embedded WebView yet; HTML preview opens in the system
-    # browser through SDL_OpenURL (ACTION_VIEW intent).
-    list(APPEND RE_SOURCES src/np_webview_stub.cpp)
+    # Android WebView (part of the OS) driven from Java over JNI; the C side
+    # implements the same np_webview.h API as the other backends.
+    list(APPEND RE_SOURCES src/np_webview_android.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(RE_HAVE_WEBKITGTK)
         list(APPEND RE_SOURCES src/np_webview_gtk.cpp)
