@@ -87,10 +87,18 @@ bool cui__plat_init(cui_app *app) {
     const char *env = getenv("CUI_RENDERER");
     if (app->desc.renderer != CUI_RENDERER_SOFTWARE && !(env && strcmp(env, "software") == 0)) {
         flags |= SDL_WINDOW_OPENGL;
+#ifdef __ANDROID__
+        /* Android only offers OpenGL ES; the renderer detects "OpenGL ES" in
+         * GL_VERSION at runtime and switches to the ES 3.00 shader source. */
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#else
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#endif
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     }
     s->win = SDL_CreateWindow(app->title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, app->desc.width, app->desc.height, flags);
@@ -137,7 +145,22 @@ bool cui__plat_gl_create(cui_app *app, bool vsync) {
     cui__sdl *s = cui__s(app);
     if (!(SDL_GetWindowFlags(s->win) & SDL_WINDOW_OPENGL)) return false;
     s->gl = SDL_GL_CreateContext(s->win);
-    if (!s->gl) return false;
+    if (!s->gl) {
+        /* Recreate the window without the GL flag: SDL_GetWindowSurface, used
+         * by the software fallback, refuses a window created with
+         * SDL_WINDOW_OPENGL. */
+        SDL_DestroyWindow(s->win);
+        Uint32 flags = SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN;
+        if (!app->desc.fixed_size) flags |= SDL_WINDOW_RESIZABLE;
+        s->win = SDL_CreateWindow(app->desc.title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                  app->desc.width, app->desc.height, flags);
+        if (s->win) {
+            SDL_SetWindowMinimumSize(s->win, app->desc.min_width, app->desc.min_height);
+            SDL_StartTextInput();
+            SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+        }
+        return false;
+    }
     SDL_GL_MakeCurrent(s->win, s->gl);
     SDL_GL_SetSwapInterval(vsync ? 1 : 0);
     return true;
@@ -164,6 +187,19 @@ void cui__plat_metrics(cui_app *app, float *w, float *h, float *scale, int *fb_w
     SDL_GetWindowSize(s->win, &ww, &wh);
     if (s->gl) SDL_GL_GetDrawableSize(s->win, &dw, &dh);
     else { dw = ww; dh = wh; }
+#ifdef __ANDROID__
+    /* Android has no HiDPI reporting: SDL gives raw pixels for both window and
+     * drawable, so CUI_SCALE maps pixels to logical points for either renderer
+     * (the software path must not double-apply it via the desktop fallback). */
+    float sc = 1.0f;
+    const char *env = getenv("CUI_SCALE");
+    if (env) { float e = (float)atof(env); if (e > 0.25f && e < 8) sc = e; }
+    *scale = sc;
+    *fb_w = ww;
+    *fb_h = wh;
+    *w = (float)ww / sc;
+    *h = (float)wh / sc;
+#else
     float sc = ww > 0 ? (float)dw / (float)ww : 1.0f;
     const char *env = getenv("CUI_SCALE");
     if (env && sc == 1.0f) { float e = (float)atof(env); if (e > 0.25f && e < 8) { sc = e; } }
@@ -173,6 +209,7 @@ void cui__plat_metrics(cui_app *app, float *w, float *h, float *scale, int *fb_w
     *w = (float)ww;
     *h = (float)wh;
     if (!s->gl) { *w = (float)ww / sc; *h = (float)wh / sc; *fb_w = ww; *fb_h = wh; }
+#endif
 }
 
 void cui__plat_set_title(cui_app *app, const char *title) { SDL_SetWindowTitle(cui__s(app)->win, title); }

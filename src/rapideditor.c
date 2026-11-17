@@ -3842,10 +3842,10 @@ static void np_frame(cui_ctx *ui, void *user) {
  * pad screen. Overridable with the CUI_SCALE environment variable. */
 static void np_android_bootstrap(notepad *a) {
     if (!getenv("CUI_SCALE")) setenv("CUI_SCALE", "2", 1);
-    /* Force the software renderer: CUI's GL path asks for a desktop GL 3.3
-     * core context, which GLES (Android/SDL2) cannot provide and the surface
-     * window creation would fail. Software blits through SDL_GetWindowSurface. */
-    setenv("CUI_RENDERER", "software", 1);
+    /* Renderer: Auto tries OpenGL ES 3 (the SDL backend requests an ES 3.0
+     * context on Android and CUI's GL renderer ships ES 3.00 shaders); if the
+     * context cannot be created it falls back to the software renderer. Set
+     * CUI_RENDERER=software to force the CPU path (see cui_app.c). */
     const char *base = SDL_AndroidGetInternalStoragePath();
     if (!base || !base[0]) return;
     char docs[NP_PATH_CAP];
