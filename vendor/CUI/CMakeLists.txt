@@ -201,7 +201,12 @@ elseif(CUI_BACKEND STREQUAL "x11")
     target_include_directories(cui PRIVATE ${X11_INCLUDE_DIR})
     target_link_libraries(cui PUBLIC ${X11_LIBRARIES} ${CMAKE_DL_LIBS})
 elseif(CUI_BACKEND STREQUAL "sdl2")
-    find_package(SDL2 REQUIRED)
+    # An embedding project may provide SDL2 itself as a subproject (the
+    # Android build does, so each ABI gets a matching libSDL2). Only fall
+    # back to find_package when no SDL2 target exists yet.
+    if(NOT TARGET SDL2::SDL2)
+        find_package(SDL2 REQUIRED)
+    endif()
     target_link_libraries(cui PUBLIC SDL2::SDL2)
 elseif(CUI_BACKEND STREQUAL "glfw")
     find_package(glfw3 REQUIRED)
@@ -221,7 +226,10 @@ if(CUI_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-# Install
+# Install. Skipped on Android: there SDL2 is a subproject of the embedding
+# app, so installing an export set that references it cannot be generated
+# (and the APK build never runs `cmake --install` anyway).
+if(NOT ANDROID)
 include(GNUInstallDirs)
 install(TARGETS cui EXPORT cuiTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -245,6 +253,7 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/cuiConfig.cmake
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/cuiConfigVersion.cmake COMPATIBILITY SameMajorVersion)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cuiConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/cuiConfigVersion.cmake cmake/CuiApp.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cui)
+endif()
 
 # pkg-config
 set(CUI_PC_LIBS "-lcui")

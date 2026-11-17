@@ -28,6 +28,19 @@ set(CUI_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(CUI_PLATFORM       "auto" CACHE STRING "CUI window backend (auto/win32/cocoa/x11)")
 # PNG decoding is needed to show the LaTeX preview (xelatex -> PDF -> pdftoppm PNG).
 set(CUI_STB_IMAGE      ON  CACHE BOOL "" FORCE)
+
+# Android: build SDL2 as a subproject (RE_SDL2_SOURCE points at an SDL2
+# source tree) so every ANDROID_ABI gets a matching libSDL2, and CUI's
+# sdl2 backend links it without find_package. Desktop builds keep using
+# the system SDL2 via CUI's find_package.
+if(ANDROID)
+    if(EXISTS "${RE_SDL2_SOURCE}")
+        add_subdirectory("${RE_SDL2_SOURCE}" sdl2-build EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR "Android build needs RE_SDL2_SOURCE pointing at an SDL2 source tree (got '${RE_SDL2_SOURCE}')")
+    endif()
+endif()
+
 add_subdirectory(vendor/CUI)
 
 # ---------------------------------------------------------------------------
@@ -56,6 +69,10 @@ if(WIN32)
 elseif(APPLE)
     # WKWebView (WebKit.framework, part of macOS).
     list(APPEND RE_SOURCES src/np_webview_cocoa.mm)
+elseif(ANDROID)
+    # Android pad: no embedded WebView yet; HTML preview opens in the system
+    # browser through SDL_OpenURL (ACTION_VIEW intent).
+    list(APPEND RE_SOURCES src/np_webview_stub.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(RE_HAVE_WEBKITGTK)
         list(APPEND RE_SOURCES src/np_webview_gtk.cpp)
@@ -66,11 +83,22 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
-add_executable(RapidEditor ${RE_SOURCES})
-target_link_libraries(RapidEditor PRIVATE cui::cui Threads::Threads)
+if(ANDROID)
+    # Android (pad, DeX/PC-mode): the editor builds as a shared library that
+    # SDL2's Java activity loads. `main` is renamed to SDL_main, which
+    # SDLActivity resolves on a dedicated native thread.
+    add_library(RapidEditor SHARED ${RE_SOURCES})
+    target_link_libraries(RapidEditor PRIVATE cui::cui Threads::Threads)
+    target_compile_definitions(RapidEditor PRIVATE main=SDL_main)
+    # liblog: __android_log_print diagnostics from np_android_bootstrap/main.
+    target_link_libraries(RapidEditor PRIVATE log)
+else()
+    add_executable(RapidEditor ${RE_SOURCES})
+    target_link_libraries(RapidEditor PRIVATE cui::cui Threads::Threads)
 
-# Set WIN32_EXECUTABLE / dead-strip / LTO flags and the GUI subsystem entry point.
-cui_app_target(RapidEditor)
+    # Set WIN32_EXECUTABLE / dead-strip / LTO flags and the GUI subsystem entry point.
+    cui_app_target(RapidEditor)
+endif()
 
 if(WIN32)
     # WebView2 C++ headers (loader functions are resolved via LoadLibrary, so
@@ -145,9 +173,11 @@ endif()
 
 set_target_properties(RapidEditor PROPERTIES OUTPUT_NAME "RapidEditor")
 
-install(TARGETS RapidEditor RUNTIME DESTINATION bin)
+install(TARGETS RapidEditor RUNTIME DESTINATION bin LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} ARCHIVE DESTINATION bin)
 
-if(WIN32)
+if(ANDROID)
+    set(RE_BACKEND sdl2)
+elseif(WIN32)
     # Ship the matching loader alongside the exe in install/dist payloads.
     install(FILES "${RE_WV2_DLL}" DESTINATION bin)
     set(RE_BACKEND win32)

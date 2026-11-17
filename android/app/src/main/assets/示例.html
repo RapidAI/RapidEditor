@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>HTML 预览示例</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; line-height: 1.6; }
+  h1 { color: #2563eb; }
+  .card { background: #f1f5f9; border-radius: 12px; padding: 16px 20px; margin: 16px 0; }
+</style>
+</head>
+<body>
+<h1>HTML 预览示例</h1>
+<p>在 RapidEditor 中选中本文件后，右侧预览面板会启动本地 HTTP 服务器，
+并用 <b>SDL_OpenURL</b> 在系统浏览器中打开这个页面。</p>
+<div class="card">改一下这里的文字并保存（Ctrl+S），再点"刷新"，就能看到变化。</div>
+<ul>
+  <li>真正的 Web 加载方式（http://127.0.0.1），不是直接打开文件</li>
+  <li>支持 CSS、JavaScript 和 canvas</li>
+</ul>
+</body>
+</html>

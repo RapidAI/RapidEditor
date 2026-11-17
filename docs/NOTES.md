@@ -4,7 +4,7 @@
 
 `vendor/CUI/` 是 [yappologistic/CUI](https://github.com/yappologistic/CUI) 的一个子集（只保留构建
 RapidEditor 所需的 `CMakeLists.txt`、`cmake/`、`include/cui/`、`src/`、`third_party/`、`LICENSE`、
-`THIRD_PARTY.md`）。相对上游有 4 处本地修改：
+`THIRD_PARTY.md`）。相对上游有 5 处本地修改：
 
 1. **CJK 光标 / 选区 advance**（`include/cui/cui.h`、`src/cui_editor.c`）：按真实字形宽度计算
    光标、选区与点击定位，中文不再错位。
@@ -22,19 +22,32 @@ RapidEditor 所需的 `CMakeLists.txt`、`cmake/`、`include/cui/`、`src/`、`t
 4. **Markdown 数学公式 / Mermaid**（`src/cui_markdown.c`）：
    - 行内 `$...$` 与块级 `$$...$$`：把常用 TeX 命令映射为 Unicode 符号，上下标用
      上标数字 / `^(...)`、`_(...)` 近似；块级公式渲染为居中的浅色面板，不依赖
-     KaTeX 或浏览器。字体缺字的命令（如 `\nabla`）退化为可读的文字（如 `grad`）；
-   - ```` ```mermaid ```` 代码块：解析 `graph/flowchart TD|LR` 的节点声明（`[]`、`()`、`{}`、`(())`）
-     和连线（`-->`、`---`、`-.->`、`==>`，支持 `|标签|` 与链式 `A --> B --> C`），
-     用 CUI canvas 自绘。布局按破环后的最长路径分层，并做重心排序减少交叉；
-     正向边连接节点相邻边，环/回边走图外侧通道；无法识别的内容回退为普通代码块。
+     KaTeX 或浏览器。符号映射逐项核对过内嵌 Inter 与 CJK 回退字体（msyh）的 cmap，
+     两边都没有字形的命令退化为可读的 ASCII/文字（如 `\Rightarrow`→`=>`、`\subseteq`→`<=`、
+     `\nabla`→`grad`），不会出现空白方块；
+   - 另支持 `\frac/\binom/\pmod`、矩阵环境（`pmatrix/bmatrix/vmatrix/cases` 加对应定界符）、
+     重音（`\hat/\bar/\tilde/\vec/\dot` 等，优先用预组合字符，如 `\hat y`→`ŷ`）、
+     `\quad/\qquad`、`\left./\bigl` 等尺寸提示、字面转义 `\{ \% \&`；
+   - ```` ```mermaid ```` 代码块：解析 `graph/flowchart TD|LR` 的节点声明（`[]`、`()`、`{}`、
+     `(())`、`[[]]` 子例程）和连线（`-->`、`---`、`-.->`（虚线）、`==>`，支持 `|标签|` 与
+     链式 `A --> B --> C`、自环 `A --> A`），用 CUI canvas 自绘。布局按破环后的最长路径
+     分层并做重心排序减少交叉；正向边走正交折线并按车道错开，同层边直连，回边走图外
+     侧通道，自环画在节点空侧；节点带阴影、起点节点用强调色；边标签最后统一绘制在
+     不透明底板上，任何线条都不会穿过文字；无法识别的内容回退为普通代码块。
+
+5. **编辑器字体 API**（`include/cui/cui.h`、`src/cui_text.c`）：
+   - `cui_font_load_deflated()`：从 raw DEFLATE 流加载 TrueType 字体，内部复用
+     `cui__inflate()` + `cui_font_load_memory()`，解压缓冲由 context 持有；
+   - `cui_font_role_font()`：返回某个角色当前解析到的具体字体 id，让 app 在
+     临时切换角色后能恢复原字体（编辑区「默认 Geist Mono」选项需要）。
 
 第 3 点是右键菜单在 macOS 上真正能打开文件的必要条件：Finder 的「打开方式」、
 Quick Action 和拖到 Dock 图标都是 Apple Event，不是命令行参数。上游 CUI 只处理了窗口内拖放
 （`cui_input_file_drop()`），无法接收这些事件。
 
-四处改动相对上游 CUI 的完整 diff 保存在 `docs/patches/`：
+五处改动相对上游 CUI 的完整 diff 保存在 `docs/patches/`：
 `CUI-cjk-caret.patch`、`CUI-cjk-largefile.patch`、`CUI-openwith.patch`、
-`CUI-markdown-math-mermaid.patch`。上游升级时可以按这些 patch 重新套用。
+`CUI-markdown-math-mermaid.patch`、`CUI-editor-font.patch`。上游升级时可以按这些 patch 重新套用。
 
 > 头文件必须位于 `vendor/CUI/include/cui/*.h`。上游的包含路径是 `cui/cui.h`，
 > 早期 vendored 副本把它们平铺在 `include/` 下导致编译失败，已修正。
@@ -164,3 +177,28 @@ CUI 的主题结构体可以通过 `cui_theme_get()` 直接改。`np_apply_theme
 `dark` 之后解析并清掉 `dark_valid`。
 
 F1 现在绑定帮助对话框（顶栏和欢迎页都提示了它）。
+
+## 编辑器字体（自定义字体 + 预置开源字体）
+
+编辑区组件 `cui_code_editor` 的所有文字都用 `CUI_FONT_MONO` 角色绘制（`vendor/CUI/src/cui_code.c`），
+所以换编辑器字体 = 换这个角色的字体。实现位于 `src/rapideditor.c` 的「Editor fonts」小节：
+
+- **预置字体**：5 款 SIL OFL 开源等宽字体（JetBrains Mono、Cascadia Code/Mono、
+  Source Code Pro、IBM Plex Mono）以 raw DEFLATE 压缩内嵌进 exe。数据在
+  `src/np_font_bundle.c/.h`，由 `scripts/make_font_bundle.py` 从 `assets/fonts/*.ttf` 生成；
+  CMake 把 `np_font_bundle.c` 编入目标。压缩后约 600 KB（原 1.37 MB），随 exe 一体分发，
+  三个平台的打包脚本都无需改动。字体许可证在 `assets/fonts/`。
+- **自定义字体**：视图菜单「自定义字体文件…」用原生文件对话框选 `ttf/otf/ttc`，
+  经 `cui_font_load_file()` 加载。仅接受 TrueType 轮廓——CUI 用 stb_truetype，不支持 CFF/OTF 轮廓。
+- **切换机制**：`cui_font_set_role(MONO, font)`。关键陷阱：CJK fallback 挂在**字体对象**上而非
+  角色上，换角色会丢失中文 fallback；因此每次切换后用 `np_font_attach_cjk()` 把启动时
+  加载的系统 CJK 字体（微软雅黑/苹方/Noto CJK/文泉驿）重新挂到新字体。
+- **恢复默认**：启动时 `cui_font_role_font(MONO)` 缓存内置 Geist Mono 的字体 id，
+  「默认」选项直接 set_role 回它。
+- **持久化**：`config.ini` 的 `editor_font=`（预置 id / `default` / `custom`）和
+  `editor_font_path=`（自定义字体路径）；启动时 `np_font_restore()` 恢复，若自定义文件已丢失
+  则退回默认。状态栏显示当前字体名。
+
+验证：临时 headless 程序链接 `libcui.a` 调用两个新 API + 字体 bundle，5 款字体全部
+解压/加载/切换/恢复成功，`cui_measure_text` 对含中文的文本返回有效宽度；`python3` 逐字节
+校验 5 个 DEFLATE 流解压后与源 TTF 完全一致。启动冒烟无崩溃、中文无乱码。

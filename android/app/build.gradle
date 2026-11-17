@@ -1,0 +1,62 @@
+plugins {
+    id 'com.android.application'
+}
+
+// SDL2 source tree for the Android subproject build (each ANDROID_ABI gets
+// a matching libSDL2). Set RE_SDL2_SOURCE via -P / environment; the default
+// matches the local bootstrap layout (.cache/android/SDL2-*).
+def sdl2Source = (project.findProperty('RE_SDL2_SOURCE')
+        ?: System.getenv('RE_SDL2_SOURCE')
+        ?: new File(rootProject.projectDir, '../.cache/android/SDL2-2.32.10').absolutePath)
+
+// Target ABIs as a comma-separated property. Default: real pads (arm64).
+// Pass -PRE_ABIS=x86_64 (or a list) to also build for the emulator.
+def targetAbis = ((project.findProperty('RE_ABIS') ?: 'arm64-v8a') as String)
+        .split(',').collect { it.trim() }
+
+android {
+    namespace 'com.rapidaire.rapideditor'
+    compileSdk 35
+    ndkVersion '28.2.13676358'
+
+    defaultConfig {
+        applicationId 'com.rapidaire.rapideditor'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.2.0'
+
+        ndk {
+            abiFilters.addAll(targetAbis)
+        }
+        externalNativeBuild {
+            cmake {
+                // The repo-root CMakeLists has an ANDROID branch that builds
+                // the editor as libRapidEditor.so (main -> SDL_main), adds the
+                // SDL2 subproject (RE_SDL2_SOURCE) and links CUI's SDL2
+                // backend, so no find_package is involved.
+                arguments '-DCUI_PLATFORM=sdl2',
+                          '-DANDROID_STL=c++_shared',
+                          "-DRE_SDL2_SOURCE=${sdl2Source.replace('\\', '/')}"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file('../../CMakeLists.txt')
+            version = '3.22.1'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+}

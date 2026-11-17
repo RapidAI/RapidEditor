@@ -23,6 +23,19 @@
 #include <ws2tcpip.h>
 #include <io.h>
 #pragma comment(lib, "ws2_32.lib")
+#elif defined(__ANDROID__)
+#include <SDL.h> /* SDL_OpenURL */
+/* Android (with the SDL2 backend) still uses POSIX sockets for the built-in
+ * loopback HTTP server of the HTML preview. */
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <errno.h>
+#include <fcntl.h>
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -33,6 +46,13 @@
 #include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
+#endif
+
+/* Existence check: the Windows CRT calls it _access, POSIX calls it access. */
+#ifdef _WIN32
+#define np__access(p, m) _access((p), (m))
+#else
+#define np__access(p, m) access((p), (m))
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -222,7 +242,7 @@ static int pv_render_pdf(np_tex_job *j, const char *pdf, const char *base,
             pv_run(cmd);
             char one[NP_PV_PATH_CAP];
             snprintf(one, sizeof one, "%s-%d.png", base, p);
-            if (_access(one, 0) == 0) pages++;
+            if (np__access(one, 0) == 0) pages++;
             else break;
         }
     } else if (pv_has_tool("magick") || pv_has_tool("convert")) {
@@ -234,13 +254,13 @@ static int pv_render_pdf(np_tex_job *j, const char *pdf, const char *base,
         for (int p = 1; p <= 200; p++) {
             char one[NP_PV_PATH_CAP];
             snprintf(one, sizeof one, "%s-%d.png", base, p);
-            if (_access(one, 0) == 0) pages++;
+            if (np__access(one, 0) == 0) pages++;
             else break;
         }
         if (pages == 0) {                        /* some builds start at 0 */
             char zero[NP_PV_PATH_CAP];
             snprintf(zero, sizeof zero, "%s-0.png", base);
-            if (_access(zero, 0) == 0) {
+            if (np__access(zero, 0) == 0) {
                 char one[NP_PV_PATH_CAP];
                 snprintf(one, sizeof one, "%s-1.png", base);
                 rename(zero, one);
@@ -272,7 +292,7 @@ static void pv_tex_worker(void *arg) {
         /* Standalone PDF: render it directly, no TeX engine needed.
          * base was already set to the extension-stripped path by the caller. */
         snprintf(pdf, sizeof pdf, "%s", j->pdf_path);
-        if (_access(pdf, 0) == 0)
+        if (np__access(pdf, 0) == 0)
             pages = pv_render_pdf(j, pdf, j->base, qlog);
         else
             snprintf(j->log, sizeof j->log, "找不到 PDF 文件：%s", pdf);
@@ -298,7 +318,7 @@ static void pv_tex_worker(void *arg) {
 
             snprintf(pdf, sizeof pdf, "%s.pdf", j->base);
             snprintf(j->pdf_path, sizeof j->pdf_path, "%s", pdf);
-            if (_access(pdf, 0) == 0)
+            if (np__access(pdf, 0) == 0)
                 pages = pv_render_pdf(j, pdf, j->base, qlog);
         } else {
             snprintf(j->log, sizeof j->log,
@@ -639,6 +659,10 @@ void np_open_url(const char *url) {
     if (!url || !*url) return;
 #ifdef _WIN32
     ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
+#elif defined(__ANDROID__)
+    /* No shell on Android: SDL_OpenURL fires an ACTION_VIEW intent that the
+     * system routes to a suitable browser. */
+    SDL_OpenURL(url);
 #else
 #ifdef __APPLE__
     char cmd[2048];
@@ -679,7 +703,7 @@ int np_webview_open(const char *url) {
                            strcmp(candidates[i][2], "pf86") == 0 ? sysdir : local;
         if (!base[0]) continue;
         snprintf(full, sizeof full, "%s\\%s", base, candidates[i][1]);
-        if (_access(full, 0) == 0) {
+        if (np__access(full, 0) == 0) {
             if ((intptr_t)ShellExecuteA(NULL, "open", full, params, NULL, SW_SHOWNORMAL) > 32) return 1;
         }
     }

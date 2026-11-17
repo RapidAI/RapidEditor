@@ -186,34 +186,80 @@ static void md_emit(md_run *runs, int *nr, const char *p, int len, int style, in
 /* The preview is a native CUI surface, not a browser: we intentionally map
  * common TeX to Unicode rather than pulling in a typesetting engine. */
 typedef struct { const char *tex; const char *uni; } md_sym;
+/* Every mapping below was checked against the cmap of the bundled Inter face
+ * and the CJK fallback (msyh). A codepoint neither face carries would render
+ * as a blank box, so those commands fall back to readable ASCII instead. */
 static const md_sym md_symbols[] = {
+    /* arrows */
     { "rightarrow", "→" }, { "leftarrow", "←" }, { "leftrightarrow", "↔" },
-    { "Rightarrow", "⇒" }, { "Leftarrow", "⇐" }, { "Leftrightarrow", "⇔" },
-    { "mapsto", "↦" }, { "longrightarrow", "⟶" }, { "otimes", "⊗" }, { "oplus", "⊕" },
-    { "subseteq", "⊆" }, { "supseteq", "⊇" }, { "varnothing", "∅" }, { "emptyset", "∅" },
-    { "partial", "∂" }, { "nabla", "grad" }, { "infty", "∞" }, { "times", "×" },
-    { "cdot", "·" }, { "divide", "÷" }, { "pm", "±" }, { "mp", "∓" },
-    { "leq", "≤" }, { "ge", "≥" }, { "geq", "≥" }, { "ne", "≠" }, { "neq", "≠" },
-    { "approx", "≈" }, { "sim", "∼" }, { "equiv", "≡" }, { "propto", "∝" },
-    { "notin", "∉" }, { "subset", "⊂" }, { "supset", "⊃" }, { "cup", "∪" },
-    { "cap", "∩" }, { "forall", "∀" }, { "exists", "∃" }, { "neg", "¬" },
-    { "land", "∧" }, { "lor", "∨" }, { "angle", "∠" }, { "perp", "⊥" },
-    { "parallel", "∥" }, { "ldots", "…" }, { "cdots", "⋯" }, { "vdots", "⋮" },
-    { "ddots", "⋱" }, { "hbar", "ℏ" }, { "ell", "ℓ" }, { "aleph", "ℵ" },
+    { "uparrow", "↑" }, { "downarrow", "↓" }, { "nearrow", "↗" }, { "searrow", "↘" },
+    { "to", "→" }, { "longrightarrow", "→" }, { "longleftarrow", "←" },
+    { "longleftrightarrow", "↔" }, { "mapsto", "|->" }, { "longmapsto", "|->" },
+    { "Rightarrow", "=>" }, { "Leftarrow", "<=" }, { "Leftrightarrow", "<=>" },
+    { "Uparrow", "=>" }, { "Downarrow", "<=" }, { "Updownarrow", "<=>" },
+    { "hookleftarrow", "<-" }, { "hookrightarrow", "->" },
+    /* operators */
+    { "otimes", "×" }, { "oplus", "⊕" }, { "ominus", "-" }, { "oslash", "ø" },
+    { "odot", "⊙" }, { "circ", "o" }, { "bullet", "•" }, { "cdot", "·" },
+    { "centerdot", "·" }, { "ast", "*" }, { "star", "*" }, { "diamond", "◇" },
+    { "times", "×" }, { "div", "÷" }, { "pm", "±" }, { "mp", "∓" },
+    { "dagger", "†" }, { "ddagger", "‡" }, { "wedge", "∧" }, { "vee", "∨" },
+    /* relations */
+    { "leq", "≤" }, { "le", "≤" }, { "geq", "≥" }, { "ge", "≥" },
+    { "neq", "≠" }, { "ne", "≠" }, { "approx", "≈" }, { "simeq", "≈" },
+    { "cong", "≈" }, { "equiv", "≡" }, { "sim", "~" }, { "propto", "∝" },
+    { "asymp", "≈" }, { "doteq", "=" }, { "prec", "<" }, { "succ", ">" },
+    { "preceq", "≤" }, { "succeq", "≥" }, { "ll", "<<" }, { "gg", ">>" },
+    { "perp", "⊥" }, { "parallel", "∥" }, { "nparallel", "!∥" },
+    { "mid", "∣" }, { "nmid", "!∣" }, { "angle", "∠" }, { "measuredangle", "∠" },
+    { "models", "|=" }, { "vDash", "|=" }, { "vdash", "|-" }, { "dashv", "-|" },
+    { "top", "T" }, { "bot", "⊥" },
+    { "forall", "for all" }, { "exists", "exists" }, { "nexists", "not exists" },
+    { "neg", "¬" }, { "lnot", "¬" }, { "land", "∧" }, { "lor", "∨" },
+    { "therefore", "∴" }, { "because", "∵" }, { "checkmark", "✓" },
+    /* sets */
+    { "in", "∈" }, { "notin", "!∈" }, { "ni", ">-" },
+    { "subset", "<=" }, { "subseteq", "<=" }, { "supset", ">=" },
+    { "supseteq", ">=" }, { "nsubseteq", "!<=" }, { "nsupseteq", "!>=" },
+    { "emptyset", "{}" }, { "varnothing", "{}" }, { "cup", "∪" }, { "cap", "∩" },
+    { "sqcup", "∪" }, { "sqcap", "∩" }, { "uplus", "∪" }, { "veebar", "⊕" },
+    /* dots */
+    { "ldots", "…" }, { "dots", "…" }, { "cdots", "..." }, { "dotsb", "..." },
+    { "dotsc", "..." }, { "dotso", "..." }, { "vdots", ":" }, { "ddots", ".." },
+    /* letter-like */
+    { "hbar", "ħ" }, { "ell", "ℓ" }, { "aleph", "aleph" }, { "beth", "beth" },
+    { "Re", "Re" }, { "Im", "Im" },
+    { "partial", "∂" }, { "nabla", "grad" }, { "infty", "∞" },
+    { "prime", "′" }, { "dprime", "″" }, { "deg", "deg" },
+    /* big operators */
+    { "sum", "∑" }, { "prod", "∏" }, { "int", "∫" }, { "iint", "∫∫" },
+    { "iiint", "∫∫∫" }, { "oint", "∮" },
+    /* greek (rendered through the CJK fallback face) */
     { "alpha", "α" }, { "beta", "β" }, { "gamma", "γ" }, { "delta", "δ" },
-    { "epsilon", "ε" }, { "varepsilon", "ε" }, { "zeta", "ζ" }, { "eta", "η" },
+    { "epsilon", "ϵ" }, { "varepsilon", "ε" }, { "zeta", "ζ" }, { "eta", "η" },
     { "theta", "θ" }, { "vartheta", "ϑ" }, { "iota", "ι" }, { "kappa", "κ" },
-    { "lambda", "λ" }, { "mu", "μ" }, { "nu", "ν" }, { "xi", "ξ" },
-    { "pi", "π" }, { "rho", "ρ" }, { "sigma", "σ" }, { "tau", "τ" },
-    { "upsilon", "υ" }, { "phi", "φ" }, { "varphi", "ϕ" }, { "chi", "χ" },
-    { "psi", "ψ" }, { "omega", "ω" }, { "Gamma", "Γ" }, { "Delta", "Δ" },
-    { "Theta", "Θ" }, { "Lambda", "Λ" }, { "Xi", "Ξ" }, { "Pi", "Π" },
-    { "Sigma", "Σ" }, { "Phi", "Φ" }, { "Psi", "Ψ" }, { "Omega", "Ω" },
-    { "sum", "∑" }, { "prod", "∏" }, { "int", "∫" }, { "oint", "∮" },
-    { "sin", "sin" }, { "cos", "cos" }, { "tan", "tan" }, { "log", "log" },
-    { "ln", "ln" }, { "lim", "lim" }, { "max", "max" }, { "min", "min" },
-    { "exp", "exp" }, { "Re", "ℜ" }, { "Im", "ℑ" }, { "deg", "°" },
-    { "le", "≤" }, { "ge", "≥" }, { "ne", "≠" }, { "to", "→" }, { "in", "∈" },
+    { "varkappa", "ϰ" }, { "lambda", "λ" }, { "mu", "μ" }, { "nu", "ν" },
+    { "xi", "ξ" }, { "omicron", "ο" }, { "pi", "π" }, { "rho", "ρ" },
+    { "varrho", "ϱ" }, { "sigma", "σ" }, { "varsigma", "ς" }, { "tau", "τ" },
+    { "upsilon", "υ" }, { "phi", "ϕ" }, { "varphi", "φ" }, { "chi", "χ" },
+    { "psi", "ψ" }, { "omega", "ω" },
+    { "Gamma", "Γ" }, { "Delta", "Δ" }, { "Theta", "Θ" }, { "Lambda", "Λ" },
+    { "Xi", "Ξ" }, { "Pi", "Π" }, { "Sigma", "Σ" }, { "Upsilon", "Υ" },
+    { "Phi", "Φ" }, { "Psi", "Ψ" }, { "Omega", "Ω" },
+    /* named functions */
+    { "sin", "sin" }, { "cos", "cos" }, { "tan", "tan" }, { "csc", "csc" },
+    { "sec", "sec" }, { "cot", "cot" }, { "sinh", "sinh" }, { "cosh", "cosh" },
+    { "tanh", "tanh" }, { "coth", "coth" }, { "arcsin", "arcsin" },
+    { "arccos", "arccos" }, { "arctan", "arctan" }, { "exp", "exp" },
+    { "log", "log" }, { "ln", "ln" }, { "lg", "lg" }, { "lim", "lim" },
+    { "limsup", "lim sup" }, { "liminf", "lim inf" }, { "max", "max" },
+    { "min", "min" }, { "sup", "sup" }, { "inf", "inf" }, { "det", "det" },
+    { "dim", "dim" }, { "gcd", "gcd" }, { "hom", "hom" }, { "ker", "ker" },
+    { "arg", "arg" }, { "Pr", "Pr" }, { "bmod", " mod " },
+    /* misc */
+    { "S", "§" }, { "P", "¶" }, { "copyright", "©" }, { "backslash", "\\" },
+    { "Vert", "‖" }, { "vert", "|" }, { "langle", "<" }, { "rangle", ">" },
+    { "lfloor", "[" }, { "rfloor", "]" }, { "lceil", "<" }, { "rceil", ">" },
 };
 
 static void md_put(char *out, int *o, int cap, const char *s, int n) {
@@ -270,15 +316,86 @@ static void md_math_script(cui_ctx *ui, char *out, int *o, int cap,
                            const char *inner, int len, bool sup) {
     char *txt = md_math_translate(ui, inner, len);
     int tn = (int)strlen(txt);
-    /* Only a single exponent digit has a reliably rendered Unicode glyph.
-     * Everything else uses the conventional ^(...) / _(...) notation. */
-    if (sup && tn == 1 && txt[0] >= '0' && txt[0] <= '9') {
-        const char *g = md_sup_char((unsigned char)txt[0]);
+    /* Single exponent digits 1-5/7/8 and 'n' have real superscript glyphs in
+     * the bundled faces; everything else uses ^( ... ) notation. */
+    if (sup && tn == 1 && ((txt[0] >= '1' && txt[0] <= '9' && txt[0] != '6') ||
+                           txt[0] == 'n')) {
+        const char *g = txt[0] == 'n' ? "ⁿ" : md_sup_char((unsigned char)txt[0]);
         if (g) { md_put(out, o, cap, g, (int)strlen(g)); return; }
     }
     md_put(out, o, cap, sup ? "^(" : "_(", -1);
     md_put(out, o, cap, txt, tn);
     md_put(out, o, cap, ")", -1);
+}
+
+/* Precomposed accented letters. The bundled faces carry Latin-1 and Latin
+ * Extended-A; combining marks (U+0302 & co) are NOT covered, so we cannot
+ * stack a diacritic onto an arbitrary base. kind: 0 hat, 1 tilde, 2 bar,
+ * 8 grave, 9 acute; other kinds have no precomposed forms. */
+static const char *md_accent_pre(char c, int kind) {
+    switch (kind) {
+    case 0:
+        switch (c) {
+        case 'a': return "â"; case 'e': return "ê"; case 'i': return "î";
+        case 'o': return "ô"; case 'u': return "û"; case 'y': return "ŷ";
+        case 'c': return "ĉ"; case 'g': return "ĝ"; case 'h': return "ĥ";
+        case 'j': return "ĵ"; case 's': return "ŝ"; case 'w': return "ŵ";
+        case 'A': return "Â"; case 'E': return "Ê"; case 'I': return "Î";
+        case 'O': return "Ô"; case 'U': return "Û"; case 'Y': return "Ŷ";
+        case 'C': return "Ĉ"; case 'G': return "Ĝ"; case 'H': return "Ĥ";
+        case 'J': return "Ĵ"; case 'S': return "Ŝ"; case 'W': return "Ŵ";
+        }
+        break;
+    case 1:
+        switch (c) {
+        case 'a': return "ã"; case 'n': return "ñ"; case 'o': return "õ";
+        case 'i': return "ĩ"; case 'u': return "ũ";
+        case 'A': return "Ã"; case 'N': return "Ñ"; case 'O': return "Õ";
+        case 'I': return "Ĩ"; case 'U': return "Ũ";
+        }
+        break;
+    case 2:
+        switch (c) {
+        case 'a': return "ā"; case 'e': return "ē"; case 'i': return "ī";
+        case 'o': return "ō"; case 'u': return "ū";
+        case 'A': return "Ā"; case 'E': return "Ē"; case 'I': return "Ī";
+        case 'O': return "Ō"; case 'U': return "Ū";
+        }
+        break;
+    case 8:
+        switch (c) {
+        case 'a': return "à"; case 'e': return "è"; case 'i': return "ì";
+        case 'o': return "ò"; case 'u': return "ù";
+        case 'A': return "À"; case 'E': return "È"; case 'I': return "Ì";
+        case 'O': return "Ò"; case 'U': return "Ù";
+        }
+        break;
+    case 9:
+        switch (c) {
+        case 'a': return "á"; case 'e': return "é"; case 'i': return "í";
+        case 'o': return "ó"; case 'u': return "ú";
+        case 'A': return "Á"; case 'E': return "É"; case 'I': return "Í";
+        case 'O': return "Ó"; case 'U': return "Ú";
+        }
+        break;
+    }
+    return NULL;
+}
+
+/* \hat{x} & friends: the accent mark follows the operand when no precomposed
+ * letter exists ("xˆ", "v→"); TeX puts it above, plain text approximates. */
+static void md_math_accent(cui_ctx *ui, char *out, int *o, int cap,
+                           const char *inner, int len, int kind) {
+    static const char *suffix[] = { "ˆ", "˜", "ˉ", "˙", "¨", "→", "˚", "˘", "`", "´" };
+    char *txt = md_math_translate(ui, inner, len);
+    int tn = (int)strlen(txt);
+    if (tn == 1) {
+        const char *g = md_accent_pre(txt[0], kind);
+        if (g) { md_put(out, o, cap, g, (int)strlen(g)); return; }
+    }
+    md_put(out, o, cap, txt, tn);
+    if (kind >= 0 && kind < (int)CUI_COUNTOF(suffix))
+        md_put(out, o, cap, suffix[kind], -1);
 }
 
 static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
@@ -294,16 +411,70 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
                 md_put(out, &o, cap, " ", 1);
                 i += 2; continue;
             }
+            if (d == '!') { i += 2; continue; }        /* negative thin space */
+            if (strchr("{}%&#$_|~^", d)) {             /* literal escapes */
+                md_put(out, &o, cap, s + i + 1, 1);
+                i += 2; continue;
+            }
+            if (d == 'q' && md_cmd_at(s, n, i, "\\quad")) {
+                md_put(out, &o, cap, "  ", 2); i += 5; continue;
+            }
+            if (d == 'q' && md_cmd_at(s, n, i, "\\qquad")) {
+                md_put(out, &o, cap, "    ", 4); i += 6; continue;
+            }
+            /* \big..\Bigg and \bigl..\Biggr are sizing hints for the delimiter
+             * that follows; plain text has nothing to size, so drop them. */
+            if ((d == 'b' || d == 'B') && i + 2 < n &&
+                (s[i + 2] == 'i' || s[i + 2] == 'I')) {
+                int j = i + 1;
+                if (s[j] == 'B') j++;
+                if (j + 2 < n && s[j] == 'b' && s[j + 1] == 'i' && s[j + 2] == 'g') {
+                    j += 3;
+                    while (j < n && s[j] == 'g') j++;
+                    if (j < n && (s[j] == 'l' || s[j] == 'm' || s[j] == 'r')) j++;
+                    if (j < n && s[j] == '.') j++;
+                    i = j; continue;
+                }
+            }
             if (md_cmd_at(s, n, i, "\\left") || md_cmd_at(s, n, i, "\\right")) {
                 i += (int)strlen(s[i + 1] == 'l' ? "\\left" : "\\right");
+                if (i < n && s[i] == '.') i++;         /* invisible delimiter */
                 continue;
             }
             if (md_cmd_at(s, n, i, "\\begin") || md_cmd_at(s, n, i, "\\end")) {
+                bool beg = s[i + 1] == 'b';
                 int bs, bl, end;
                 int j = i + (s[i + 1] == 'b' ? 6 : 4);
-                if (md_group_at(s, n, j, &bs, &bl, &end)) i = end;
-                else i = j;
-                continue;
+                if (!md_group_at(s, n, j, &bs, &bl, &end)) { i = j; continue; }
+                /* Matrices and cases get their conventional delimiters; rows
+                 * are separated by \\ and columns by &. */
+                const char *delim = "";
+                if (bl == 7 && !memcmp(s + bs, "pmatrix", 7)) delim = beg ? "(" : ")";
+                else if (bl == 7 && !memcmp(s + bs, "Bmatrix", 7)) delim = beg ? "{" : "}";
+                else if (bl == 7 && !memcmp(s + bs, "bmatrix", 7)) delim = beg ? "[" : "]";
+                else if (bl == 7 && !memcmp(s + bs, "vmatrix", 7)) delim = "|";
+                else if (bl == 7 && !memcmp(s + bs, "Vmatrix", 7)) delim = "‖";
+                else if (bl == 5 && !memcmp(s + bs, "cases", 5)) delim = beg ? "{" : "";
+                if (beg && bl == 5 && !memcmp(s + bs, "array", 5)) {
+                    int bs2, bl2, end2;                 /* skip the column spec */
+                    if (md_group_at(s, n, end, &bs2, &bl2, &end2)) end = end2;
+                }
+                md_put(out, &o, cap, delim, -1);
+                i = end; continue;
+            }
+            if (md_cmd_at(s, n, i, "\\binom")) {
+                int j = i + 6, bs, bl, end;
+                if (!md_group_at(s, n, j, &bs, &bl, &end)) { i += 2; continue; }
+                char *top = md_math_translate(ui, s + bs, bl);
+                j = end;
+                if (!md_group_at(s, n, j, &bs, &bl, &end)) { i += 2; continue; }
+                char *bot = md_math_translate(ui, s + bs, bl);
+                md_put(out, &o, cap, "C(", -1);
+                md_put(out, &o, cap, top, (int)strlen(top));
+                md_put(out, &o, cap, ", ", 2);
+                md_put(out, &o, cap, bot, (int)strlen(bot));
+                md_put(out, &o, cap, ")", -1);
+                i = end; continue;
             }
             if (md_cmd_at(s, n, i, "\\frac") || md_cmd_at(s, n, i, "\\dfrac") ||
                 md_cmd_at(s, n, i, "\\tfrac")) {
@@ -353,19 +524,55 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
                 }
                 i = j; continue;
             }
-            /* The bundled font has no glyph for U+2207 (∇), so render the
-             * operator by its common name instead of leaving a blank. */
-            if (md_cmd_at(s, n, i, "\\nabla")) {
-                if (o > 0 && ((unsigned char)out[o - 1] >= 0x80 ||
-                    (out[o - 1] >= 'a' && out[o - 1] <= 'z') ||
-                    (out[o - 1] >= 'A' && out[o - 1] <= 'Z')))
-                    md_put(out, &o, cap, " ", 1);
-                md_put(out, &o, cap, "grad", -1);
-                i += 6;
-                if (i + 1 < n && s[i] == ' ' &&
-                    ((s[i + 1] >= 'a' && s[i + 1] <= 'z') ||
-                     (s[i + 1] >= 'A' && s[i + 1] <= 'Z') ||
-                     (s[i + 1] >= '0' && s[i + 1] <= '9') || s[i + 1] == '\\')) i++;
+            /* Accents: use a precomposed Latin letter when one exists in the
+             * bundled faces (combining marks do not), else put the modifier
+             * mark after the operand. */
+            int acc = -1;                              /* 0 hat .. 9 acute */
+            int j = i + 1;
+            {
+                static const char *const nm[] = {
+                    "\\hat", "\\widehat", "\\tilde", "\\widetilde", "\\bar",
+                    "\\overline", "\\dot", "\\ddot", "\\vec", "\\mathring",
+                    "\\breve", "\\grave", "\\acute"
+                };
+                static const int kd[] = { 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9 };
+                for (int k = 0; k < (int)CUI_COUNTOF(nm); k++) {
+                    int sl = (int)strlen(nm[k]);
+                    if (i + sl <= n && !memcmp(s + i, nm[k], (size_t)sl) &&
+                        (i + sl >= n || !(s[i + sl] >= 'a' && s[i + sl] <= 'z'))) {
+                        acc = kd[k]; j = i + sl; break;
+                    }
+                }
+            }
+            if (acc >= 0) {
+                int bs, bl, end;
+                if (j < n && s[j] == '{' && md_group_at(s, n, j, &bs, &bl, &end)) {
+                    md_math_accent(ui, out, &o, cap, s + bs, bl, acc);
+                    i = end; continue;
+                }
+                if (j < n && s[j] == '\\' && j + 1 < n) {
+                    int k = j + 1;
+                    while (k < n && ((s[k] >= 'a' && s[k] <= 'z') ||
+                           (s[k] >= 'A' && s[k] <= 'Z'))) k++;
+                    md_math_accent(ui, out, &o, cap, s + j, k - j, acc);
+                    i = k; continue;
+                }
+                if (j < n) {
+                    md_math_accent(ui, out, &o, cap, s + j, 1, acc);
+                    i = j + 1; continue;
+                }
+                i = j; continue;
+            }
+            if (md_cmd_at(s, n, i, "\\pmod")) {
+                int bs, bl, end;
+                int j = i + 5;
+                md_put(out, &o, cap, " (mod ", -1);
+                if (md_group_at(s, n, j, &bs, &bl, &end)) {
+                    char *m = md_math_translate(ui, s + bs, bl);
+                    md_put(out, &o, cap, m, (int)strlen(m));
+                    i = end;
+                } else i = j;
+                md_put(out, &o, cap, ")", -1);
                 continue;
             }
             int best = -1, bestlen = 0;
@@ -409,7 +616,11 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
             md_math_script(ui, out, &o, cap, s + j, 1, sup);
             i += 2; continue;
         }
-        if (c == '{' || c == '}' || c == '&') { i++; continue; }
+        if (c == '{' || c == '}') { i++; continue; }
+        if (c == '&') {                            /* matrix column break */
+            md_put(out, &o, cap, "  ", 2);
+            i++; continue;
+        }
         md_put(out, &o, cap, s + i, 1);
         i++;
     }
@@ -1142,7 +1353,8 @@ typedef struct {
 typedef struct {
     int a, b;
     char label[MD_MM_EDGE_CAP];
-    bool arrow, back, back_side;
+    bool arrow, back, back_side, dashed, self, side;
+    float lane_f, out_frac, in_frac; /* route lane + attach offsets */
 } mm_edge;
 typedef struct {
     mm_node n[MD_MM_MAX_NODES];
@@ -1221,8 +1433,8 @@ static int mm_operand(mm_graph *g, const char *s, int n) {
     if (ln >= 4 && lb[0] == '(' && lb[1] == '(' && lb[ln - 1] == ')' && lb[ln - 2] == ')') {
         shape = 2; lb += 2; ln -= 4;
     } else if (ln >= 2 && lb[0] == '[' && lb[ln - 1] == ']') {
-        shape = (ln >= 4 && lb[1] == '[' && lb[ln - 2] == ']') ? 3 : 0;
-        if (shape == 3) { lb += 2; ln -= 4; } else { lb++; ln -= 2; }
+        shape = (ln >= 4 && lb[1] == '[' && lb[ln - 2] == ']') ? 4 : 0;
+        if (shape == 4) { lb += 2; ln -= 4; } else { lb++; ln -= 2; }
     } else if (ln >= 2 && lb[0] == '(' && lb[ln - 1] == ')') {
         shape = 1; lb++; ln -= 2;
     } else if (ln >= 2 && lb[0] == '{' && lb[ln - 1] == '}') {
@@ -1235,16 +1447,16 @@ static int mm_operand(mm_graph *g, const char *s, int n) {
     return mm_add(g, id, idn, lb, ln, shape);
 }
 
-typedef struct { int left, right, ls, ln; bool arrow; const char *label_ptr; } mm_arrow;
+typedef struct { int left, right, ls, ln; bool arrow, dashed; const char *label_ptr; } mm_arrow;
 
 static int mm_find_arrow(const char *s, int n, mm_arrow *r) {
     memset(r, 0, sizeof *r);
     for (int i = 0; i < n - 1; i++) {
         int tok = 0, next = 0;
-        bool arrow = false;
+        bool arrow = false, dashed = false;
         if (s[i] == '-' && s[i + 1] == '-') {
             if (i + 2 < n && s[i + 2] == '>') { tok = 3; arrow = true; }
-            else if (i + 4 < n && s[i + 2] == '.' && s[i + 3] == '-' && s[i + 4] == '>') { tok = 5; arrow = true; }
+            else if (i + 4 < n && s[i + 2] == '.' && s[i + 3] == '-' && s[i + 4] == '>') { tok = 5; arrow = true; dashed = true; }
             else if (i + 2 < n && s[i + 2] == '-' && (i + 3 >= n || s[i + 3] != '>')) { tok = 3; }
             else {                              /* "-- label -->" */
                 for (int j = i + 2; j + 2 < n; j++) {
@@ -1261,7 +1473,7 @@ static int mm_find_arrow(const char *s, int n, mm_arrow *r) {
             else if (i + 2 < n && s[i + 2] == '=') { tok = 3; }
             else continue;
         } else if (s[i] == '-' && s[i + 1] == '.' && i + 3 < n && s[i + 2] == '-' && s[i + 3] == '>') {
-            tok = 4; arrow = true;
+            tok = 4; arrow = true; dashed = true;
         } else continue;
         next = i + tok;
         r->left = i; r->right = next; r->arrow = arrow;
@@ -1270,15 +1482,17 @@ static int mm_find_arrow(const char *s, int n, mm_arrow *r) {
             while (j < n && s[j] != '|') j++;
             if (j < n) { r->ls = next + 1; r->ln = j - next - 1; r->right = j + 1; }
         }
+        r->dashed = dashed;
         return 1;
     }
     return 0;
 }
 
 static void mm_add_edge(mm_graph *g, int from, int to, const mm_arrow *a) {
-    if (from < 0 || to < 0 || from == to || g->ne >= MD_MM_MAX_EDGES) return;
+    if (from < 0 || to < 0 || g->ne >= MD_MM_MAX_EDGES) return;
     mm_edge *e = &g->e[g->ne++];
-    e->a = from; e->b = to; e->arrow = a->arrow;
+    e->a = from; e->b = to; e->arrow = a->arrow; e->dashed = a->dashed;
+    e->self = from == to;
     const char *lp = a->label_ptr ? a->label_ptr : "";
     int ln = a->ln;
     while (ln > 0 && md_ws((unsigned char)*lp)) { lp++; ln--; }
@@ -1436,8 +1650,11 @@ static void mm_layout(mm_graph *g, cui_ctx *ui, float fs, float u) {
     for (int i = 0; i < g->nn; i++) g->n[i].rank = max_rank - g->n[i].rank;
     for (int k = 0; k < g->ne; k++) {
         mm_edge *e = &g->e[k];
-        e->back = (e->a < 0 || e->b < 0 || e->a >= g->nn || e->b >= g->nn) ||
-                  (g->n[e->b].rank <= g->n[e->a].rank);
+        bool bad = e->a < 0 || e->b < 0 || e->a >= g->nn || e->b >= g->nn;
+        e->self = !bad && e->a == e->b;
+        e->side = !bad && !e->self && g->n[e->a].rank == g->n[e->b].rank;
+        e->back = !bad && !e->self && !e->side &&
+                  g->n[e->b].rank < g->n[e->a].rank;
     }
     int byr[MD_MM_MAX_NODES][MD_MM_MAX_NODES];
     int cnt[MD_MM_MAX_NODES];
@@ -1502,6 +1719,53 @@ static void mm_layout(mm_graph *g, cui_ctx *ui, float fs, float u) {
         float pos = g->lr ? a->y + a->h * 0.5f : a->x + a->w * 0.5f;
         e->back_side = pos < m + cross * 0.5f;   /* left for TD, top for LR */
     }
+    /* Stagger forward edges: per rank pair, edges share the gap in insertion
+     * order of their endpoints; attach points spread over the node side. */
+    {
+        int pair[MD_MM_MAX_NODES][MD_MM_MAX_NODES];
+        int outc[MD_MM_MAX_NODES], inc[MD_MM_MAX_NODES];
+        int outidx[MD_MM_MAX_EDGES], inidx[MD_MM_MAX_EDGES];
+        memset(pair, 0, sizeof pair);
+        memset(outc, 0, sizeof outc);
+        memset(inc, 0, sizeof inc);
+        int pass;
+        for (pass = 0; pass < 2; pass++) {
+            for (int k = 0; k < g->ne; k++) {
+                mm_edge *e = &g->e[k];
+                if (e->back || e->self || e->side) continue;
+                if (e->a < 0 || e->a >= g->nn || e->b < 0 || e->b >= g->nn) continue;
+                int ra = g->n[e->a].rank, rb = g->n[e->b].rank;
+                if (ra < 0 || ra >= MD_MM_MAX_NODES || rb < 0 || rb >= MD_MM_MAX_NODES)
+                    continue;
+                if (pass == 0) {
+                    outidx[k] = outc[e->a]++;
+                    inidx[k] = inc[e->b]++;
+                    pair[ra][rb]++;
+                } else {
+                    /* spread attach across 30%..70% of the node side */
+                    e->out_frac = outc[e->a] > 1
+                        ? 0.30f + 0.40f * outidx[k] / (outc[e->a] - 1) : 0.5f;
+                    e->in_frac = inc[e->b] > 1
+                        ? 0.30f + 0.40f * inidx[k] / (inc[e->b] - 1) : 0.5f;
+                }
+            }
+        }
+        for (int k = 0; k < g->ne; k++) {
+            mm_edge *e = &g->e[k];
+            if (e->back || e->self || e->side) continue;
+            if (e->a < 0 || e->a >= g->nn || e->b < 0 || e->b >= g->nn) continue;
+            int ra = g->n[e->a].rank, rb = g->n[e->b].rank;
+            if (ra < 0 || ra >= MD_MM_MAX_NODES || rb < 0 || rb >= MD_MM_MAX_NODES)
+                continue;
+            int total = pair[ra][rb], before = 0;
+            for (int q = 0; q < k; q++) {
+                mm_edge *f = &g->e[q];
+                if (f->back || f->self || f->side) continue;
+                if (g->n[f->a].rank == ra && g->n[f->b].rank == rb) before++;
+            }
+            e->lane_f = total > 0 ? (float)(before + 1) / (total + 1) : 0.5f;
+        }
+    }
 }
 
 static void mm_arrow_head(cui_ctx *ui, cui_vec2 tip, float ang, float scale, cui_color col) {
@@ -1514,32 +1778,114 @@ static void mm_arrow_head(cui_ctx *ui, cui_vec2 tip, float ang, float scale, cui
     cui_draw_polygon(ui, p, 3, col);
 }
 
-/* Forward edges meet the facing sides; cycle (back) edges take a channel
- * outside the graph so they never cut through unrelated nodes. */
+/* Forward edges run orthogonally through the rank gap (staggered lanes),
+ * same-rank edges cross the facing sides, cycle (back) edges take a channel
+ * outside the graph, and self edges loop around the free side of the node.
+ * Besides the polyline this reports the local segment direction at the label
+ * anchor (dir, unit or 0,0) and the side the label should move to (nrm):
+ * labels sit beside the line instead of straddling it. */
 static void mm_edge_points(mm_graph *g, mm_edge *e, float u,
-                           cui_vec2 *pts, int *np, cui_vec2 *lp) {
+                           cui_vec2 *pts, int *np, cui_vec2 *lp,
+                           float dir[2], float nrm[2]) {
     mm_node *a = &g->n[e->a], *b = &g->n[e->b];
     float acx = a->x + a->w * 0.5f, acy = a->y + a->h * 0.5f;
     float bcx = b->x + b->w * 0.5f, bcy = b->y + b->h * 0.5f;
-    if (!e->back && !g->lr) {
-        float ax = CUI_MAX(a->x + 10 * u, CUI_MIN(bcx, a->x + a->w - 10 * u));
-        float bx = CUI_MAX(b->x + 10 * u, CUI_MIN(acx, b->x + b->w - 10 * u));
-        pts[0] = (cui_vec2){ ax, a->y + a->h };
-        pts[1] = (cui_vec2){ bx, b->y };
+    dir[0] = dir[1] = nrm[0] = nrm[1] = 0;
+    if (e->self) {
+        float reach = 18 * u;
+        if (!g->lr) {
+            float x0 = a->x + a->w, y0 = a->y + a->h * 0.30f;
+            float y1 = a->y + a->h * 0.72f;
+            pts[0] = (cui_vec2){ x0, y0 };
+            pts[1] = (cui_vec2){ x0 + reach, y0 };
+            pts[2] = (cui_vec2){ x0 + reach, y1 };
+            pts[3] = (cui_vec2){ x0, y1 };
+            *np = 4;
+            *lp = (cui_vec2){ x0 + reach * 0.55f, y1 };
+            dir[0] = 1; nrm[1] = 1;             /* below the bottom run */
+        } else {
+            float y0 = a->y + a->h, x0 = a->x + a->w * 0.30f;
+            float x1 = a->x + a->w * 0.72f;
+            pts[0] = (cui_vec2){ x0, y0 };
+            pts[1] = (cui_vec2){ x0, y0 + reach };
+            pts[2] = (cui_vec2){ x1, y0 + reach };
+            pts[3] = (cui_vec2){ x1, y0 };
+            *np = 4;
+            *lp = (cui_vec2){ x1, y0 + reach * 0.55f };
+            dir[1] = 1; nrm[0] = 1;             /* right of the outer run */
+        }
+        return;
+    }
+    if (e->side) {
+        if (g->lr) {
+            bool down = bcy > acy;
+            pts[0] = (cui_vec2){ acx, down ? a->y + a->h : a->y };
+            pts[1] = (cui_vec2){ bcx, down ? b->y : b->y + b->h };
+        } else {
+            bool right = bcx > acx;
+            pts[0] = (cui_vec2){ right ? a->x + a->w : a->x, acy };
+            pts[1] = (cui_vec2){ right ? b->x : b->x + b->w, bcy };
+        }
         *np = 2;
-        /* Bias the label toward the source: the midpoint often lands right
-         * on a node in the next rank. */
-        *lp = (cui_vec2){ ax + (bx - ax) * 0.35f,
-                          a->y + a->h + (b->y - a->y - a->h) * 0.35f };
-    } else if (!e->back) {
-        float ay = CUI_MAX(a->y + 8 * u, CUI_MIN(bcy, a->y + a->h - 8 * u));
-        float by = CUI_MAX(b->y + 8 * u, CUI_MIN(acy, b->y + b->h - 8 * u));
-        pts[0] = (cui_vec2){ a->x + a->w, ay };
-        pts[1] = (cui_vec2){ b->x, by };
-        *np = 2;
-        *lp = (cui_vec2){ a->x + a->w + (b->x - a->x - a->w) * 0.35f,
-                          ay + (by - ay) * 0.35f };
-    } else if (!g->lr) {
+        *lp = (cui_vec2){ (pts[0].x + pts[1].x) * 0.5f,
+                          (pts[0].y + pts[1].y) * 0.5f };
+        {   /* perpendicular to the (usually diagonal) run, tilted upward */
+            float dx = pts[1].x - pts[0].x, dy = pts[1].y - pts[0].y;
+            float len = sqrtf(dx * dx + dy * dy);
+            if (len > 0.01f) {
+                float nx = -dy / len, ny = dx / len;
+                if (g->lr ? nx < 0 : ny > 0) { nx = -nx; ny = -ny; }
+                dir[0] = dx / len; dir[1] = dy / len;
+                nrm[0] = nx; nrm[1] = ny;
+            }
+        }
+        return;
+    }
+    if (!e->back) {
+        float ax = g->lr ? a->y + a->h * e->out_frac
+                         : a->x + a->w * e->out_frac;
+        float bx = g->lr ? b->y + b->h * e->in_frac
+                         : b->x + b->w * e->in_frac;
+        if (!g->lr) {
+            float a0 = a->y + a->h, b0 = b->y;
+            float lane = a0 + (b0 - a0) * e->lane_f;
+            if (fabsf(ax - bx) < 1.0f) {
+                pts[0] = (cui_vec2){ ax, a0 };
+                pts[1] = (cui_vec2){ bx, b0 };
+                *np = 2;
+                *lp = (cui_vec2){ ax, (a0 + b0) * 0.5f };
+                dir[1] = 1; nrm[0] = 1;         /* vertical run: right side */
+            } else {
+                pts[0] = (cui_vec2){ ax, a0 };
+                pts[1] = (cui_vec2){ ax, lane };
+                pts[2] = (cui_vec2){ bx, lane };
+                pts[3] = (cui_vec2){ bx, b0 };
+                *np = 4;
+                *lp = (cui_vec2){ (ax + bx) * 0.5f, lane };
+                dir[0] = 1; nrm[1] = -1;        /* horizontal lane: above */
+            }
+        } else {
+            float a0 = a->x + a->w, b0 = b->x;
+            float lane = a0 + (b0 - a0) * e->lane_f;
+            if (fabsf(ax - bx) < 1.0f) {
+                pts[0] = (cui_vec2){ a0, ax };
+                pts[1] = (cui_vec2){ b0, bx };
+                *np = 2;
+                *lp = (cui_vec2){ (a0 + b0) * 0.5f, ax };
+                dir[0] = 1; nrm[1] = -1;        /* horizontal run: above */
+            } else {
+                pts[0] = (cui_vec2){ a0, ax };
+                pts[1] = (cui_vec2){ lane, ax };
+                pts[2] = (cui_vec2){ lane, bx };
+                pts[3] = (cui_vec2){ b0, bx };
+                *np = 4;
+                *lp = (cui_vec2){ lane, (ax + bx) * 0.5f };
+                dir[1] = 1; nrm[0] = 1;         /* vertical lane: right side */
+            }
+        }
+        return;
+    }
+    if (!g->lr) {
         float ch = e->back_side ? g->ch_lo : g->ch_hi;
         float sx = e->back_side ? a->x : a->x + a->w;
         float tx = e->back_side ? b->x : b->x + b->w;
@@ -1549,6 +1895,7 @@ static void mm_edge_points(mm_graph *g, mm_edge *e, float u,
         pts[3] = (cui_vec2){ tx, bcy };
         *np = 4;
         *lp = (cui_vec2){ (ch + tx) * 0.5f, bcy };
+        dir[0] = 1; nrm[1] = -1;                /* horizontal run: above */
     } else {
         float ch = e->back_side ? g->ch_lo : g->ch_hi;
         float sy = e->back_side ? a->y : a->y + a->h;
@@ -1559,6 +1906,7 @@ static void mm_edge_points(mm_graph *g, mm_edge *e, float u,
         pts[3] = (cui_vec2){ bcx, ty };
         *np = 4;
         *lp = (cui_vec2){ bcx, (ch + ty) * 0.5f };
+        dir[1] = 1; nrm[0] = 1;                 /* vertical run: right side */
     }
 }
 
@@ -1579,51 +1927,123 @@ static void mm_paint_cb(cui_ctx *ui, cui_rect rect, void *user) {
     float oy = rect.y + (rect.h - g->nat_h * sc) * 0.5f;
 #define MMX(v) (ox + (v) * sc)
 #define MMY(v) (oy + (v) * sc)
+    /* Pass 1: every edge's lines and arrowheads. Labels come last (pass 2)
+     * so later edges never draw through an earlier label's background. */
+    cui_vec2 lbl_pt[MD_MM_MAX_EDGES];
+    const char *lbl_txt[MD_MM_MAX_EDGES];
+    cui_color lbl_col[MD_MM_MAX_EDGES];
+    float lbl_dir[MD_MM_MAX_EDGES][2], lbl_nrm[MD_MM_MAX_EDGES][2];
+    int lbl_n = 0;
     for (int k = 0; k < g->ne; k++) {
         mm_edge *e = &g->e[k];
         if (e->a < 0 || e->a >= g->nn || e->b < 0 || e->b >= g->nn) continue;
         cui_vec2 pts[4], lp;
+        float edir[2], enorm[2];
         int np = 0;
-        mm_edge_points(g, e, p->u, pts, &np, &lp);
+        mm_edge_points(g, e, p->u, pts, &np, &lp, edir, enorm);
         cui_color col = p->muted;
         if (e->back) col.a = (uint8_t)(col.a * 0.7f);
-        for (int q = 1; q < np; q++)
-            cui_draw_line(ui, (cui_vec2){ MMX(pts[q - 1].x), MMY(pts[q - 1].y) },
-                          (cui_vec2){ MMX(pts[q].x), MMY(pts[q].y) },
-                          CUI_MAX(1.0f, 1.6f * sc), col);
+        float lw = CUI_MAX(1.0f, 1.6f * sc);
+#define MMP(q) (cui_vec2){ MMX(pts[q].x), MMY(pts[q].y) }
+        if (!e->dashed) {
+            for (int q = 1; q < np; q++)
+                cui_draw_line(ui, MMP(q - 1), MMP(q), lw, col);
+        } else {                                /* -.-> : hand-drawn dashes */
+            float dash = 5.5f * sc, gap = 4 * sc;
+            for (int q = 1; q < np; q++) {
+                cui_vec2 p0 = MMP(q - 1), p1 = MMP(q);
+                float dx = p1.x - p0.x, dy = p1.y - p0.y;
+                float len = sqrtf(dx * dx + dy * dy);
+                for (float t = 0; len > 0.01f && t < len; t += dash + gap) {
+                    float t1 = CUI_MIN(t + dash, len);
+                    cui_draw_line(ui,
+                                  (cui_vec2){ p0.x + dx * t / len, p0.y + dy * t / len },
+                                  (cui_vec2){ p0.x + dx * t1 / len, p0.y + dy * t1 / len },
+                                  lw, col);
+                }
+            }
+        }
         if (e->arrow && np >= 2) {
-            cui_vec2 tip = { MMX(pts[np - 1].x), MMY(pts[np - 1].y) };
-            cui_vec2 prev = { MMX(pts[np - 2].x), MMY(pts[np - 2].y) };
+            cui_vec2 tip = MMP(np - 1);
+            cui_vec2 prev = MMP(np - 2);
             mm_arrow_head(ui, tip, atan2f(tip.y - prev.y, tip.x - prev.x), sc, col);
         }
-        if (e->label[0]) {
-            float lf = CUI_MAX(9.0f, p->fs * 0.82f * sc);
-            float tw = cui__text_width(ui, CUI_FONT_BODY, lf, e->label, -1, false);
-            float mx = MMX(lp.x), my = MMY(lp.y);
-            cui_draw_rect(ui, (cui_rect){ mx - tw * 0.5f - 4, my - lf * 0.72f,
-                                          tw + 8, lf * 1.44f },
-                          CUI_CORNERS(4), p->panel);
-            cui_draw_text(ui, CUI_FONT_BODY, lf,
-                          (cui_vec2){ mx - tw * 0.5f, my - lf * 0.6f },
-                          col, e->label, -1);
+#undef MMP
+        if (e->label[0] && lbl_n < MD_MM_MAX_EDGES) {
+            lbl_pt[lbl_n] = lp;
+            lbl_txt[lbl_n] = e->label;
+            lbl_col[lbl_n] = col;
+            lbl_dir[lbl_n][0] = edir[0]; lbl_dir[lbl_n][1] = edir[1];
+            lbl_nrm[lbl_n][0] = enorm[0]; lbl_nrm[lbl_n][1] = enorm[1];
+            lbl_n++;
         }
+    }
+    /* Pass 2: labels beside the line (above horizontal runs, right of
+     * vertical ones, offset along the normal for diagonals), on opaque
+     * plates, always above every line. */
+    for (int k = 0; k < lbl_n; k++) {
+        float lf = CUI_MAX(9.0f, p->fs * 0.82f * sc);
+        float tw = cui__text_width(ui, CUI_FONT_BODY, lf, lbl_txt[k], -1, false);
+        float mx = MMX(lbl_pt[k].x), my = MMY(lbl_pt[k].y);
+        float ph = lf * 1.64f, pw = tw + 10, gap = 3;
+        float dx = lbl_dir[k][0], dy = lbl_dir[k][1];
+        float px, py;                           /* plate top-left */
+        if (dx == 0 && dy == 0) {               /* no hint: straddle anchor */
+            px = mx - pw * 0.5f; py = my - ph * 0.5f;
+        } else if (fabsf(dy) < 0.25f) {         /* horizontal run: above/below */
+            px = mx - pw * 0.5f;
+            py = lbl_nrm[k][1] < 0 ? my - gap - ph : my + gap;
+        } else if (fabsf(dx) < 0.25f) {         /* vertical run: left/right */
+            px = lbl_nrm[k][0] < 0 ? mx - gap - pw : mx + gap;
+            py = my - ph * 0.5f;
+        } else {                                /* diagonal: push off the line */
+            float off = ph * 0.5f + gap;
+            px = mx + lbl_nrm[k][0] * off - pw * 0.5f;
+            py = my + lbl_nrm[k][1] * off - ph * 0.5f;
+        }
+        cui_rect plate = { px, py, pw, ph };
+        cui_draw_rect(ui, plate, CUI_CORNERS(4), p->panel);
+        cui_draw_rect_border(ui, plate, CUI_CORNERS(4), cui__rgba(0, 0, 0, 0),
+                             p->border, 1);
+        cui_draw_text(ui, CUI_FONT_BODY, lf,
+                      (cui_vec2){ px + 5, py + lf * 0.16f },
+                      lbl_col[k], lbl_txt[k], -1);
     }
     for (int i = 0; i < g->nn; i++) {
         mm_node *nd = &g->n[i];
         cui_rect r = { MMX(nd->x), MMY(nd->y), nd->w * sc, nd->h * sc };
-        float bw = CUI_MAX(1.0f, 1.2f * sc);
-        cui_color fill = nd->rank == 0 ? p->start : p->surface;
+        float bw = CUI_MAX(1.0f, 1.3f * sc);
+        bool start = nd->rank == 0;
+        cui_color fill = start ? p->start : p->surface;
+        cui_color border = start ? p->accent : p->border;
+        float shadow_dx = 1.2f * sc, shadow_dy = 2.4f * sc;
+        cui_color shadow = cui__rgba(0, 0, 0, 26);
         if (nd->shape == 3) {
             cui_vec2 v[4] = {
                 { r.x + r.w * 0.5f, r.y }, { r.x + r.w, r.y + r.h * 0.5f },
                 { r.x + r.w * 0.5f, r.y + r.h }, { r.x, r.y + r.h * 0.5f }
             };
+            cui_vec2 vs[4];
+            for (int q = 0; q < 4; q++)
+                vs[q] = (cui_vec2){ v[q].x + shadow_dx, v[q].y + shadow_dy };
+            cui_draw_polygon(ui, vs, 4, shadow);
             cui_draw_polygon(ui, v, 4, fill);
-            cui_draw_polyline(ui, v, 4, bw, p->border, true);
+            cui_draw_polyline(ui, v, 4, bw, border, true);
+        } else if (nd->shape == 4) {
+            /* subroutine: rectangle with double side bars */
+            cui_draw_rect(ui, (cui_rect){ r.x + shadow_dx, r.y + shadow_dy,
+                                          r.w, r.h }, CUI_CORNERS(2 * sc), shadow);
+            cui_draw_rect_border(ui, r, CUI_CORNERS(2 * sc), fill, border, bw);
+            cui_draw_line(ui, (cui_vec2){ r.x + r.w * 0.12f, r.y },
+                          (cui_vec2){ r.x + r.w * 0.12f, r.y + r.h }, bw, border);
+            cui_draw_line(ui, (cui_vec2){ r.x + r.w * 0.88f, r.y },
+                          (cui_vec2){ r.x + r.w * 0.88f, r.y + r.h }, bw, border);
         } else {
             float rad = (nd->shape == 2 ? r.h * 0.5f :
                          (nd->shape == 1 ? 10 : 6) * sc);
-            cui_draw_rect_border(ui, r, CUI_CORNERS(rad), fill, p->border, bw);
+            cui_draw_rect(ui, (cui_rect){ r.x + shadow_dx, r.y + shadow_dy,
+                                          r.w, r.h }, CUI_CORNERS(rad), shadow);
+            cui_draw_rect_border(ui, r, CUI_CORNERS(rad), fill, border, bw);
         }
         float lf = CUI_MAX(9.0f, p->fs * sc * (nd->shape == 3 ? 0.86f : 1.0f));
         float tw = cui__text_width(ui, CUI_FONT_BODY, lf, nd->label, -1, false);

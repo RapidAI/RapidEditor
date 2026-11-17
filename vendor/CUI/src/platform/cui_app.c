@@ -2,6 +2,11 @@
  * sleeping and screenshots. Backends supply windows and events. */
 #include "cui_platform.h"
 
+#ifdef __ANDROID__
+#include <SDL.h>
+#include <android/log.h>
+#endif
+
 static cui_app *cui__current_app;
 static void cui__app_set_clip(void *user, const char *utf8);
 static const char *cui__app_get_clip(void *user);
@@ -81,6 +86,11 @@ cui_app *cui_app_create(const cui_app_desc *desc) {
     if (!app->ui) { free(app); return NULL; }
     if (!cui__plat_init(app)) {
         fprintf(stderr, "cui: could not create a window (%s backend)\n", cui__plat_name());
+#ifdef __ANDROID__
+        /* stderr is invisible on Android; surface the SDL error in logcat. */
+        __android_log_print(ANDROID_LOG_WARN, "CUI", "could not create window (%s): %s",
+                            cui__plat_name(), SDL_GetError());
+#endif
         cui_destroy(app->ui);
         free(app);
         return NULL;

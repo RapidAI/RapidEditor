@@ -44,6 +44,10 @@
 #include <wchar.h>
 #endif
 
+#ifdef __ANDROID__
+#include <SDL.h> /* SDL_OpenURL: ACTION_VIEW intent for files and links */
+#endif
+
 #define NP_TEXT_INIT  ((size_t)64 * 1024)              /* initial buffer per tab */
 #define NP_TEXT_MAX   ((size_t)256 * 1024 * 1024)       /* hard ceiling per tab */
 #define NP_LOAD_MAX   ((size_t)240 * 1024 * 1024)       /* largest file read in full */
@@ -1426,7 +1430,10 @@ static void np_load_fonts(cui_ctx *ui, notepad *a) {
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/system/fonts/NotoSansCJK-Regular.ttc",      /* Android */
+        "/system/fonts/NotoSerifCJK-Regular.ttc",     /* Android variant */
+        "/system/fonts/DroidSansFallback.ttf"         /* older Android */
     };
     for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
         cui_font f = cui_font_load_file(ui, paths[i]);
@@ -2372,6 +2379,11 @@ static void np_system_open(notepad *a, const char *path, bool locate) {
     } else {
         ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
     }
+#elif defined(__ANDROID__)
+    /* Android: no shell and no "reveal in folder". SDL_OpenURL fires an
+     * ACTION_VIEW intent, which opens the file/URL with the matching handler. */
+    (void)locate;
+    SDL_OpenURL(path);
 #else
     char q[NP_PATH_CAP + 8], cmd[NP_PATH_CAP * 2 + 64];
     if (locate) {
@@ -3822,6 +3834,53 @@ static void np_frame(cui_ctx *ui, void *user) {
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
+#ifdef __ANDROID__
+/* Seed the app-private documents folder with bundled sample files on first
+ * run, and open a sensible default document when launched from the launcher
+ * (Android gives SDL_Main no argv). Also asks CUI for a 2x logical scale:
+ * the software renderer reports 1:1 pixels, which is unreadable on a dense
+ * pad screen. Overridable with the CUI_SCALE environment variable. */
+static void np_android_bootstrap(notepad *a) {
+    if (!getenv("CUI_SCALE")) setenv("CUI_SCALE", "2", 1);
+    /* Force the software renderer: CUI's GL path asks for a desktop GL 3.3
+     * core context, which GLES (Android/SDL2) cannot provide and the surface
+     * window creation would fail. Software blits through SDL_GetWindowSurface. */
+    setenv("CUI_RENDERER", "software", 1);
+    const char *base = SDL_AndroidGetInternalStoragePath();
+    if (!base || !base[0]) return;
+    char docs[NP_PATH_CAP];
+    snprintf(docs, sizeof docs, "%s/docs", base);
+    mkdir(docs, 0755);
+    static const char *samples[] = { "欢迎.md", "示例.html", "示例.c" };
+    for (size_t i = 0; i < sizeof samples / sizeof *samples; i++) {
+        char dst[NP_PATH_CAP];
+        snprintf(dst, sizeof dst, "%s/docs/%s", base, samples[i]);
+        struct stat st;
+        if (stat(dst, &st) == 0) continue;
+        SDL_RWops *src = SDL_RWFromFile(samples[i], "rb");   /* APK asset */
+        if (!src) continue;
+        FILE *f = fopen(dst, "wb");
+        if (f) {
+            char buf[8192];
+            size_t n;
+            while ((n = SDL_RWread(src, buf, 1, sizeof buf)) > 0)
+                fwrite(buf, 1, n, f);
+            fclose(f);
+        }
+        SDL_RWclose(src);
+    }
+    /* The sidebar starts at "/" which scoped storage makes unreadable; point
+     * it at the seeded documents folder instead. */
+    if (a->side_dir[0] == '\0' || strcmp(a->side_dir, "/") == 0) {
+        snprintf(a->side_dir, sizeof a->side_dir, "%s/docs", base);
+        a->side_reload = true;
+    }
+    if (a->startup_count == 0 && a->session_count == 0)
+        snprintf(a->startup[a->startup_count++], NP_PATH_CAP,
+                 "%s/docs/欢迎.md", base);
+}
+#endif
+
 int main(int argc, char **argv) {
     g.font_size = NP_FONT_DEF;
     snprintf(g.font_ident, sizeof g.font_ident, "default");
@@ -3875,6 +3934,10 @@ int main(int argc, char **argv) {
         for (int i = 0; i < g.session_count && g.startup_count < NP_DOC_MAX; i++)
             snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", g.session[i]);
     }
+
+#ifdef __ANDROID__
+    np_android_bootstrap(&g);
+#endif
 
     int rc = cui_app_run(&(cui_app_desc){
         .title = "未命名 - RapidEditor",

@@ -1,6 +1,6 @@
 # RapidEditor
 
-一个跨平台的多标签记事本 / 源码编辑器，核心为 C99，基于 [CUI](https://github.com/yappologistic/CUI) 即时模式 UI 库。原生窗口后端：Windows (Win32)、macOS (Cocoa)、Linux (X11)。HTML 内嵌预览的原生桥接层按平台使用 C++ / Objective-C++（见下）。
+一个跨平台的多标签记事本 / 源码编辑器，核心为 C99，基于 [CUI](https://github.com/yappologistic/CUI) 即时模式 UI 库。原生窗口后端：Windows (Win32)、macOS (Cocoa)、Linux (X11)、Android 平板 (SDL2/NativeActivity，实验性)。HTML 内嵌预览的原生桥接层按平台使用 C++ / Objective-C++（见下）。
 
 ## 功能特性
 
@@ -16,6 +16,7 @@
 - **大文件支持**：动态缓冲区 + 行索引缓存 + 增量撤销，可完整打开、编辑、保存 100 MB 级 / 百万行文本。
 - **中文友好**：系统 CJK 字体 fallback、按真实字形 advance 计算的光标 / 选区 / 点击定位，UTF-8 / UTF-8 BOM / UTF-16 / ANSI(GBK) 读写，中文路径命令行与拖放。
 - **常用编辑能力**：查找 / 替换 / 转到行、行号、撤销重做、复制粘贴、Tab 缩进、括号高亮、插入日期时间、明暗主题、字号调节、CRLF/LF 切换、未保存关闭保护。
+- **编辑器字体**（视图 → 编辑器字体）：内置 5 款 SIL OFL 开源编程字体（JetBrains Mono、Cascadia Code / Mono、Source Code Pro、IBM Plex Mono），也可加载本机任意 TTF/OTF 字体文件；切换即时生效、中文 CJK fallback 自动保留，选择随配置持久化。
 - **十六进制编辑**（010 Editor 风格）：二进制文件自动以十六进制模式打开（含 NUL 或大量控制字节即判定），偏移列 + 16 字节行 + ASCII 三段视图；点击 / 拖选字节、方向键与翻页移动、直接键入十六进制覆盖光标字节、`Ctrl+C` 复制选区为十六进制 / `Ctrl+Shift+C` 复制为 ASCII、`Ctrl+G` 转到偏移；文本 ↔ 十六进制模式可随时互切（「文件」菜单或工具栏），保存原样写回字节。
 - **在文件中查找**（`Ctrl+Shift+F`）：对整个目录递归搜索（支持 `*.c;*.h` 文件类型过滤），结果按文件 / 行号列出，点击直接打开并跳转；自动跳过 `.git`、`node_modules`、`build` 等构建目录。
 - **文本转换**（编辑 → 转换）：选区大小写转换（无选区时转光标所在词）、选区行排序、去除相邻重复行、删除空行、剪裁行尾空白、转到匹配的括号。
@@ -31,6 +32,23 @@
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 # 产物: build/RapidEditor(.exe)
+```
+
+### Android 平板（实验性）
+
+同一份 C99 核心，经 SDL2 运行在 NativeActivity 上，面向平板外接键鼠的 Dex / PC 模式（触摸由 SDL 自动映射为鼠标，文本框自动拉起软键盘）。触摸/键鼠之外的平台差异：HTML 预览走 `SDL_OpenURL` 系统浏览器；CJK 字体回退取 `/system/fonts/NotoSansCJK*`；文档默认存放在应用私有目录 `files/docs/`（首次启动自动播种示例文件）。
+
+本地构建 APK 需要 Android NDK + SDK + Java 17：
+
+```sh
+# 1) 下载 SDL2 源码（作为子项目参与每个 ABI 的构建）
+curl -fLo .cache/android/SDL2.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz
+tar xzf .cache/android/SDL2.tar.gz -C .cache/android/
+
+# 2) 生成 APK（默认 arm64-v8a；-PRE_ABIS=x86_64 可加模拟器架构）
+cd android
+../.cache/android/gradle-8.9/bin/gradle :app:assembleDebug --no-daemon
+# 产物: app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Linux 需先安装依赖：
