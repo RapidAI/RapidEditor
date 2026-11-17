@@ -1,5 +1,10 @@
 package com.rapidaire.rapideditor;
 
+import android.app.Activity;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.PointerIcon;
+
 import org.libsdl.app.SDLActivity;
 
 /**
@@ -22,5 +27,26 @@ public class MainActivity extends SDLActivity {
             "SDL2",
             "RapidEditor"
         };
+    }
+
+    /**
+     * SDL's SDL_SetCursor cannot change the cursor the emulator / DeX draws
+     * (Android has no global system-cursor API); the pointer shape must be
+     * set per-view through PointerIcon.  Called from native (cui__sdl_set_cursor)
+     * on the SDL thread whenever the UI's hovered widget changes.
+     *
+     * @param style PointerIcon system style constant (see the mapping below).
+     */
+    public static void setPointerIconFromNative(final int style) {
+        final Activity a = SDLActivity.getContext() instanceof Activity
+                ? (Activity) SDLActivity.getContext() : null;
+        if (a == null) return;
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                PointerIcon icon = PointerIcon.getSystemIcon(a, style);
+                a.getWindow().getDecorView().setPointerIcon(icon);
+            }
+        });
     }
 }

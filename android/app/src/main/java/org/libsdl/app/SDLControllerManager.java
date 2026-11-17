@@ -623,6 +623,8 @@ class SDLGenericMotionListener_API12 implements View.OnGenericMotionListener {
     // Generic Motion (mouse hover, joystick...) events go here
     @Override
     public boolean onGenericMotion(View v, MotionEvent event) {
+        android.util.Log.i("CUI", "gen src=0x" + Integer.toHexString(event.getSource())
+                + " act=" + event.getActionMasked() + " vscroll=" + event.getAxisValue(MotionEvent.AXIS_VSCROLL, 0));
         float x, y;
         int action;
 
@@ -630,29 +632,32 @@ class SDLGenericMotionListener_API12 implements View.OnGenericMotionListener {
             case InputDevice.SOURCE_JOYSTICK:
                 return SDLControllerManager.handleJoystickMotionEvent(event);
 
-            case InputDevice.SOURCE_MOUSE:
-                action = event.getActionMasked();
-                switch (action) {
-                    case MotionEvent.ACTION_SCROLL:
-                        x = event.getAxisValue(MotionEvent.AXIS_HSCROLL, 0);
-                        y = event.getAxisValue(MotionEvent.AXIS_VSCROLL, 0);
-                        SDLActivity.onNativeMouse(0, action, x, y, false);
-                        return true;
-
-                    case MotionEvent.ACTION_HOVER_MOVE:
-                        x = event.getX(0);
-                        y = event.getY(0);
-
-                        SDLActivity.onNativeMouse(0, action, x, y, false);
-                        return true;
-
-                    default:
-                        break;
-                }
-                break;
-
             default:
                 break;
+        }
+
+        /* Accept any pointer-class device, not only exact SOURCE_MOUSE:
+         * emulator mice (MuMu etc.) often report SOURCE_MOUSE|SOURCE_TOUCHSCREEN
+         * or another composite source, and the wheel was dropped silently. */
+        if ((event.getSource() & InputDevice.SOURCE_CLASS_POINTER) != 0) {
+            action = event.getActionMasked();
+            switch (action) {
+                case MotionEvent.ACTION_SCROLL:
+                    x = event.getAxisValue(MotionEvent.AXIS_HSCROLL, 0);
+                    y = event.getAxisValue(MotionEvent.AXIS_VSCROLL, 0);
+                    SDLActivity.onNativeMouse(0, action, x, y, false);
+                    return true;
+
+                case MotionEvent.ACTION_HOVER_MOVE:
+                    x = event.getX(0);
+                    y = event.getY(0);
+
+                    SDLActivity.onNativeMouse(0, action, x, y, false);
+                    return true;
+
+                default:
+                    break;
+            }
         }
 
         // Event was not managed

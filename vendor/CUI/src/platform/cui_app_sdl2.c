@@ -2,6 +2,11 @@
  * on. Select it with -DCUI_PLATFORM=sdl2. */
 #include "cui_platform.h"
 #include <SDL.h>
+#ifdef __ANDROID__
+#include <SDL_system.h>
+#include <jni.h>
+#include <android/log.h>
+#endif
 
 typedef struct {
     SDL_Window *win;
@@ -10,6 +15,11 @@ typedef struct {
     cui_cursor cursor;
     SDL_Surface *surface;
     float px_scale;   /* Android: device pixels per logical point (CUI_SCALE) */
+    /* two-finger scroll: active finger ids and their last normalized pos */
+    int ntouch;
+    Uint32 tid[12];
+    float tpx[12], tpy[12];
+    bool tscroll;     /* a two-finger scroll is in progress */
 } cui__sdl;
 
 static cui__sdl *cui__s(cui_app *app) { return app->plat; }
@@ -18,11 +28,33 @@ double cui__plat_now(void) { return (double)SDL_GetPerformanceCounter() / (doubl
 const char *cui__plat_name(void) { return "sdl2"; }
 int cui__plat_system_dark(void) { return -1; }
 
+#ifdef __ANDROID__
+/* SDL_SetCursor cannot change the pointer the emulator / DeX draws - Android
+ * has no global cursor API, the shape is per-view via PointerIcon.  Mirror
+ * every cursor change into the activity's decor view (API 24+, minSdk 26). */
+static void cui__android_pointer_icon(cui_cursor c) {
+    /* PointerIcon system style ids (android.view.PointerIcon) for the
+     * CUI_CURSOR_* enum order: ARROW, HAND, IBEAM, SIZEWE, SIZENS, SIZEALL, NO */
+    static const int styles[CUI_CURSOR_COUNT] = { 1000, 1002, 1008, 1014, 1017, 1013, 1012 };
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    if (!env) return;
+    jclass cls = (*env)->FindClass(env, "com/rapidaire/rapideditor/MainActivity");
+    if (!cls) { (*env)->ExceptionClear(env); return; }
+    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "setPointerIconFromNative", "(I)V");
+    if (mid) (*env)->CallStaticVoidMethod(env, cls, mid, (jint)styles[c]);
+    else (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, cls);
+}
+#endif
+
 static void cui__sdl_set_cursor(void *user, cui_cursor c) {
     cui__sdl *s = cui__s(user);
     if (c == s->cursor || (int)c < 0 || c >= CUI_CURSOR_COUNT) return;
     s->cursor = c;
     if (s->cursors[c]) SDL_SetCursor(s->cursors[c]);
+#ifdef __ANDROID__
+    cui__android_pointer_icon(c);
+#endif
 }
 static void cui__sdl_set_clip(void *user, const char *utf8) { (void)user; SDL_SetClipboardText(utf8); }
 static const char *cui__sdl_get_clip(void *user) {
@@ -262,6 +294,43 @@ static int cui__sdl_mods(Uint16 m) {
     return r;
 }
 
+static int cui__touch_slot(cui__sdl *s, Uint32 id, bool add) {
+    for (int i = 0; i < s->ntouch && i < 12; i++)
+        if (s->tid[i] == id) return i;
+    if (!add || s->ntouch >= 12) return -1;
+    s->tid[s->ntouch] = id;
+    s->ntouch++;
+    return s->ntouch - 1;
+}
+
+/* Two-finger pan scroll: the second finger converts touch motion into
+ * scrolling (the wheel gesture on emulators that map it to touch, and the
+ * standard two-finger drag on real tablets).  Entering the gesture releases
+ * the emulated mouse button, because the first finger's drag otherwise
+ * leaves a text selection behind. */
+static void cui__touch_scroll(cui_app *app, cui__sdl *s, Uint32 id, float x, float y) {
+    cui_ctx *ui = app->ui;
+    int i = cui__touch_slot(s, id, true);
+    if (i < 0) return;
+    float dx = x - s->tpx[i], dy = y - s->tpy[i];
+    s->tpx[i] = x;
+    s->tpy[i] = y;
+    if (!s->tscroll && s->ntouch >= 2) {
+        s->tscroll = true;
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);   /* drop the drag-selection */
+    }
+    if (!s->tscroll || s->ntouch < 2) return;
+    int ww, wh;
+    SDL_GetWindowSize(s->win, &ww, &wh);
+#ifdef __ANDROID__
+    float pts = s->px_scale > 0 ? s->px_scale : 1.0f;
+#else
+    float pts = 1.0f;
+#endif
+    float dypx = (dy * wh) / pts, dxpx = (dx * ww) / pts;
+    if (dypx != 0 || dxpx != 0) cui_input_scroll(ui, -dxpx / 24.0f, dypx / 24.0f);
+}
+
 static void cui__sdl_event(cui_app *app, SDL_Event *e) {
     cui_ctx *ui = app->ui;
 #ifdef __ANDROID__
@@ -296,6 +365,22 @@ static void cui__sdl_event(cui_app *app, SDL_Event *e) {
         dx = e->wheel.preciseX; dy = e->wheel.preciseY;
 #endif
         cui_input_scroll(ui, -dx, dy);
+        break;
+    }
+    case SDL_FINGERDOWN: case SDL_FINGERMOTION: case SDL_FINGERUP: {
+        cui__sdl *s = cui__s(app);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "CUI", "finger %s id=%u %g,%g n=%d",
+                            e->type == SDL_FINGERDOWN ? "down" : e->type == SDL_FINGERMOTION ? "move" : "up",
+                            (unsigned)e->tfinger.fingerId, (double)e->tfinger.x, (double)e->tfinger.y, s->ntouch);
+#endif
+        if (e->type == SDL_FINGERUP) {
+            int i = cui__touch_slot(s, e->tfinger.fingerId, false);
+            if (i >= 0) { s->tid[i] = s->tid[--s->ntouch]; s->tpx[i] = s->tpx[s->ntouch]; s->tpy[i] = s->tpy[s->ntouch]; }
+            if (s->ntouch < 2) s->tscroll = false;
+        } else {
+            cui__touch_scroll(app, s, e->tfinger.fingerId, e->tfinger.x, e->tfinger.y);
+        }
         break;
     }
     case SDL_KEYDOWN: case SDL_KEYUP: {
