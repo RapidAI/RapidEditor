@@ -85,6 +85,13 @@ bool cui__plat_init(cui_app *app) {
     app->plat = s;
     Uint32 flags = SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_HIDDEN;
     if (!app->desc.fixed_size) flags |= SDL_WINDOW_RESIZABLE;
+#ifdef __ANDROID__
+    /* Immersive fullscreen: hides the system status/navigation bars.  Without
+     * it the top screen edge stays under the notification-shade gesture zone,
+     * and on emulators (MuMu) mouse clicks there never reach the app - the
+     * whole menu bar row is unclickable. */
+    flags |= SDL_WINDOW_FULLSCREEN;
+#endif
     const char *env = getenv("CUI_RENDERER");
     if (app->desc.renderer != CUI_RENDERER_SOFTWARE && !(env && strcmp(env, "software") == 0)) {
         flags |= SDL_WINDOW_OPENGL;
