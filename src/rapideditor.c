@@ -19,6 +19,8 @@
 #include <cui/cui.h>
 #include <cui/cui_app.h>
 #include "np_preview.h"
+#include "np_webview.h"
+#include "np_font_bundle.h"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -244,6 +246,13 @@ typedef struct notepad {
     bool quiet;                         /* no "opened" toasts while loading startup files */
     int  accent, font_size;
     int  density;                       /* 0 comfortable, 1 compact, 2 spacious */
+
+    /* Editor font ------------------------------------------------------ */
+    char font_ident[128];               /* bundled id, "default", or "custom" */
+    char font_custom_path[NP_PATH_CAP]; /* last custom font file (for restore) */
+    cui_font font_cjk;                  /* loaded CJK fallback font, reattached on switch */
+    cui_font font_default_mono;         /* cached original mono role font, for reset */
+    cui_font font_active;               /* the cui_font currently set on the mono role */
     bool welcome_dismissed;             /* hide the start screen on an empty session */
     int  pending_action, pending_doc;
 
@@ -299,6 +308,11 @@ typedef struct notepad {
     cui_texture preview_tex;       /* current PDF page texture */
     int  preview_tex_page;         /* page index currently loaded */
     char preview_owner[NP_PATH_CAP]; /* doc path the preview belongs to */
+
+    /* Embedded WebView2 (Win32, HTML preview only) --------------------- */
+    bool wv_init_done;             /* np_webview_init() attempted once */
+    bool wv_available;             /* runtime present + controller created */
+    char wv_url[512];              /* last URL pushed to the WebView */
 
     /* Persisted between runs (config file) ----------------------------- */
     char session[NP_SESSION_MAX][NP_PATH_CAP];
@@ -1309,26 +1323,122 @@ static void np_open_hex_dialog(notepad *a) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Fonts: CUI's embedded fonts cover Latin, so add a CJK fallback       */
+/* Editor fonts: bundled open-source faces + user font + CJK fallback   */
 /* ------------------------------------------------------------------ */
+
+/* Cache a CJK font so it can be re-attached to whichever font currently
+ * occupies the mono role: fallbacks live on the font object, not the role,
+ * so cui_font_set_role() drops them and we must add them back each switch. */
+static void np_font_attach_cjk(cui_ctx *ui, notepad *a, cui_font font) {
+    if (a->font_cjk >= 0 && font >= 0)
+        cui_font_add_fallback(ui, font, a->font_cjk);
+}
+
+/* Apply a face to the editor (mono) role and keep the CJK fallback intact. */
+static void np_font_set_active(cui_ctx *ui, notepad *a, cui_font font) {
+    if (font < 0) return;
+    a->font_active = font;
+    cui_font_set_role(ui, CUI_FONT_MONO, font);
+    np_font_attach_cjk(ui, a, font);
+}
+
+/* Restore CUI's built-in monospace face (Geist Mono). */
+static void np_font_reset(cui_ctx *ui, notepad *a) {
+    if (a->font_default_mono < 0) return;
+    np_font_set_active(ui, a, a->font_default_mono);
+    snprintf(a->font_ident, sizeof a->font_ident, "default");
+}
+
+/* Apply one of the bundled fonts by index. */
+static bool np_font_apply_bundled(cui_ctx *ui, notepad *a, int idx) {
+    if (idx < 0 || idx >= np_bundled_font_count) return false;
+    const np_bundled_font *bf = &np_bundled_fonts[idx];
+    cui_font f = cui_font_load_deflated(ui, bf->data, bf->packed_size, bf->raw_size);
+    if (f < 0) {
+        np_logf(a, "字体加载失败  ·  %s", bf->label);
+        return false;
+    }
+    np_font_set_active(ui, a, f);
+    snprintf(a->font_ident, sizeof a->font_ident, "%s", bf->ident);
+    np_logf(a, "编辑器字体  ·  %s", bf->label);
+    return true;
+}
+
+/* Apply a user-picked TrueType/OpenType file. */
+static bool np_font_apply_file(cui_ctx *ui, notepad *a, const char *path) {
+    if (!path || !*path) return false;
+    cui_font f = cui_font_load_file(ui, path);
+    if (f < 0) {
+        np_toast(a, "无法加载字体", "不是有效的 TrueType / OpenType 文件", CUI_TONE_WARNING);
+        np_logf(a, "字体加载失败  ·  %s", np_base(path));
+        return false;
+    }
+    np_font_set_active(ui, a, f);
+    snprintf(a->font_ident, sizeof a->font_ident, "custom");
+    snprintf(a->font_custom_path, sizeof a->font_custom_path, "%s", path);
+    np_toast(a, "编辑器字体已更新", np_base(path), CUI_TONE_SUCCESS);
+    np_logf(a, "编辑器字体（自定义）  ·  %s", np_base(path));
+    return true;
+}
+
+/* Human-readable name of the active face, for menus and the status bar. */
+static const char *np_font_label(const notepad *a) {
+    if (!strcmp(a->font_ident, "default")) return "默认 (Geist Mono)";
+    if (!strcmp(a->font_ident, "custom"))
+        return a->font_custom_path[0] ? np_base(a->font_custom_path) : "自定义";
+    for (int i = 0; i < np_bundled_font_count; i++)
+        if (!strcmp(a->font_ident, np_bundled_fonts[i].ident))
+            return np_bundled_fonts[i].label;
+    return a->font_ident;
+}
+
+/* Restore the face selected in config.ini at startup. */
+static void np_font_restore(cui_ctx *ui, notepad *a) {
+    if (!strcmp(a->font_ident, "default") || !a->font_ident[0]) {
+        np_font_reset(ui, a);
+        return;
+    }
+    if (!strcmp(a->font_ident, "custom")) {
+        if (a->font_custom_path[0] && np_font_apply_file(ui, a, a->font_custom_path)) return;
+        np_font_reset(ui, a);   /* custom file gone -> fall back to default */
+        return;
+    }
+    for (int i = 0; i < np_bundled_font_count; i++)
+        if (!strcmp(a->font_ident, np_bundled_fonts[i].ident))
+            if (np_font_apply_bundled(ui, a, i)) return;
+    np_font_reset(ui, a);
+}
 
 static void np_load_fonts(cui_ctx *ui, notepad *a) {
     a->fonts_ready = true;
+
+    /* Remember the built-in mono font before we ever replace its role. */
+    a->font_default_mono = cui_font_role_font(ui, CUI_FONT_MONO);
+    a->font_active = a->font_default_mono;
+    a->font_cjk = -1;
+
+    /* CUI's embedded fonts cover Latin; add one system CJK face as fallback
+     * so Chinese/kanji text renders in every role, including our editor font. */
     static const char *paths[] = {
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/simsun.ttc",
         "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
     };
     for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
         cui_font f = cui_font_load_file(ui, paths[i]);
         if (f < 0) continue;
+        a->font_cjk = f;
         for (int role = CUI_FONT_BODY; role <= CUI_FONT_MONO; role++)
             cui_font_add_fallback(ui, (cui_font)role, f);
         break;
     }
+
+    /* Apply the persisted choice (or the default). */
+    np_font_restore(ui, a);
 }
 
 /* Tighter radii, calmer elevation and a controlled type scale give the stock
@@ -1565,6 +1675,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "F5              插入日期和时间",
             "Ctrl Z / Y      撤销 / 重做",
             "Ctrl +/-        放大 / 缩小编辑器字号，Ctrl 0 重置",
+            "视图 → 编辑器字体：内置开源编程字体 + 自定义 TTF / OTF 文件",
             "Alt             激活菜单栏，方向键选择菜单项",
             "编辑器内：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Tab 缩进",
             "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、括号跳转",
@@ -2138,6 +2249,10 @@ static void np_config_load(notepad *a) {
         } else if (!strcmp(key, "font")) {
             int v = atoi(val);
             if (v >= NP_FONT_MIN && v <= NP_FONT_MAX) a->font_size = v;
+        } else if (!strcmp(key, "editor_font")) {
+            snprintf(a->font_ident, sizeof a->font_ident, "%s", val);
+        } else if (!strcmp(key, "editor_font_path")) {
+            snprintf(a->font_custom_path, sizeof a->font_custom_path, "%s", val);
         } else if (!strcmp(key, "density")) {
             int v = atoi(val);
             if (v >= 0 && v <= 2) a->density = v;
@@ -2199,6 +2314,8 @@ static void np_config_save(notepad *a) {
             a->follow_active ? 1 : 0, a->default_crlf ? 1 : 0,
             a->make_backup ? 1 : 0, a->session_restore ? 1 : 0,
             a->match_case ? 1 : 0, a->dark_valid ? 0 : 1);
+    fprintf(f, "editor_font=%s\neditor_font_path=%s\n",
+            a->font_ident[0] ? a->font_ident : "default", a->font_custom_path);
     fprintf(f, "find=%s\nreplace=%s\nworkdir=%s\n",
             a->find_query, a->replace_with, a->side_dir);
     for (int i = 0; i < a->recent_count; i++)
@@ -2707,6 +2824,45 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
 
 /* ---- Unified preview ------------------------------------------------ */
 
+/* Embedded WebView callback: event 0 = ready, 1 = runtime missing/failed. */
+static void np_webview_event(int event) {
+    g.wv_available = (event == 0);
+    if (g.ui) cui_request_redraw(g.ui);
+}
+
+/* Create the embedded WebView once, bound to the top-level editor window.
+ * Each platform uses its OS-provided engine (WebView2 / WKWebView / WebKitGTK);
+ * no heavy runtime is bundled. */
+static void np_webview_boot(notepad *a) {
+    if (a->wv_init_done) return;
+    a->wv_init_done = true;
+    void *native = cui_app_native_window(NULL);
+    if (!native) return;
+    np_webview_init(native, np_webview_event);
+}
+
+/* Every frame: place the native WebView view exactly over the reserved host
+ * box when an HTML document is being previewed, otherwise hide it. CUI reports
+ * rectangles in logical points; the bridge expects physical pixels with the
+ * origin at the top-left (each backend flips its own coordinate system). */
+static void np_sync_webview(notepad *a, cui_ctx *ui) {
+    if (!a->wv_init_done) return;
+    bool want = a->show_preview && a->preview_kind == NP_PREVIEW_HTML &&
+                np_webview_ready();
+    cui_id host = cui_make_id(ui, "wv-host");
+    cui_rect r = cui_get_rect(ui, host);
+    if (!want || r.w <= 0 || r.h <= 0) {
+        np_webview_set_visible(false);
+        return;
+    }
+    float s = cui_dpi_scale(ui);
+    if (s <= 0) s = 1.0f;
+    int x = (int)(r.x * s + 0.5f), y = (int)(r.y * s + 0.5f);
+    int w = (int)(r.w * s + 0.5f), h = (int)(r.h * s + 0.5f);
+    np_webview_set_bounds(x, y, w, h);
+    np_webview_set_visible(true);
+}
+
 /* Resolve whether the active document can be previewed, and start/stop the
  * async worker when the document or its content changes. */
 static np_preview_kind np_preview_for_doc(notepad *a, np_doc *d) {
@@ -2927,31 +3083,54 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                          .size = 11, .color = CUI_COLOR_TEXT_MUTED, .font = CUI_FONT_MONO);
             }
         } else if (k == NP_PREVIEW_HTML) {
-            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 10, .pad = 6) {
-                cui_text(ui, "本地 Web 预览", .size = 13, .font = CUI_FONT_MEDIUM);
-                cui_text(ui, "使用内建 HTTP 服务器提供当前文件所在目录，"
-                             "以真正的 Web 方式加载（而非直接打开文件）。",
-                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 6, .pad = 6) {
                 if (np_http_running(&a->web_server)) {
                     char url[512], base[128];
                     const char *name = d->path[0] ? np_base(d->path) : "index.html";
                     snprintf(base, sizeof base, "%s", name);
                     snprintf(url, sizeof url, "http://127.0.0.1:%d/%s",
                              a->web_server.port, base);
-                    cui_input(ui, "web-preview-url", url, sizeof url, .read_only = true,
-                              .width = CUI_FILL);
-                    if (cui_button(ui, "在 WebView 窗口打开", .icon = CUI_ICON_EXTERNAL_LINK,
-                                   .variant = CUI_BUTTON_PRIMARY))
-                        np_webview_open(url);
-                    if (cui_button(ui, "系统默认浏览器", .size = CUI_SIZE_SM,
-                                   .variant = CUI_BUTTON_GHOST))
-                        np_open_url(url);
+                    cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                        cui_input(ui, "web-preview-url", url, sizeof url, .read_only = true,
+                                  .width = CUI_FILL);
+                        if (cui_button(ui, "刷新", .size = CUI_SIZE_SM,
+                                       .tooltip = "重新载入 Web 预览"))
+                            np_webview_reload();
+                        if (cui_button(ui, "浏览器打开", .size = CUI_SIZE_SM,
+                                       .icon = CUI_ICON_EXTERNAL_LINK,
+                                       .tooltip = "在系统默认浏览器中打开"))
+                            np_open_url(url);
+                    }
+                    if (a->wv_available) {
+                        /* Push the URL once per URL change. The native view is
+                         * positioned over this box every frame by
+                         * np_sync_webview() at the end of np_frame(). */
+                        if (strcmp(a->wv_url, url) != 0) {
+                            np_webview_navigate(url);
+                            snprintf(a->wv_url, sizeof a->wv_url, "%s", url);
+                        }
+                        /* Reserved host rectangle; the native WebView paints
+                         * on top of it. */
+                        cui_box(ui, .id = "wv-host", .width = CUI_FILL,
+                                .height = CUI_FILL, .bg = CUI_COLOR_SURFACE);
+                    } else {
+                        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                                   .align = CUI_ALIGN_CENTER,
+                                   .justify = CUI_JUSTIFY_CENTER, .gap = 8) {
+                            cui_text(ui, "内嵌 Web 预览不可用", .size = 13,
+                                     .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_WARNING);
+                            cui_text(ui, "未检测到系统 Web 引擎。Windows 需 Edge WebView2 运行时；"
+                                         "macOS / Linux 需系统 WebKit。也可在下方用系统浏览器打开。",
+                                     .size = 11, .color = CUI_COLOR_TEXT_MUTED,
+                                     .nowrap = false);
+                            if (cui_button(ui, "在系统浏览器打开", .variant = CUI_BUTTON_PRIMARY))
+                                np_open_url(url);
+                        }
+                    }
                 } else {
                     cui_text(ui, "无法启动本地 HTTP 服务器。", .size = 12,
                              .color = CUI_COLOR_DANGER);
                 }
-                cui_text(ui, "提示：修改并保存 HTML 后，在预览窗口刷新即可看到更新。",
-                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
             }
         }
     }
@@ -3056,6 +3235,7 @@ static void np_frame(cui_ctx *ui, void *user) {
 #ifdef _WIN32
         np_install_close_hook();
 #endif
+        np_webview_boot(a);      /* async: bring up native WebView for HTML preview */
         a->quiet = true;
         for (int i = 0; i < a->startup_count; i++)
             np_open_path(a, a->startup[i], false);
@@ -3360,6 +3540,29 @@ static void np_frame(cui_ctx *ui, void *user) {
                         a->density = (a->density + 1) % 3;
                 }
                 cui_menu_separator(ui);
+                {
+                    char flabel[128];
+                    snprintf(flabel, sizeof flabel, "编辑器字体（%s）", np_font_label(a));
+                    cui_menu_label(ui, flabel);
+                    if (cui_menu_item(ui, "默认 (Geist Mono)", .checked = !strcmp(a->font_ident, "default")))
+                        np_font_reset(ui, a);
+                    for (int fi = 0; fi < np_bundled_font_count; fi++) {
+                        const np_bundled_font *bf = &np_bundled_fonts[fi];
+                        char mi[128];
+                        snprintf(mi, sizeof mi, "%s · %s", bf->label, bf->tag);
+                        if (cui_menu_item(ui, mi, .checked = !strcmp(a->font_ident, bf->ident)))
+                            np_font_apply_bundled(ui, a, fi);
+                    }
+                    if (cui_menu_item(ui, "自定义字体文件…", .icon = CUI_ICON_TYPE)) {
+                        char fp[NP_PATH_CAP];
+                        if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                                .kind = CUI_FILE_OPEN, .title = "选择编辑器字体（TTF / OTF）",
+                                .filter_name = "字体文件", .filter = "ttf;otf;ttc" },
+                                fp, sizeof fp))
+                            np_font_apply_file(ui, a, fp);
+                    }
+                }
+                cui_menu_separator(ui);
                 if (cui_menu_item(ui, "放大字号", .icon = CUI_ICON_ZOOM_IN, .shortcut = "Ctrl +"))
                     a->font_size = NP_MIN(NP_FONT_MAX, a->font_size + 1);
                 if (cui_menu_item(ui, "缩小字号", .icon = CUI_ICON_ZOOM_OUT, .shortcut = "Ctrl -"))
@@ -3597,6 +3800,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_status_bar_item(ui, nl, .tooltip = "点击切换换行符"))
                     d->crlf = !d->crlf;
                 }
+                char fn[128];
+                snprintf(fn, sizeof fn, "%s###fontname", np_font_label(a));
+                cui_status_bar_text(ui, fn);
                 char fs[32];
                 snprintf(fs, sizeof fs, "%d pt###font", a->font_size);
                 if (cui_status_bar_item(ui, fs, .tooltip = "点击重置字号"))
@@ -3606,6 +3812,10 @@ static void np_frame(cui_ctx *ui, void *user) {
     }
 
     np_dialogs(a, ui);
+
+    /* Keep the native WebView child view aligned with its host box after
+     * this frame's layout has been computed. */
+    np_sync_webview(a, ui);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3614,6 +3824,7 @@ static void np_frame(cui_ctx *ui, void *user) {
 
 int main(int argc, char **argv) {
     g.font_size = NP_FONT_DEF;
+    snprintf(g.font_ident, sizeof g.font_ident, "default");
     g.line_numbers = true;
     g.show_status = true;
     g.accent = CUI_ACCENT_BLUE;
@@ -3674,6 +3885,7 @@ int main(int argc, char **argv) {
         .follow_system_theme = true
     }, np_frame, &g);
     np_config_save(&g);      /* settings, recents and the open-file session */
+    np_webview_shutdown();
     np_preview_stop_http(&g);
     np_tex_job_free(&g.tex_job);
     return rc;

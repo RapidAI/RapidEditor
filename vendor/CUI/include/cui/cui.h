@@ -387,8 +387,17 @@ enum {
  * Returns a font id, or -1 on failure. */
 CUI_API cui_font cui_font_load_memory(cui_ctx *ui, const void *data, size_t size, bool copy);
 CUI_API cui_font cui_font_load_file(cui_ctx *ui, const char *path);
+/* Load a font from a raw DEFLATE stream (RFC 1951) that unpacks to `raw_size`
+ * bytes of TrueType data. Useful for apps that embed compressed fonts. The
+ * unpacked buffer is owned by the context. Returns a font id, or -1 on failure. */
+CUI_API cui_font cui_font_load_deflated(cui_ctx *ui, const void *packed,
+                                        size_t packed_size, size_t raw_size);
 /* Replace one of the built-in roles (e.g. use your brand font as CUI_FONT_BODY). */
 CUI_API void cui_font_set_role(cui_ctx *ui, cui_font role, cui_font font);
+/* Return the concrete font currently assigned to `role` as a reusable font id,
+ * so an app can restore a role to its previous font after temporarily
+ * switching it (e.g. editor font selection). Returns -1 for an invalid role. */
+CUI_API cui_font cui_font_role_font(cui_ctx *ui, cui_font role);
 /* Glyphs missing from `font` are looked up in `fallback` (e.g. CJK, emoji). */
 CUI_API void cui_font_add_fallback(cui_ctx *ui, cui_font font, cui_font fallback);
 

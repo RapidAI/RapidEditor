@@ -214,6 +214,21 @@ cui_font cui_font_load_file(cui_ctx *ui, const char *path) {
     return id;
 }
 
+cui_font cui_font_load_deflated(cui_ctx *ui, const void *packed,
+                                size_t packed_size, size_t raw_size) {
+    if (!packed || packed_size == 0 || raw_size == 0) return -1;
+    unsigned char *buf = cui__alloc(ui, raw_size);
+    if (!buf) return -1;
+    if (cui__inflate(packed, packed_size, buf, raw_size) != raw_size) {
+        cui__free(ui, buf);
+        return -1;
+    }
+    cui_font id = cui_font_load_memory(ui, buf, raw_size, false);
+    if (id < 0) { cui__free(ui, buf); return -1; }
+    ui->fonts[id - CUI__USER_FONT_BASE].owned = true;
+    return id;
+}
+
 void cui_font_set_role(cui_ctx *ui, cui_font role, cui_font font) {
     if (role < 0 || role >= 5) return;
     int real = cui__resolve_font(ui, font);
@@ -223,6 +238,13 @@ void cui_font_set_role(cui_ctx *ui, cui_font role, cui_font font) {
 #endif
     ui->roles[role] = real;
     ui->fonts[real].is_icon = role == CUI_FONT_ICONS;
+}
+
+cui_font cui_font_role_font(cui_ctx *ui, cui_font role) {
+    if (role < 0 || role >= 5) return -1;
+    int real = cui__resolve_font(ui, role);
+    if (real < 0) return -1;
+    return CUI__USER_FONT_BASE + real;
 }
 
 void cui_font_add_fallback(cui_ctx *ui, cui_font font, cui_font fallback) {

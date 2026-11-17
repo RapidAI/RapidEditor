@@ -198,26 +198,42 @@ Section "RapidEditor 主程序 (必需)" SEC_MAIN
   ; Stage every payload, then rename the one matching this machine.
   !ifdef PAYLOAD_X64
     File "/oname=bin-x64.tmp" "${PAYLOAD_X64}"
+    !ifdef WV2_X64
+      File "/oname=wv2-x64.tmp" "${WV2_X64}"
+    !endif
   !endif
   !ifdef PAYLOAD_ARM64
     File "/oname=bin-arm64.tmp" "${PAYLOAD_ARM64}"
+    !ifdef WV2_ARM64
+      File "/oname=wv2-arm64.tmp" "${WV2_ARM64}"
+    !endif
   !endif
 
   ${If} $R0 == "arm64"
     !ifdef PAYLOAD_ARM64
       Delete "$INSTDIR\${APP_EXE}"
       Rename "$INSTDIR\bin-arm64.tmp" "$INSTDIR\${APP_EXE}"
+      !ifdef WV2_ARM64
+        Delete "$INSTDIR\WebView2Loader.dll"
+        Rename "$INSTDIR\wv2-arm64.tmp" "$INSTDIR\WebView2Loader.dll"
+      !endif
       DetailPrint "已安装 ARM64 版本"
     !endif
   ${Else}
     !ifdef PAYLOAD_X64
       Delete "$INSTDIR\${APP_EXE}"
       Rename "$INSTDIR\bin-x64.tmp" "$INSTDIR\${APP_EXE}"
+      !ifdef WV2_X64
+        Delete "$INSTDIR\WebView2Loader.dll"
+        Rename "$INSTDIR\wv2-x64.tmp" "$INSTDIR\WebView2Loader.dll"
+      !endif
       DetailPrint "已安装 x64 版本"
     !endif
   ${EndIf}
   Delete "$INSTDIR\bin-x64.tmp"
   Delete "$INSTDIR\bin-arm64.tmp"
+  Delete "$INSTDIR\wv2-x64.tmp"
+  Delete "$INSTDIR\wv2-arm64.tmp"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\${PRODUCT_NAME}" "Install_Dir" "$INSTDIR"
@@ -273,8 +289,11 @@ Section "Uninstall"
   RMDir  "$SMPROGRAMS\${PRODUCT_NAME}"
 
   Delete "$INSTDIR\${APP_EXE}"
+  Delete "$INSTDIR\WebView2Loader.dll"
   Delete "$INSTDIR\bin-x64.tmp"
   Delete "$INSTDIR\bin-arm64.tmp"
+  Delete "$INSTDIR\wv2-x64.tmp"
+  Delete "$INSTDIR\wv2-arm64.tmp"
   Delete "$INSTDIR\uninstall.exe"
   RMDir  "$INSTDIR"
 

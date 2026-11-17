@@ -4,7 +4,7 @@
 
 `vendor/CUI/` 是 [yappologistic/CUI](https://github.com/yappologistic/CUI) 的一个子集（只保留构建
 RapidEditor 所需的 `CMakeLists.txt`、`cmake/`、`include/cui/`、`src/`、`third_party/`、`LICENSE`、
-`THIRD_PARTY.md`）。相对上游有 3 处本地修改：
+`THIRD_PARTY.md`）。相对上游有 4 处本地修改：
 
 1. **CJK 光标 / 选区 advance**（`include/cui/cui.h`、`src/cui_editor.c`）：按真实字形宽度计算
    光标、选区与点击定位，中文不再错位。
@@ -19,13 +19,22 @@ RapidEditor 所需的 `CMakeLists.txt`、`cmake/`、`include/cui/`、`src/`、`t
      `finishLaunching` **之前**——否则启动期间收到的 Apple Event 会被 AppKit 丢弃；
    - `src/rapideditor.c` 每帧排空队列并调用 `np_open_path()`。
 
+4. **Markdown 数学公式 / Mermaid**（`src/cui_markdown.c`）：
+   - 行内 `$...$` 与块级 `$$...$$`：把常用 TeX 命令映射为 Unicode 符号，上下标用
+     上标数字 / `^(...)`、`_(...)` 近似；块级公式渲染为居中的浅色面板，不依赖
+     KaTeX 或浏览器。字体缺字的命令（如 `\nabla`）退化为可读的文字（如 `grad`）；
+   - ```` ```mermaid ```` 代码块：解析 `graph/flowchart TD|LR` 的节点声明（`[]`、`()`、`{}`、`(())`）
+     和连线（`-->`、`---`、`-.->`、`==>`，支持 `|标签|` 与链式 `A --> B --> C`），
+     用 CUI canvas 自绘。布局按破环后的最长路径分层，并做重心排序减少交叉；
+     正向边连接节点相邻边，环/回边走图外侧通道；无法识别的内容回退为普通代码块。
+
 第 3 点是右键菜单在 macOS 上真正能打开文件的必要条件：Finder 的「打开方式」、
 Quick Action 和拖到 Dock 图标都是 Apple Event，不是命令行参数。上游 CUI 只处理了窗口内拖放
 （`cui_input_file_drop()`），无法接收这些事件。
 
-三处改动相对上游 CUI 的完整 diff 保存在 `docs/patches/`：
-`CUI-cjk-caret.patch`、`CUI-cjk-largefile.patch`、`CUI-openwith.patch`。
-上游升级时可以按这些 patch 重新套用。
+四处改动相对上游 CUI 的完整 diff 保存在 `docs/patches/`：
+`CUI-cjk-caret.patch`、`CUI-cjk-largefile.patch`、`CUI-openwith.patch`、
+`CUI-markdown-math-mermaid.patch`。上游升级时可以按这些 patch 重新套用。
 
 > 头文件必须位于 `vendor/CUI/include/cui/*.h`。上游的包含路径是 `cui/cui.h`，
 > 早期 vendored 副本把它们平铺在 `include/` 下导致编译失败，已修正。
@@ -61,6 +70,10 @@ python packaging/make_icons.py
 `installer.nsi` 在 `.onInit` 检测本机架构，把匹配的 payload 改名为 `RapidEditor.exe`。
 ARM64 步骤带 `continue-on-error`，若交叉编译出问题仍会产出 x64 安装包。
 本地实测两个 PE 的 machine 分别为 `0x8664`（x64）与 `0xaa64`（ARM64）。
+
+llvm-mingw 的 `wrl.h` 只提供 `ComPtr`，没有 MSVC 的 `Microsoft::WRL::Callback`。
+`src/np_webview2_bridge.cpp` 在 `__MINGW32__` 下用两个手写 COM 回调对象替代，
+MSVC 构建仍走标准 WRL；不影响运行时行为。
 
 ## NSIS 编码
 
