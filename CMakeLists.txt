@@ -1,10 +1,21 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(RapidEditor
-    VERSION 1.1.3
-    DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
-    HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
-    LANGUAGES C CXX)
+# On Apple, OBJCXX must be declared together with the project() call: enabling
+# it later via enable_language() breaks on CMake >= 3.30 runners with
+# "required internal CMake variable not set: CMAKE_OBJCXX_COMPILE_OBJECT".
+if(APPLE)
+    project(RapidEditor
+        VERSION 1.2.0
+        DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
+        HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
+        LANGUAGES C CXX OBJCXX)
+else()
+    project(RapidEditor
+        VERSION 1.2.0
+        DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
+        HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
+        LANGUAGES C CXX)
+endif()
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -156,8 +167,8 @@ if(WIN32)
     target_link_libraries(RapidEditor PRIVATE re_res)
 
 elseif(APPLE)
-    # WKWebView: Objective-C++ source needs the OBJCXX language enabled.
-    enable_language(OBJCXX)
+    # OBJCXX language is enabled by the conditional project() call at the top
+    # (WKWebView: Objective-C++ source).
     find_library(COCOA_LIBRARY Cocoa REQUIRED)
     find_library(WEBKIT_LIBRARY WebKit REQUIRED)
     target_link_libraries(RapidEditor PRIVATE ${COCOA_LIBRARY} ${WEBKIT_LIBRARY})
