@@ -25,6 +25,7 @@ typedef struct {
      * touch->mouse synthesis otherwise turns into a drag text selection */
     bool tmaybe;      /* gesture pending classification */
     bool twheel;      /* classified as wheel flick: scroll instead of drag */
+    bool pending_up;  /* deferred release after collapsing a drag selection */
     Uint32 tdown_ms;
     float tdown_x, tdown_y;   /* first finger down pos, logical pts */
 } cui__sdl;
@@ -323,12 +324,14 @@ static void cui__finger_pts(cui__sdl *s, float x, float y, float *px, float *py)
     *py = (y * wh) / pts;
 }
 
-/* Drop the drag-selection started by the emulated mouse press: snap the
- * pointer back to the press point and release there, leaving a plain click
- * (cursor placement) instead of a selected region. */
+/* Collapse the drag-selection started by the emulated mouse press: move the
+ * pointer back to the press point while the button is still down, so the
+ * editor (on the next frame) drags its caret back there too.  The actual
+ * release is deferred (pending_up) to the next event - releasing in the same
+ * frame would settle the selection at the last drag position instead. */
 static void cui__touch_drop_drag(cui_app *app, cui__sdl *s) {
     cui_input_mouse_move(app->ui, s->tdown_x, s->tdown_y);
-    cui_input_mouse_button(app->ui, CUI_MOUSE_LEFT, false);
+    s->pending_up = true;
 }
 
 /* Touch panning: a single fast vertical flick (the emulators' mouse-wheel
@@ -341,6 +344,9 @@ static void cui__touch_scroll(cui_app *app, cui__sdl *s, Uint32 id, float x, flo
     float dx = x - s->tpx[i], dy = y - s->tpy[i];
     s->tpx[i] = x;
     s->tpy[i] = y;
+    /* While the collapsed drag is still being held (pending release) any
+     * scrolling would drag the selection caret along with the content. */
+    if (s->pending_up) return;
     bool pan = s->twheel || s->tscroll;
     if (!pan && s->ntouch >= 2) {
         s->tscroll = true;
@@ -360,6 +366,13 @@ static void cui__touch_scroll(cui_app *app, cui__sdl *s, Uint32 id, float x, flo
 
 static void cui__sdl_event(cui_app *app, SDL_Event *e) {
     cui_ctx *ui = app->ui;
+    cui__sdl *s = cui__s(app);
+    /* Deferred drag-collapse release (see cui__touch_drop_drag): the editor
+     * has had a frame to drag its caret back to the press point, now end it. */
+    if (s && s->pending_up) {
+        s->pending_up = false;
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    }
 #ifdef __ANDROID__
     /* SDL reports pointer positions in raw device pixels, but the UI is laid
      * out in logical points (pixels / CUI_SCALE).  Desktop SDL already hands
