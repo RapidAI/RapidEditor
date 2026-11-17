@@ -9,6 +9,7 @@ typedef struct {
     SDL_Cursor *cursors[CUI_CURSOR_COUNT];
     cui_cursor cursor;
     SDL_Surface *surface;
+    float px_scale;   /* Android: device pixels per logical point (CUI_SCALE) */
 } cui__sdl;
 
 static cui__sdl *cui__s(cui_app *app) { return app->plat; }
@@ -195,6 +196,7 @@ void cui__plat_metrics(cui_app *app, float *w, float *h, float *scale, int *fb_w
     const char *env = getenv("CUI_SCALE");
     if (env) { float e = (float)atof(env); if (e > 0.25f && e < 8) sc = e; }
     *scale = sc;
+    s->px_scale = sc;
     *fb_w = ww;
     *fb_h = wh;
     *w = (float)ww / sc;
@@ -255,6 +257,16 @@ static int cui__sdl_mods(Uint16 m) {
 
 static void cui__sdl_event(cui_app *app, SDL_Event *e) {
     cui_ctx *ui = app->ui;
+#ifdef __ANDROID__
+    /* SDL reports pointer positions in raw device pixels, but the UI is laid
+     * out in logical points (pixels / CUI_SCALE).  Desktop SDL already hands
+     * us window coordinates, which are logical there - only Android needs the
+     * division.  Without it every click lands twice as far down as aimed,
+     * silently hitting the editor instead of the toolbar/menus. */
+    float pts = cui__s(app)->px_scale > 0 ? cui__s(app)->px_scale : 1.0f;
+#else
+    float pts = 1.0f;
+#endif
     switch (e->type) {
     case SDL_QUIT: app->running = false; break;
     case SDL_WINDOWEVENT:
@@ -264,10 +276,10 @@ static void cui__sdl_event(cui_app *app, SDL_Event *e) {
         else if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST) cui_input_focus(ui, false);
         cui_request_redraw(ui);
         break;
-    case SDL_MOUSEMOTION: cui_input_mouse_move(ui, (float)e->motion.x, (float)e->motion.y); break;
+    case SDL_MOUSEMOTION: cui_input_mouse_move(ui, (float)e->motion.x / pts, (float)e->motion.y / pts); break;
     case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
         cui_mouse_button b = e->button.button == SDL_BUTTON_LEFT ? CUI_MOUSE_LEFT : e->button.button == SDL_BUTTON_RIGHT ? CUI_MOUSE_RIGHT : CUI_MOUSE_MIDDLE;
-        cui_input_mouse_move(ui, (float)e->button.x, (float)e->button.y);
+        cui_input_mouse_move(ui, (float)e->button.x / pts, (float)e->button.y / pts);
         cui_input_mouse_button(ui, b, e->type == SDL_MOUSEBUTTONDOWN);
         break;
     }
