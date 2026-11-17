@@ -178,14 +178,22 @@ jobs:
           path: dist/*.AppImage
           if-no-files-found: error
 
-  # Android pad build. The in-app updater (np_updater.c) downloads exactly
-  # this asset from the release, so the APK must carry the release version
+  # Android builds. The in-app updater (np_updater.c) downloads exactly the
+  # arm64 asset from the release, so the APK must carry the release version
   # and the committed signing key (updates refuse a different signature).
+  # x86_64 targets emulator hosts (e.g. MuMu) where ARM translation is slow.
   android:
     needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64
+          - abi: x86_64
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.meta.outputs.version }}
+      RE_ABI: ${{ matrix.abi }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -202,16 +210,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/sdl2"
           tar -xzf /tmp/sdl2.tar.gz -C "$RUNNER_TEMP/sdl2" --strip-components=1
           echo "RE_SDL2_SOURCE=$RUNNER_TEMP/sdl2" >> "$GITHUB_ENV"
-      - name: Build signed APK (arm64)
+      - name: Build signed APK (${{ matrix.abi }})
         run: |
           cd android
-          gradle assembleRelease -PRE_VERSION="$VERSION" -PRE_SDL2_SOURCE="$RE_SDL2_SOURCE"
+          gradle assembleRelease -PRE_VERSION="$VERSION" -PRE_ABIS="$RE_ABI" -PRE_SDL2_SOURCE="$RE_SDL2_SOURCE"
           mkdir -p ../dist
           cp app/build/outputs/apk/release/app-release.apk \
-             ../dist/RapidEditor-${VERSION}-android-arm64.apk
+             ../dist/RapidEditor-${VERSION}-android-${RE_ABI}.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: rapideditor-android
+          name: rapideditor-android-${{ matrix.abi }}
           path: dist/*.apk
           if-no-files-found: error
 
