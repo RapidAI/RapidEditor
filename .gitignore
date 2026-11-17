@@ -24,6 +24,11 @@ installer-output/
 *.workflow/
 *.nsi.exe
 
+# WebView2 loader binaries are vendored build inputs (needed by CMake POST_BUILD
+# and NSIS packaging), not generated artifacts — keep them tracked.
+!vendor/webview2/**/*.dll
+!vendor/webview2/**/*.lib
+
 # Python helpers
 __pycache__/
 *.pyc
