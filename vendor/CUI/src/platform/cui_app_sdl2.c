@@ -15,11 +15,18 @@ typedef struct {
     cui_cursor cursor;
     SDL_Surface *surface;
     float px_scale;   /* Android: device pixels per logical point (CUI_SCALE) */
-    /* two-finger scroll: active finger ids and their last normalized pos */
+    /* touch scroll: active finger ids and their last normalized pos */
     int ntouch;
     Uint32 tid[12];
     float tpx[12], tpy[12];
     bool tscroll;     /* a two-finger scroll is in progress */
+    /* single-finger wheel-flick: emulators (MuMu, AVD) map each mouse-wheel
+     * notch to one fast vertical touch drag with a constant x, which the
+     * touch->mouse synthesis otherwise turns into a drag text selection */
+    bool tmaybe;      /* gesture pending classification */
+    bool twheel;      /* classified as wheel flick: scroll instead of drag */
+    Uint32 tdown_ms;
+    float tdown_x, tdown_y;   /* first finger down pos, logical pts */
 } cui__sdl;
 
 static cui__sdl *cui__s(cui_app *app) { return app->plat; }
@@ -303,11 +310,30 @@ static int cui__touch_slot(cui__sdl *s, Uint32 id, bool add) {
     return s->ntouch - 1;
 }
 
-/* Two-finger pan scroll: the second finger converts touch motion into
- * scrolling (the wheel gesture on emulators that map it to touch, and the
- * standard two-finger drag on real tablets).  Entering the gesture releases
- * the emulated mouse button, because the first finger's drag otherwise
- * leaves a text selection behind. */
+/* Finger coords are normalized (0..1); convert to logical points. */
+static void cui__finger_pts(cui__sdl *s, float x, float y, float *px, float *py) {
+    int ww, wh;
+    SDL_GetWindowSize(s->win, &ww, &wh);
+#ifdef __ANDROID__
+    float pts = s->px_scale > 0 ? s->px_scale : 1.0f;
+#else
+    float pts = 1.0f;
+#endif
+    *px = (x * ww) / pts;
+    *py = (y * wh) / pts;
+}
+
+/* Drop the drag-selection started by the emulated mouse press: snap the
+ * pointer back to the press point and release there, leaving a plain click
+ * (cursor placement) instead of a selected region. */
+static void cui__touch_drop_drag(cui_app *app, cui__sdl *s) {
+    cui_input_mouse_move(app->ui, s->tdown_x, s->tdown_y);
+    cui_input_mouse_button(app->ui, CUI_MOUSE_LEFT, false);
+}
+
+/* Touch panning: a single fast vertical flick (the emulators' mouse-wheel
+ * mapping) or a two-finger drag (the standard tablet scroll) converts touch
+ * motion into scrolling. */
 static void cui__touch_scroll(cui_app *app, cui__sdl *s, Uint32 id, float x, float y) {
     cui_ctx *ui = app->ui;
     int i = cui__touch_slot(s, id, true);
@@ -315,11 +341,12 @@ static void cui__touch_scroll(cui_app *app, cui__sdl *s, Uint32 id, float x, flo
     float dx = x - s->tpx[i], dy = y - s->tpy[i];
     s->tpx[i] = x;
     s->tpy[i] = y;
-    if (!s->tscroll && s->ntouch >= 2) {
+    bool pan = s->twheel || s->tscroll;
+    if (!pan && s->ntouch >= 2) {
         s->tscroll = true;
-        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);   /* drop the drag-selection */
+        cui__touch_drop_drag(app, s);   /* drop the drag-selection */
     }
-    if (!s->tscroll || s->ntouch < 2) return;
+    if (!pan) return;
     int ww, wh;
     SDL_GetWindowSize(s->win, &ww, &wh);
 #ifdef __ANDROID__
@@ -369,16 +396,42 @@ static void cui__sdl_event(cui_app *app, SDL_Event *e) {
     }
     case SDL_FINGERDOWN: case SDL_FINGERMOTION: case SDL_FINGERUP: {
         cui__sdl *s = cui__s(app);
-#ifdef __ANDROID__
-        __android_log_print(ANDROID_LOG_INFO, "CUI", "finger %s id=%u %g,%g n=%d",
-                            e->type == SDL_FINGERDOWN ? "down" : e->type == SDL_FINGERMOTION ? "move" : "up",
-                            (unsigned)e->tfinger.fingerId, (double)e->tfinger.x, (double)e->tfinger.y, s->ntouch);
-#endif
+        if (e->type == SDL_FINGERDOWN) {
+            if (s->ntouch == 0) {
+                /* first finger of a gesture: candidate for the wheel flick */
+                s->tmaybe = true;
+                s->twheel = false;
+                s->tdown_ms = SDL_GetTicks();
+                cui__finger_pts(s, e->tfinger.x, e->tfinger.y, &s->tdown_x, &s->tdown_y);
+            } else {
+                s->tmaybe = false;   /* second finger: two-finger pan takes over */
+            }
+        }
         if (e->type == SDL_FINGERUP) {
             int i = cui__touch_slot(s, e->tfinger.fingerId, false);
             if (i >= 0) { s->tid[i] = s->tid[--s->ntouch]; s->tpx[i] = s->tpx[s->ntouch]; s->tpy[i] = s->tpy[s->ntouch]; }
             if (s->ntouch < 2) s->tscroll = false;
+            if (s->ntouch == 0) { s->tmaybe = false; s->twheel = false; }
         } else {
+            /* classify a single-finger gesture: a fast, near-vertical flick
+             * with a fixed x is the emulators' mouse-wheel mapping, not a
+             * drag selection.  Thresholds in logical points, measured from
+             * the press point; a slow or sideways move keeps mouse semantics. */
+            if (s->tmaybe && s->ntouch == 1 && e->type == SDL_FINGERMOTION) {
+                float fx, fy;
+                cui__finger_pts(s, e->tfinger.x, e->tfinger.y, &fx, &fy);
+                float adx = fx - s->tdown_x, ady = fy - s->tdown_y;
+                if (adx < 0) adx = -adx;
+                if (ady < 0) ady = -ady;
+                Uint32 dt = SDL_GetTicks() - s->tdown_ms;
+                if (adx > 6) s->tmaybe = false;            /* moved sideways */
+                else if (dt > 260) s->tmaybe = false;      /* slow drag = select */
+                else if (ady > 34) {
+                    s->tmaybe = false;
+                    s->twheel = true;
+                    cui__touch_drop_drag(app, s);          /* collapse the synthetic drag */
+                }
+            }
             cui__touch_scroll(app, s, e->tfinger.fingerId, e->tfinger.x, e->tfinger.y);
         }
         break;

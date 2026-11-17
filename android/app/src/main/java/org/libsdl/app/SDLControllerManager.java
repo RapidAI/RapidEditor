@@ -623,8 +623,6 @@ class SDLGenericMotionListener_API12 implements View.OnGenericMotionListener {
     // Generic Motion (mouse hover, joystick...) events go here
     @Override
     public boolean onGenericMotion(View v, MotionEvent event) {
-        android.util.Log.i("CUI", "gen src=0x" + Integer.toHexString(event.getSource())
-                + " act=" + event.getActionMasked() + " vscroll=" + event.getAxisValue(MotionEvent.AXIS_VSCROLL, 0));
         float x, y;
         int action;
 
