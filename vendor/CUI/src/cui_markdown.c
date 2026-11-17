@@ -312,20 +312,116 @@ static const char *md_sup_char(unsigned char c) {
 
 static char *md_math_translate(cui_ctx *ui, const char *s, int n);
 
-static void md_math_script(cui_ctx *ui, char *out, int *o, int cap,
-                           const char *inner, int len, bool sup) {
-    char *txt = md_math_translate(ui, inner, len);
-    int tn = (int)strlen(txt);
-    /* Single exponent digits 1-5/7/8 and 'n' have real superscript glyphs in
-     * the bundled faces; everything else uses ^( ... ) notation. */
-    if (sup && tn == 1 && ((txt[0] >= '1' && txt[0] <= '9' && txt[0] != '6') ||
-                           txt[0] == 'n')) {
-        const char *g = txt[0] == 'n' ? "ⁿ" : md_sup_char((unsigned char)txt[0]);
-        if (g) { md_put(out, o, cap, g, (int)strlen(g)); return; }
+/* ---- math IR --------------------------------------------------------------
+ * The TeX subset is parsed once into a small item tree. Inline math flattens
+ * the tree back to the same Unicode approximation as before, while display
+ * math ($$ blocks) is measured and painted from the tree: stacked fractions,
+ * raised/lowered scripts, sqrt overlines, spanning matrix delimiters. */
+enum { MT_TXT, MT_GAP, MT_FRAC, MT_SQRT, MT_SCRIPT, MT_BINOM, MT_MAT,
+       MT_ROWBR, MT_COLBR };
+
+typedef struct md_mit md_mit;
+struct md_mit {
+    int kind;
+    char buf[160]; int tn;       /* MT_TXT: UTF-8 run; MT_GAP: space count */
+    md_mit *a, *b, *c;           /* num/den, sqrt arg, base/sup/sub */
+    md_mit **cell;               /* MT_MAT: cell chains, [row * ncol + col] */
+    int *ncr;                    /* columns actually used per row */
+    int nrow, ncol;
+    const char *dl, *dr;         /* matrix delimiters ("" = none) */
+    md_mit *next;
+    float w, as, de;             /* measured box around the baseline */
+    float *rh, *mxa, *cw, mh;    /* MT_MAT row/column metrics */
+    int lruns;                   /* MT_TXT: letter runs (italic shear) */
+};
+
+typedef struct { md_mit **it; int n; float w, as, de; } md_mline;
+typedef struct {
+    md_mline *line; int nline;
+    float fs, u, lh, w, h;
+    cui_color fg, bg, border;
+} md_mpaint;
+
+static void md_shear(cui_ctx *ui, int v0, float base);   /* defined below */
+static char *md_m_flat(cui_ctx *ui, const md_mit *it, int cap);
+static float md_m_paint_list(cui_ctx *ui, md_mit *it, float x, float yb,
+                             float fs, md_mpaint *p);
+
+static md_mit *md_m_new(cui_ctx *ui, int kind) {
+    md_mit *it = cui__frame_alloc(ui, sizeof *it);
+    memset(it, 0, sizeof *it);
+    it->kind = kind;
+    return it;
+}
+
+static void md_m_push(md_mit **head, md_mit **tail, md_mit *it) {
+    if (!*head) *head = it; else (*tail)->next = it;
+    *tail = it;
+}
+
+/* Append text to the trailing TXT run, splitting at the buffer cap. */
+static void md_m_text(cui_ctx *ui, md_mit **head, md_mit **tail,
+                      const char *s, int n) {
+    if (n < 0) n = (int)strlen(s);
+    while (n > 0) {
+        md_mit *t = *tail;
+        if (!t || t->kind != MT_TXT || t->tn >= (int)sizeof t->buf - 1) {
+            t = md_m_new(ui, MT_TXT);
+            md_m_push(head, tail, t);
+        }
+        int k = CUI_MIN(n, (int)sizeof t->buf - 1 - t->tn);
+        memcpy(t->buf + t->tn, s, (size_t)k);
+        t->tn += k; s += k; n -= k;
     }
-    md_put(out, o, cap, sup ? "^(" : "_(", -1);
-    md_put(out, o, cap, txt, tn);
-    md_put(out, o, cap, ")", -1);
+}
+
+/* Detach the last cluster as a script base: a whole non-text item, else the
+ * final UTF-8 character of the trailing TXT run. */
+static md_mit *md_m_pop_base(cui_ctx *ui, md_mit **head, md_mit **tail) {
+    md_mit *t = *tail;
+    if (!t) return NULL;
+    if (t->kind != MT_TXT || t->tn == 0) {
+        if (*head == t) { *head = NULL; *tail = NULL; return t; }
+        md_mit *p = *head;
+        while (p && p->next != t) p = p->next;
+        if (p) { p->next = NULL; *tail = p; }
+        return t;
+    }
+    int k = t->tn - 1;
+    while (k > 0 && (t->buf[k] & 0xC0) == 0x80) k--;
+    md_mit *base = md_m_new(ui, MT_TXT);
+    base->tn = t->tn - k;
+    memcpy(base->buf, t->buf + k, (size_t)base->tn);
+    t->tn = k;
+    return base;
+}
+
+/* Letter runs get a synthesized italic; letters are ASCII plus the Greek
+ * block (0xCE/0xCF lead bytes). Reports the full UTF-8 character length. */
+static bool md_m_letter(const char *s, int n, int *len) {
+    unsigned char c = (unsigned char)s[0];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) { *len = 1; return true; }
+    int l = 1 + ((c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 :
+                 (c & 0xF8) == 0xF0 ? 3 : 0);
+    if (n >= 2 && (c == 0xCE || c == 0xCF)) { *len = 2; return true; }
+    *len = CUI_MIN(l, n);
+    return false;
+}
+
+static int md_m_letter_runs(const char *s, int n) {
+    int runs = 0, i = 0;
+    while (i < n) {
+        int cl; bool let = md_m_letter(s + i, n - i, &cl);
+        int j = i;
+        while (j < n) {
+            int l2; bool let2 = md_m_letter(s + j, n - j, &l2);
+            if (let2 != let) break;
+            j += l2;
+        }
+        if (let) runs++;
+        i = j;
+    }
+    return runs;
 }
 
 /* Precomposed accented letters. The bundled faces carry Latin-1 and Latin
@@ -382,48 +478,140 @@ static const char *md_accent_pre(char c, int kind) {
     return NULL;
 }
 
-/* \hat{x} & friends: the accent mark follows the operand when no precomposed
- * letter exists ("xˆ", "v→"); TeX puts it above, plain text approximates. */
-static void md_math_accent(cui_ctx *ui, char *out, int *o, int cap,
-                           const char *inner, int len, int kind) {
-    static const char *suffix[] = { "ˆ", "˜", "ˉ", "˙", "¨", "→", "˚", "˘", "`", "´" };
-    char *txt = md_math_translate(ui, inner, len);
-    int tn = (int)strlen(txt);
-    if (tn == 1) {
-        const char *g = md_accent_pre(txt[0], kind);
-        if (g) { md_put(out, o, cap, g, (int)strlen(g)); return; }
+/* Split a matrix environment body (brace-aware) into rows of cells:
+ * \\ separates rows, & separates columns. */
+static void md_m_matrix(cui_ctx *ui, md_mit *it, const char *s, int bs, int bl);
+static char *md_m_flat(cui_ctx *ui, const md_mit *it, int cap);
+static md_mit *md_math_ir(cui_ctx *ui, const char *s, int n);
+static float md_m_paint_list(cui_ctx *ui, md_mit *it, float x, float yb, float fs, md_mpaint *p);
+
+static void md_m_flat1(cui_ctx *ui, const md_mit *it, char *out, int *o, int cap) {
+    for (; it; it = it->next) {
+        switch (it->kind) {
+        case MT_TXT: md_put(out, o, cap, it->buf, it->tn); break;
+        case MT_GAP:
+            for (int k = 0; k < it->tn && k < 8; k++) md_put(out, o, cap, " ", 1);
+            break;
+        case MT_ROWBR: md_put(out, o, cap, "\n", 1); break;
+        case MT_COLBR: md_put(out, o, cap, "  ", 2); break;
+        case MT_FRAC: {
+            char *nu = md_m_flat(ui, it->a, cap);
+            char *de = md_m_flat(ui, it->b, cap);
+            int nn = (int)strlen(nu), nd = (int)strlen(de);
+            bool pn = md_group_complex(nu, nn), pd = md_group_complex(de, nd);
+            if (pn) md_put(out, o, cap, "(", 1);
+            md_put(out, o, cap, nu, nn);
+            if (pn) md_put(out, o, cap, ")", 1);
+            md_put(out, o, cap, "/", 1);
+            if (pd) md_put(out, o, cap, "(", 1);
+            md_put(out, o, cap, de, nd);
+            if (pd) md_put(out, o, cap, ")", 1);
+            break;
+        }
+        case MT_SQRT: {
+            md_put(out, o, cap, "√", -1);
+            char *v = md_m_flat(ui, it->a, cap);
+            int vn = (int)strlen(v);
+            if (md_group_complex(v, vn)) {
+                md_put(out, o, cap, "(", 1);
+                md_put(out, o, cap, v, vn);
+                md_put(out, o, cap, ")", 1);
+            } else {
+                md_put(out, o, cap, v, vn);
+            }
+            break;
+        }
+        case MT_SCRIPT: {
+            md_m_flat1(ui, it->a, out, o, cap);
+            if (it->b) {
+                char *sv = md_m_flat(ui, it->b, cap);
+                int sn = (int)strlen(sv);
+                bool all = sn > 0 && sn <= 8;
+                for (int k = 0; all && k < sn; k++)
+                    if (!md_sup_char((unsigned char)sv[k])) all = false;
+                if (all) {
+                    for (int k = 0; k < sn; k++)
+                        md_put(out, o, cap, md_sup_char((unsigned char)sv[k]), -1);
+                } else {
+                    md_put(out, o, cap, "^(", -1);
+                    md_put(out, o, cap, sv, sn);
+                    md_put(out, o, cap, ")", 1);
+                }
+            }
+            if (it->c) {
+                char *sv = md_m_flat(ui, it->c, cap);
+                md_put(out, o, cap, "_(", -1);
+                md_put(out, o, cap, sv, (int)strlen(sv));
+                md_put(out, o, cap, ")", 1);
+            }
+            break;
+        }
+        case MT_BINOM: {
+            char *a = md_m_flat(ui, it->a, cap);
+            char *b = md_m_flat(ui, it->b, cap);
+            md_put(out, o, cap, "C(", -1);
+            md_put(out, o, cap, a, (int)strlen(a));
+            md_put(out, o, cap, ", ", 2);
+            md_put(out, o, cap, b, (int)strlen(b));
+            md_put(out, o, cap, ")", 1);
+            break;
+        }
+        case MT_MAT: {
+            md_put(out, o, cap, it->dl, -1);
+            for (int r = 0; r < it->nrow; r++) {
+                for (int cc = 0; cc < it->ncr[r]; cc++) {
+                    if (cc) md_put(out, o, cap, "  ", 2);
+                    md_m_flat1(ui, it->cell[r * it->ncol + cc], out, o, cap);
+                }
+                if (r < it->nrow - 1) md_put(out, o, cap, "\n", 1);
+            }
+            md_put(out, o, cap, it->dr, -1);
+            break;
+        }
+        }
     }
-    md_put(out, o, cap, txt, tn);
-    if (kind >= 0 && kind < (int)CUI_COUNTOF(suffix))
-        md_put(out, o, cap, suffix[kind], -1);
 }
 
-static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
-    int cap = n * 8 + 128;
+static char *md_m_flat(cui_ctx *ui, const md_mit *it, int cap) {
     char *out = cui__frame_alloc(ui, (size_t)cap);
     int o = 0;
+    md_m_flat1(ui, it, out, &o, cap);
+    out[o] = 0;
+    return out;
+}
+
+/* Parse the TeX subset into an item tree. */
+static md_mit *md_math_ir(cui_ctx *ui, const char *s, int n) {
+    md_mit *head = NULL, *tail = NULL;
     for (int i = 0; i < n;) {
         unsigned char c = (unsigned char)s[i];
         if (c == '\\' && i + 1 < n) {
             unsigned char d = (unsigned char)s[i + 1];
-            if (d == '\\') { md_put(out, &o, cap, "\n", 1); i += 2; continue; }
+            if (d == '\\') {
+                md_m_push(&head, &tail, md_m_new(ui, MT_ROWBR));
+                i += 2; continue;
+            }
             if (d == ',' || d == ';' || d == ':' || d == ' ') {
-                md_put(out, &o, cap, " ", 1);
+                md_mit *it = md_m_new(ui, MT_GAP); it->tn = 1;
+                md_m_push(&head, &tail, it);
                 i += 2; continue;
             }
             if (d == '!') { i += 2; continue; }        /* negative thin space */
             if (strchr("{}%&#$_|~^", d)) {             /* literal escapes */
-                md_put(out, &o, cap, s + i + 1, 1);
+                md_m_text(ui, &head, &tail, s + i + 1, 1);
                 i += 2; continue;
             }
             if (d == 'q' && md_cmd_at(s, n, i, "\\quad")) {
-                md_put(out, &o, cap, "  ", 2); i += 5; continue;
+                md_mit *it = md_m_new(ui, MT_GAP); it->tn = 2;
+                md_m_push(&head, &tail, it);
+                i += 5; continue;
             }
             if (d == 'q' && md_cmd_at(s, n, i, "\\qquad")) {
-                md_put(out, &o, cap, "    ", 4); i += 6; continue;
+                md_mit *it = md_m_new(ui, MT_GAP); it->tn = 4;
+                md_m_push(&head, &tail, it);
+                i += 6; continue;
             }
-            /* \big..\Bigg and \bigl..\Biggr are sizing hints for the delimiter
-             * that follows; plain text has nothing to size, so drop them. */
+            /* \big..\Bigg and \bigl..\Biggr are sizing hints; drop them. */
             if ((d == 'b' || d == 'B') && i + 2 < n &&
                 (s[i + 2] == 'i' || s[i + 2] == 'I')) {
                 int j = i + 1;
@@ -436,83 +624,136 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
                     i = j; continue;
                 }
             }
+            /* \left/\right: keep the delimiter glyph instead of dropping it */
             if (md_cmd_at(s, n, i, "\\left") || md_cmd_at(s, n, i, "\\right")) {
-                i += (int)strlen(s[i + 1] == 'l' ? "\\left" : "\\right");
-                if (i < n && s[i] == '.') i++;         /* invisible delimiter */
-                continue;
+                bool left = s[i + 1] == 'l';
+                int j = i + (left ? 5 : 6);
+                if (j >= n) { i = j; continue; }
+                char c1 = s[j];
+                if (c1 == '.') { i = j + 1; continue; }     /* invisible delim */
+                if (c1 == '{' || c1 == '}') {
+                    md_m_text(ui, &head, &tail, &c1, 1);
+                    i = j + 1; continue;
+                }
+                if (c1 && strchr("()[]|/", c1)) {
+                    md_m_text(ui, &head, &tail, &c1, 1);
+                    i = j + 1; continue;
+                }
+                if (c1 == '\\') {
+                    static const struct { const char *nm, *g; } dl2[] = {
+                        { "langle", "<" }, { "rangle", ">" }, { "lvert", "|" },
+                        { "rvert", "|" }, { "lVert", "‖" }, { "rVert", "‖" },
+                        { "lfloor", "[" }, { "rfloor", "]" }, { "lceil", "[" },
+                        { "rceil", "]" }, { "lbrace", "{" }, { "rbrace", "}" },
+                    };
+                    int matched = -1, ml = 0;
+                    for (int k = 0; k < (int)CUI_COUNTOF(dl2); k++) {
+                        int sl = (int)strlen(dl2[k].nm);
+                        if (j + 1 + sl <= n &&
+                            !memcmp(s + j + 1, dl2[k].nm, (size_t)sl) && sl > ml) {
+                            matched = k; ml = sl;
+                        }
+                    }
+                    if (matched >= 0) {
+                        md_m_text(ui, &head, &tail, dl2[matched].g, -1);
+                        i = j + 1 + ml; continue;
+                    }
+                }
+                i = j; continue;
             }
             if (md_cmd_at(s, n, i, "\\begin") || md_cmd_at(s, n, i, "\\end")) {
                 bool beg = s[i + 1] == 'b';
-                int bs, bl, end;
-                int j = i + (s[i + 1] == 'b' ? 6 : 4);
+                if (!beg) {                                /* stray \end */
+                    int bs, bl, end;
+                    if (md_group_at(s, n, i + 4, &bs, &bl, &end)) i = end;
+                    else i += 4;
+                    continue;
+                }
+                int j = i + 6, bs, bl, end;
                 if (!md_group_at(s, n, j, &bs, &bl, &end)) { i = j; continue; }
-                /* Matrices and cases get their conventional delimiters; rows
-                 * are separated by \\ and columns by &. */
-                const char *delim = "";
-                if (bl == 7 && !memcmp(s + bs, "pmatrix", 7)) delim = beg ? "(" : ")";
-                else if (bl == 7 && !memcmp(s + bs, "Bmatrix", 7)) delim = beg ? "{" : "}";
-                else if (bl == 7 && !memcmp(s + bs, "bmatrix", 7)) delim = beg ? "[" : "]";
-                else if (bl == 7 && !memcmp(s + bs, "vmatrix", 7)) delim = "|";
-                else if (bl == 7 && !memcmp(s + bs, "Vmatrix", 7)) delim = "‖";
-                else if (bl == 5 && !memcmp(s + bs, "cases", 5)) delim = beg ? "{" : "";
-                if (beg && bl == 5 && !memcmp(s + bs, "array", 5)) {
-                    int bs2, bl2, end2;                 /* skip the column spec */
+                static const struct { const char *nm, *dl, *dr; } envs[] = {
+                    { "pmatrix", "(", ")" }, { "bmatrix", "[", "]" },
+                    { "Bmatrix", "{", "}" }, { "vmatrix", "|", "|" },
+                    { "Vmatrix", "‖", "‖" }, { "cases", "{", "" },
+                    { "dcases", "{", "" }, { "matrix", "", "" },
+                    { "align", "", "" }, { "aligned", "", "" },
+                    { "gather", "", "" }, { "gathered", "", "" },
+                    { "array", "", "" }, { "smallmatrix", "", "" },
+                };
+                const char *dl = NULL, *dr = "";
+                for (int k = 0; k < (int)CUI_COUNTOF(envs); k++) {
+                    if (bl == (int)strlen(envs[k].nm) &&
+                        !memcmp(s + bs, envs[k].nm, (size_t)bl)) {
+                        dl = envs[k].dl; dr = envs[k].dr; break;
+                    }
+                }
+                if (!dl) { i = end; continue; }            /* unknown env */
+                if (bl == 5 && !memcmp(s + bs, "array", 5)) {
+                    int bs2, bl2, end2;                    /* skip column spec */
                     if (md_group_at(s, n, end, &bs2, &bl2, &end2)) end = end2;
                 }
-                md_put(out, &o, cap, delim, -1);
-                i = end; continue;
+                int bend = end, eend = end;                /* find \end{env} */
+                for (int k = end; k + 4 <= n; k++) {
+                    if (s[k] == '\\' && !memcmp(s + k, "\\end", 4)) {
+                        int bs3, bl3, end3;
+                        if (md_group_at(s, n, k + 4, &bs3, &bl3, &end3) &&
+                            bl3 == bl && !memcmp(s + bs3, s + bs, (size_t)bl)) {
+                            bend = k; eend = end3;
+                        }
+                        break;
+                    }
+                }
+                md_mit *it = md_m_new(ui, MT_MAT);
+                it->dl = dl; it->dr = dr;
+                md_m_matrix(ui, it, s, end, bend - end);
+                md_m_push(&head, &tail, it);
+                i = eend; continue;
             }
             if (md_cmd_at(s, n, i, "\\binom")) {
                 int j = i + 6, bs, bl, end;
                 if (!md_group_at(s, n, j, &bs, &bl, &end)) { i += 2; continue; }
-                char *top = md_math_translate(ui, s + bs, bl);
+                md_mit *top = md_math_ir(ui, s + bs, bl);
                 j = end;
                 if (!md_group_at(s, n, j, &bs, &bl, &end)) { i += 2; continue; }
-                char *bot = md_math_translate(ui, s + bs, bl);
-                md_put(out, &o, cap, "C(", -1);
-                md_put(out, &o, cap, top, (int)strlen(top));
-                md_put(out, &o, cap, ", ", 2);
-                md_put(out, &o, cap, bot, (int)strlen(bot));
-                md_put(out, &o, cap, ")", -1);
+                md_mit *bot = md_math_ir(ui, s + bs, bl);
+                md_mit *it = md_m_new(ui, MT_BINOM);
+                it->a = top; it->b = bot;
+                md_m_push(&head, &tail, it);
                 i = end; continue;
             }
             if (md_cmd_at(s, n, i, "\\frac") || md_cmd_at(s, n, i, "\\dfrac") ||
                 md_cmd_at(s, n, i, "\\tfrac")) {
                 int j = i + (s[i + 1] == 'f' ? 5 : 6), bs, bl, end;
                 if (!md_group_at(s, n, j, &bs, &bl, &end)) { i += 2; continue; }
-                char *num = md_math_translate(ui, s + bs, bl);
+                md_mit *num = md_math_ir(ui, s + bs, bl);
                 j = end;
                 if (!md_group_at(s, n, j, &bs, &bl, &end)) { i += 2; continue; }
-                char *den = md_math_translate(ui, s + bs, bl);
-                bool pn = md_group_complex(num, (int)strlen(num));
-                bool pd = md_group_complex(den, (int)strlen(den));
-                if (pn) md_put(out, &o, cap, "(", -1);
-                md_put(out, &o, cap, num, (int)strlen(num));
-                if (pn) md_put(out, &o, cap, ")", -1);
-                md_put(out, &o, cap, "/", -1);
-                if (pd) md_put(out, &o, cap, "(", -1);
-                md_put(out, &o, cap, den, (int)strlen(den));
-                if (pd) md_put(out, &o, cap, ")", -1);
+                md_mit *den = md_math_ir(ui, s + bs, bl);
+                md_mit *it = md_m_new(ui, MT_FRAC);
+                it->a = num; it->b = den;
+                md_m_push(&head, &tail, it);
                 i = end; continue;
             }
             if (md_cmd_at(s, n, i, "\\sqrt")) {
                 int j = i + 5, bs, bl, end;
-                if (j < n && s[j] == '[') {                 /* optional root index */
+                if (j < n && s[j] == '[') {                /* optional root index */
                     int k = j + 1;
                     while (k < n && s[k] != ']') k++;
-                    if (k < n) { md_put(out, &o, cap, s + j + 1, k - j - 1); j = k + 1; }
+                    if (k < n) {
+                        md_m_text(ui, &head, &tail, s + j + 1, k - j - 1);
+                        j = k + 1;
+                    }
                 }
                 if (md_group_at(s, n, j, &bs, &bl, &end)) {
-                    md_put(out, &o, cap, "√", -1);
-                    char *v = md_math_translate(ui, s + bs, bl);
-                    int vn = (int)strlen(v);
-                    bool paren = md_group_complex(v, vn);
-                    if (paren) md_put(out, &o, cap, "(", -1);
-                    md_put(out, &o, cap, v, vn);
-                    if (paren) md_put(out, &o, cap, ")", -1);
-                    i = end; continue;
+                    md_mit *rt = md_m_new(ui, MT_SQRT);
+                    rt->a = md_math_ir(ui, s + bs, bl);
+                    md_m_push(&head, &tail, rt);
+                    i = end;
+                } else {
+                    md_m_text(ui, &head, &tail, "√", -1);
+                    i = j;
                 }
-                md_put(out, &o, cap, "√", -1); i += 5; continue;
+                continue;
             }
             if (md_cmd_at(s, n, i, "\\text") || md_cmd_at(s, n, i, "\\mathrm") ||
                 md_cmd_at(s, n, i, "\\mathbf") || md_cmd_at(s, n, i, "\\operatorname")) {
@@ -520,13 +761,13 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
                 while (j < n && ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z'))) j++;
                 int bs, bl, end;
                 if (md_group_at(s, n, j, &bs, &bl, &end)) {
-                    md_put(out, &o, cap, s + bs, bl); i = end; continue;
+                    md_m_text(ui, &head, &tail, s + bs, bl);
+                    i = end; continue;
                 }
                 i = j; continue;
             }
-            /* Accents: use a precomposed Latin letter when one exists in the
-             * bundled faces (combining marks do not), else put the modifier
-             * mark after the operand. */
+            /* Accents: precomposed Latin letter when one exists in the bundled
+             * faces, else the modifier mark follows the operand. */
             int acc = -1;                              /* 0 hat .. 9 acute */
             int j = i + 1;
             {
@@ -545,34 +786,42 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
                 }
             }
             if (acc >= 0) {
+                static const char *suffix[] = { "ˆ", "˜", "ˉ", "˙", "¨", "→", "˚", "˘", "`", "´" };
+                const char *inner = NULL; int inl = 0;
                 int bs, bl, end;
                 if (j < n && s[j] == '{' && md_group_at(s, n, j, &bs, &bl, &end)) {
-                    md_math_accent(ui, out, &o, cap, s + bs, bl, acc);
-                    i = end; continue;
-                }
-                if (j < n && s[j] == '\\' && j + 1 < n) {
+                    inner = s + bs; inl = bl; i = end;
+                } else if (j < n && s[j] == '\\' && j + 1 < n) {
                     int k = j + 1;
                     while (k < n && ((s[k] >= 'a' && s[k] <= 'z') ||
                            (s[k] >= 'A' && s[k] <= 'Z'))) k++;
-                    md_math_accent(ui, out, &o, cap, s + j, k - j, acc);
-                    i = k; continue;
+                    inner = s + j; inl = k - j; i = k;
+                } else if (j < n) {
+                    int k = j + 1;
+                    while (k < n && (s[k] & 0xC0) == 0x80) k++;
+                    inner = s + j; inl = k - j; i = k;
+                } else { i = j; continue; }
+                char *txt = md_m_flat(ui, md_math_ir(ui, inner, inl), 1024);
+                int tn2 = (int)strlen(txt);
+                if (tn2 == 1) {
+                    const char *g = md_accent_pre(txt[0], acc);
+                    if (g) { md_m_text(ui, &head, &tail, g, -1); continue; }
                 }
-                if (j < n) {
-                    md_math_accent(ui, out, &o, cap, s + j, 1, acc);
-                    i = j + 1; continue;
-                }
-                i = j; continue;
+                md_m_text(ui, &head, &tail, txt, tn2);
+                if (acc < (int)CUI_COUNTOF(suffix))
+                    md_m_text(ui, &head, &tail, suffix[acc], -1);
+                continue;
             }
             if (md_cmd_at(s, n, i, "\\pmod")) {
                 int bs, bl, end;
                 int j = i + 5;
-                md_put(out, &o, cap, " (mod ", -1);
+                md_m_text(ui, &head, &tail, " (mod ", -1);
                 if (md_group_at(s, n, j, &bs, &bl, &end)) {
-                    char *m = md_math_translate(ui, s + bs, bl);
-                    md_put(out, &o, cap, m, (int)strlen(m));
+                    char *m = md_m_flat(ui, md_math_ir(ui, s + bs, bl), 1024);
+                    md_m_text(ui, &head, &tail, m, -1);
                     i = end;
                 } else i = j;
-                md_put(out, &o, cap, ")", -1);
+                md_m_text(ui, &head, &tail, ")", 1);
                 continue;
             }
             int best = -1, bestlen = 0;
@@ -587,7 +836,7 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
             }
             if (best >= 0) {
                 const char *u = md_symbols[best].uni;
-                md_put(out, &o, cap, u, (int)strlen(u));
+                md_m_text(ui, &head, &tail, u, -1);
                 i += bestlen + 1;
                 /* TeX inserts a thin space after a symbolic command; a plain
                  * space here would read as "∂ u" instead of "∂u". */
@@ -602,30 +851,440 @@ static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
         }
         if ((c == '^' || c == '_') && i + 1 < n) {
             bool sup = c == '^';
-            int j = i + 1, bs, bl, end;
-            if (s[j] == '{' && md_group_at(s, n, j, &bs, &bl, &end)) {
-                md_math_script(ui, out, &o, cap, s + bs, bl, sup);
-                i = end; continue;
+            md_mit *sc = NULL;
+            if (tail && tail->kind == MT_SCRIPT) sc = tail;
+            else {
+                sc = md_m_new(ui, MT_SCRIPT);
+                sc->a = md_m_pop_base(ui, &head, &tail);
+                md_m_push(&head, &tail, sc);
             }
-            if (s[j] == '\\' && j + 1 < n) {           /* \alpha as a script */
+            md_mit *oh = NULL;
+            int j = i + 1;
+            if (j < n && s[j] == '{') {
+                int bs, bl, end;
+                if (md_group_at(s, n, j, &bs, &bl, &end)) {
+                    oh = md_math_ir(ui, s + bs, bl);
+                    i = end;
+                } else i = j;
+            } else if (j < n && s[j] == '\\') {
                 int k = j + 1;
-                while (k < n && ((s[k] >= 'a' && s[k] <= 'z') || (s[k] >= 'A' && s[k] <= 'Z'))) k++;
-                md_math_script(ui, out, &o, cap, s + j, k - j, sup);
-                i = k; continue;
-            }
-            md_math_script(ui, out, &o, cap, s + j, 1, sup);
-            i += 2; continue;
+                if (k < n && ((s[k] >= 'a' && s[k] <= 'z') ||
+                              (s[k] >= 'A' && s[k] <= 'Z'))) {
+                    while (k < n && ((s[k] >= 'a' && s[k] <= 'z') ||
+                           (s[k] >= 'A' && s[k] <= 'Z'))) k++;
+                } else if (k < n) k++;
+                oh = md_math_ir(ui, s + j, k - j);
+                i = k;
+            } else if (j < n) {
+                int k = j + 1;
+                while (k < n && (s[k] & 0xC0) == 0x80) k++;
+                oh = md_math_ir(ui, s + j, k - j);
+                i = k;
+            } else i = j;
+            if (sup) sc->b = oh; else sc->c = oh;
+            continue;
         }
         if (c == '{' || c == '}') { i++; continue; }
-        if (c == '&') {                            /* matrix column break */
-            md_put(out, &o, cap, "  ", 2);
+        if (c == '&') {                                /* column gap */
+            md_mit *it = md_m_new(ui, MT_GAP); it->tn = 2;
+            md_m_push(&head, &tail, it);
             i++; continue;
         }
-        md_put(out, &o, cap, s + i, 1);
+        md_m_text(ui, &head, &tail, s + i, 1);
         i++;
     }
+    return head;
+}
+
+static char *md_math_translate(cui_ctx *ui, const char *s, int n) {
+    md_mit *ir = md_math_ir(ui, s, n);
+    int cap = n * 8 + 256;
+    char *out = cui__frame_alloc(ui, (size_t)cap);
+    int o = 0;
+    md_m_flat1(ui, ir, out, &o, cap);
     out[o] = 0;
     return out;
+}
+
+/* Split a matrix environment body into rows of cells: \\ separates rows,
+ * & separates columns (both at brace depth 0). */
+static void md_m_matrix(cui_ctx *ui, md_mit *it, const char *s, int bs, int bl) {
+    int ncm = 1, nr = 1, depth = 0, cols = 1;
+    for (int i = 0; i < bl; i++) {
+        char ch = s[bs + i];
+        if (ch == '\\' && i + 1 < bl) {
+            if (s[bs + i + 1] == '\\' && depth == 0) {
+                nr++;
+                if (cols > ncm) ncm = cols;
+                cols = 1;
+            }
+            i++; continue;                         /* skip escape / command char */
+        }
+        if (ch == '{') depth++;
+        else if (ch == '}') { if (depth > 0) depth--; }
+        else if (depth == 0 && ch == '&') cols++;
+    }
+    if (cols > ncm) ncm = cols;
+    it->nrow = nr; it->ncol = ncm;
+    it->ncr = cui__frame_alloc(ui, sizeof(int) * (size_t)nr);
+    it->cell = cui__frame_alloc(ui, sizeof(md_mit *) * (size_t)(nr * ncm));
+    memset(it->cell, 0, sizeof(md_mit *) * (size_t)(nr * ncm));
+    int r = 0, cl = 0, cstart = bs;
+    depth = 0;
+    for (int i = 0; i <= bl; i++) {
+        bool sep_row = false, sep_col = false, fin = i == bl;
+        int cur = i;                               /* cell ends here (exclusive) */
+        if (!fin) {
+            char ch = s[bs + i];
+            if (ch == '\\' && i + 1 < bl) {
+                if (s[bs + i + 1] == '\\' && depth == 0) { sep_row = true; cur = i; i++; }
+                else { i++; continue; }
+            } else if (ch == '{') depth++;
+            else if (ch == '}') { if (depth > 0) depth--; }
+            else if (depth == 0 && ch == '&') sep_col = true;
+        }
+        if (sep_row || sep_col || fin) {
+            md_mit *cell = md_math_ir(ui, s + cstart, bs + cur - cstart);
+            if (cell && r < nr && cl < ncm) it->cell[r * ncm + cl] = cell;
+            it->ncr[r] = cl + 1;
+            if (sep_row) { r++; cl = 0; cstart = bs + i + 1; }
+            else if (sep_col) { cl++; cstart = bs + i + 1; }
+        }
+    }
+}
+
+/* Measure an item chain: fills w/as/de (box around the baseline). */
+static void md_m_meas(cui_ctx *ui, md_mit *it, float fs);
+
+static void md_m_meas1(cui_ctx *ui, md_mit *it, float fs) {
+    float fa = cui__font_ascent(ui, CUI_FONT_BODY, fs);
+    float fd = cui__font_line_height(ui, CUI_FONT_BODY, fs) - fa;
+    switch (it->kind) {
+    case MT_TXT:
+        it->w = cui__text_width(ui, CUI_FONT_BODY, fs, it->buf, it->tn, false);
+        it->lruns = md_m_letter_runs(it->buf, it->tn);
+        it->w += it->lruns * 0.08f * fs;           /* room for the italic shear */
+        it->as = fa; it->de = fd;
+        break;
+    case MT_GAP:
+        it->w = (float)it->tn *
+                cui__text_width(ui, CUI_FONT_BODY, fs, " ", 1, false);
+        it->as = it->de = 0;
+        break;
+    case MT_ROWBR: case MT_COLBR:
+        it->w = it->as = it->de = 0;
+        break;
+    case MT_FRAC: {
+        if (it->a) md_m_meas(ui, it->a, fs);
+        if (it->b) md_m_meas(ui, it->b, fs);
+        float cw = CUI_MAX(it->a ? it->a->w : 0, it->b ? it->b->w : 0);
+        it->w = cw + 6;
+        it->as = (it->a ? it->a->as : fa) + 0.47f * fs;
+        it->de = (it->b ? it->b->de : fd) + 0.47f * fs;
+        break;
+    }
+    case MT_SQRT: {
+        if (it->a) md_m_meas(ui, it->a, fs);
+        float sw = cui__text_width(ui, CUI_FONT_BODY, fs, "√", -1, false);
+        it->w = sw + (it->a ? it->a->w : 0) + 3;
+        it->as = CUI_MAX(fa, (it->a ? it->a->as : fa) + 5);
+        it->de = it->a ? it->a->de : fd;
+        break;
+    }
+    case MT_SCRIPT: {
+        if (it->a) md_m_meas(ui, it->a, fs);
+        float sfs = fs * 0.7f;
+        if (it->b) md_m_meas(ui, it->b, sfs);
+        if (it->c) md_m_meas(ui, it->c, sfs);
+        it->w = (it->a ? it->a->w : 0) + (it->b ? it->b->w : 0) + (it->c ? it->c->w : 0);
+        it->as = CUI_MAX(it->a ? it->a->as : fa,
+                         it->b ? it->b->as + 0.42f * fs : 0);
+        it->de = CUI_MAX(it->a ? it->a->de : fd,
+                         it->c ? it->c->de + 0.22f * fs : 0);
+        break;
+    }
+    case MT_BINOM: {
+        if (it->a) md_m_meas(ui, it->a, fs);
+        if (it->b) md_m_meas(ui, it->b, fs);
+        float hs = (it->a ? it->a->as + it->a->de : fa + fd) +
+                   (it->b ? it->b->as + it->b->de : fa + fd) + 0.2f * fs;
+        float cw = CUI_MAX(it->a ? it->a->w : 0, it->b ? it->b->w : 0);
+        it->w = cw + 0.9f * fs;
+        it->as = hs * 0.5f + 0.03f * fs;
+        it->de = hs * 0.5f - 0.03f * fs;
+        break;
+    }
+    case MT_MAT: {
+        it->rh = cui__frame_alloc(ui, sizeof(float) * (size_t)it->nrow);
+        it->mxa = cui__frame_alloc(ui, sizeof(float) * (size_t)it->nrow);
+        it->cw = cui__frame_alloc(ui, sizeof(float) * (size_t)it->ncol);
+        memset(it->cw, 0, sizeof(float) * (size_t)it->ncol);
+        float h = 0;
+        for (int r = 0; r < it->nrow; r++) {
+            float mxa = fa * 0.5f, mde = fd * 0.5f;
+            for (int cc = 0; cc < it->ncr[r]; cc++) {
+                md_mit *cell = it->cell[r * it->ncol + cc];
+                if (!cell) continue;
+                for (md_mit *m = cell; m; m = m->next) md_m_meas1(ui, m, fs);
+                float w2 = 0;
+                for (md_mit *m = cell; m; m = m->next) w2 += m->w;
+                if (w2 > it->cw[cc]) it->cw[cc] = w2;
+                if (cell->as > mxa) mxa = cell->as;
+                if (cell->de > mde) mde = cell->de;
+            }
+            it->mxa[r] = mxa;
+            it->rh[r] = mxa + mde;
+            h += it->rh[r];
+        }
+        h += (it->nrow - 1) * 0.15f * fs;
+        it->mh = h;
+        float dw = ((it->dl[0] ? 0.55f : 0) + (it->dr[0] ? 0.55f : 0)) * fs;
+        float gap = ((it->dl[0] ? 1 : 0) + (it->dr[0] ? 1 : 0)) * 0.3f * fs;
+        float tw = dw + gap;
+        for (int cc = 0; cc < it->ncol; cc++) tw += it->cw[cc] + 0.75f * fs;
+        it->w = tw - 0.75f * fs;
+        it->as = h * 0.5f + 0.3f * fs;
+        it->de = h * 0.5f;
+        break;
+    }
+    }
+}
+
+static void md_m_meas(cui_ctx *ui, md_mit *it, float fs) {
+    for (; it; it = it->next) md_m_meas1(ui, it, fs);
+}
+
+/* Draw one delimiter spanning [top, bot]: paren/bracket curves or bars. */
+static void md_m_delim(cui_ctx *ui, float x, float top, float bot,
+                       const char *d, bool left, cui_color col, float fs) {
+    float th = CUI_MAX(1.0f, fs / 14.0f);
+    float wdt = 0.45f * fs;
+    float mid = (top + bot) * 0.5f;
+    if (!strcmp(d, "|")) {
+        cui_draw_line(ui, (cui_vec2){ x + wdt * 0.5f, top },
+                      (cui_vec2){ x + wdt * 0.5f, bot }, th, col);
+        return;
+    }
+    if (!strcmp(d, "‖")) {
+        cui_draw_line(ui, (cui_vec2){ x + wdt * 0.3f, top },
+                      (cui_vec2){ x + wdt * 0.3f, bot }, th, col);
+        cui_draw_line(ui, (cui_vec2){ x + wdt * 0.7f, top },
+                      (cui_vec2){ x + wdt * 0.7f, bot }, th, col);
+        return;
+    }
+    bool curvy = d[0] == '(' || d[0] == ')';
+    bool curly = d[0] == '{' || d[0] == '}';
+    float inner = left ? x + wdt * 0.18f : x + wdt * 0.82f;
+    float outer = left ? x + wdt : x;
+    if (curly) {
+        cui_vec2 v[7] = {
+            { outer, top + 1 }, { inner, top + 1 }, { inner, mid - 3 },
+            { left ? inner + wdt * 0.5f : inner - wdt * 0.5f, mid },
+            { inner, mid + 3 }, { inner, bot - 1 }, { outer, bot - 1 }
+        };
+        cui_draw_polyline(ui, v, 7, th, col, false);
+        return;
+    }
+    float bend = curvy ? (bot - top) * 0.3f : 1;
+    cui_vec2 v[4] = {
+        { outer, top + 1 }, { inner, top + bend },
+        { inner, bot - bend }, { outer, bot - 1 }
+    };
+    cui_draw_polyline(ui, v, 4, th, col, false);
+}
+
+/* Paint one item with its baseline at yb; returns the next x. */
+static float md_m_paint1(cui_ctx *ui, md_mit *it, float x, float yb, float fs,
+                         md_mpaint *p) {
+    float fa = cui__font_ascent(ui, CUI_FONT_BODY, fs);
+    float fd = cui__font_line_height(ui, CUI_FONT_BODY, fs) - fa;
+    switch (it->kind) {
+    case MT_TXT: {
+        int i = 0;
+        while (i < it->tn) {
+            int cl; bool let = md_m_letter(it->buf + i, it->tn - i, &cl);
+            int j = i;
+            while (j < it->tn) {
+                int l2; bool let2 = md_m_letter(it->buf + j, it->tn - j, &l2);
+                if (let2 != let) break;
+                j += l2;
+            }
+            int v0 = ui->dl.vtx_count;
+            cui_draw_text(ui, CUI_FONT_BODY, fs,
+                          (cui_vec2){ x, yb - fa }, p->fg, it->buf + i, j - i);
+            if (let) md_shear(ui, v0, yb);
+            x += cui__text_width(ui, CUI_FONT_BODY, fs, it->buf + i, j - i, false)
+                 + (let ? 0.08f * fs : 0);
+            i = j;
+        }
+        break;
+    }
+    case MT_GAP:
+        x += it->w;
+        break;
+    case MT_FRAC: {
+        float bar = yb - 0.33f * fs;
+        float th = CUI_MAX(1.0f, fs / 14.0f);
+        float cw = it->w - 6;
+        if (it->a) {
+            float w2 = 0;
+            for (md_mit *m = it->a; m; m = m->next) w2 += m->w;
+            md_m_paint_list(ui, it->a, x + 3 + (cw - w2) * 0.5f,
+                            bar - 0.14f * fs - it->a->de, fs, p);
+        }
+        if (it->b) {
+            float w2 = 0;
+            for (md_mit *m = it->b; m; m = m->next) w2 += m->w;
+            md_m_paint_list(ui, it->b, x + 3 + (cw - w2) * 0.5f,
+                            bar + 0.14f * fs + it->b->as, fs, p);
+        }
+        cui_draw_rect(ui, (cui_rect){ x + 2, bar - th * 0.5f, it->w - 4, th },
+                      CUI_CORNERS(0), p->fg);
+        x += it->w;
+        break;
+    }
+    case MT_SQRT: {
+        float sw = cui__text_width(ui, CUI_FONT_BODY, fs, "√", -1, false);
+        cui_draw_text(ui, CUI_FONT_BODY, fs,
+                      (cui_vec2){ x, yb - fa }, p->fg, "√", -1);
+        float y_ov = yb - CUI_MAX(0.85f * fs, (it->a ? it->a->as : fa) + 4);
+        float th = CUI_MAX(1.0f, fs / 14.0f);
+        cui_draw_rect(ui, (cui_rect){ x + sw * 0.5f, y_ov,
+                                      sw * 0.5f + (it->a ? it->a->w : 0) + 4, th },
+                      CUI_CORNERS(0), p->fg);
+        if (it->a) md_m_paint_list(ui, it->a, x + sw + 3, yb, fs, p);
+        x += it->w;
+        break;
+    }
+    case MT_SCRIPT: {
+        float sfs = fs * 0.7f;
+        float xa = it->a ? md_m_paint_list(ui, it->a, x, yb, fs, p) : x;
+        if (it->b) md_m_paint_list(ui, it->b, xa, yb - 0.42f * fs, sfs, p);
+        if (it->c) {
+            float xs = xa + (it->b ? it->b->w : 0);
+            md_m_paint_list(ui, it->c, xs, yb + 0.22f * fs, sfs, p);
+        }
+        x += it->w;
+        break;
+    }
+    case MT_BINOM: {
+        float dw = 0.45f * fs;
+        float top = yb - it->as;
+        float hs = it->as + it->de;
+        float cwid = it->w - 2 * dw;
+        if (it->a) {
+            float w2 = 0;
+            for (md_mit *m = it->a; m; m = m->next) w2 += m->w;
+            md_m_paint_list(ui, it->a, x + dw + (cwid - w2) * 0.5f,
+                            top + it->a->as, fs, p);
+        }
+        if (it->b) {
+            float w2 = 0;
+            for (md_mit *m = it->b; m; m = m->next) w2 += m->w;
+            float btop = top + (it->a ? it->a->as + it->a->de : fa + fd) + 0.2f * fs;
+            md_m_paint_list(ui, it->b, x + dw + (cwid - w2) * 0.5f,
+                            btop + it->b->as, fs, p);
+        }
+        md_m_delim(ui, x, top, top + hs, "(", true, p->fg, fs);
+        md_m_delim(ui, x + dw + cwid, top, top + hs, ")", false, p->fg, fs);
+        x += it->w;
+        break;
+    }
+    case MT_MAT: {
+        float dlw = (it->dl[0] ? 0.55f : 0) * fs;
+        float drw = (it->dr[0] ? 0.55f : 0) * fs;
+        float mgap = ((it->dl[0] ? 1 : 0) + (it->dr[0] ? 1 : 0)) * 0.3f * fs;
+        float top = yb - it->as;
+        float *cx = cui__frame_alloc(ui, sizeof(float) * (size_t)(it->ncol + 1));
+        float cxx = x + dlw + (it->dl[0] ? 0.3f * fs : 0);
+        for (int cc = 0; cc < it->ncol; cc++) { cx[cc] = cxx; cxx += it->cw[cc] + 0.75f * fs; }
+        float rowtop = top;
+        for (int r = 0; r < it->nrow; r++) {
+            float rb = rowtop + it->mxa[r];
+            for (int cc = 0; cc < it->ncr[r]; cc++) {
+                md_mit *cell = it->cell[r * it->ncol + cc];
+                if (!cell) continue;
+                float cellw = 0;
+                for (md_mit *m = cell; m; m = m->next) cellw += m->w;
+                md_m_paint_list(ui, cell, cx[cc] + (it->cw[cc] - cellw) * 0.5f, rb, fs, p);
+            }
+            rowtop += it->rh[r] + 0.15f * fs;
+        }
+        float bot = rowtop - 0.15f * fs;
+        if (it->dl[0]) md_m_delim(ui, x, top, bot, it->dl, true, p->fg, fs);
+        if (it->dr[0]) md_m_delim(ui, x + it->w - drw, top, bot, it->dr, false, p->fg, fs);
+        x += it->w;
+        break;
+    }
+    case MT_ROWBR: case MT_COLBR: break;
+    }
+    return x;
+}
+
+static float md_m_paint_list(cui_ctx *ui, md_mit *it, float x, float yb, float fs,
+                             md_mpaint *p) {
+    for (; it; it = it->next) x = md_m_paint1(ui, it, x, yb, fs, p);
+    return x;
+}
+
+/* Wrap the top-level rows (split at MT_ROWBR) into centered display lines. */
+static void md_m_layout(cui_ctx *ui, md_mit *ir, float fs, float avail,
+                        md_mpaint *p) {
+    float fa = cui__font_ascent(ui, CUI_FONT_BODY, fs);
+    float fd = cui__font_line_height(ui, CUI_FONT_BODY, fs) - fa;
+    int total = 0;
+    for (md_mit *it = ir; it; it = it->next) { md_m_meas1(ui, it, fs); total++; }
+    md_mit **all = cui__frame_alloc(ui, sizeof(md_mit *) * (size_t)(total + 1));
+    int n = 0;
+    for (md_mit *it = ir; it; it = it->next) all[n++] = it;
+    md_mline *lines = cui__frame_alloc(ui, sizeof(md_mline) * (size_t)(n + 2));
+    int nline = 0, rstart = 0;
+    for (int k = 0; k <= n; k++) {
+        if (k == n || all[k]->kind == MT_ROWBR) {
+            int i = rstart;
+            while (i < k) {
+                md_mline *L = &lines[nline++];
+                L->it = &all[i]; L->n = 0; L->w = L->as = L->de = 0;
+                while (i < k) {
+                    md_mit *m = all[i];
+                    if (L->n > 0 && L->w + m->w > avail) break;
+                    L->w += m->w;
+                    if (m->as > L->as) L->as = m->as;
+                    if (m->de > L->de) L->de = m->de;
+                    L->n++; i++;
+                }
+                if (L->as < fa) L->as = fa;
+                if (L->de < fd * 0.6f) L->de = fd * 0.6f;
+            }
+            rstart = k + 1;
+        }
+    }
+    p->line = lines;
+    p->nline = nline;
+    float h = 0, w = 0;
+    for (int k = 0; k < nline; k++) {
+        h += lines[k].as + lines[k].de + p->lh;
+        if (lines[k].w > w) w = lines[k].w;
+    }
+    p->h = h - p->lh;
+    p->w = w;
+}
+
+static void md_math_paint_cb(cui_ctx *ui, cui_rect rect, void *user) {
+    md_mpaint *p = user;
+    cui_draw_rect(ui, rect, CUI_CORNERS(8 * p->u), p->bg);
+    cui_draw_rect_border(ui, rect, CUI_CORNERS(8 * p->u), cui__rgba(0, 0, 0, 0),
+                         p->border, 1);
+    float pad = 13 * p->u;
+    float y = rect.y + pad;
+    for (int k = 0; k < p->nline; k++) {
+        md_mline *L = &p->line[k];
+        float x = rect.x + (rect.w - L->w) * 0.5f;
+        float yb = y + L->as;
+        for (int q = 0; q < L->n; q++)
+            x = md_m_paint1(ui, L->it[q], x, yb, p->fs, p);
+        y = yb + L->de + p->lh;
+    }
 }
 
 /* $...$ only when both sides are tight: "$5 and $10" stays prose. */
@@ -1313,31 +1972,29 @@ static float md_code(md_ctx *c, const md_line *L, int n, int strip, md_line lang
     return c->fit ? widest + 42 : 0;
 }
 
-/* Display math: a tinted, centered panel. The expression is translated to
- * Unicode first, then laid out as ordinary (centered) inline runs. */
+/* Display math: a tinted, centered panel. The expression is parsed into the
+ * math IR and laid out for real — stacked fractions, raised/lowered scripts,
+ * sqrt overlines, spanning matrix delimiters, italic letters. */
 static float md_math_block(md_ctx *c, const md_box *b, const char *expr, int len, int prev) {
     cui_ctx *ui = c->ui;
+    md_mit *ir = md_math_ir(ui, expr, len);
     md_space(c, md_gap_before(c, b, prev, BK_MATH, 0));
-    char *txt = md_math_translate(ui, expr, len);
-    int tn = (int)strlen(txt);
-    if (tn <= 0) return 0;
-    int panel = cui__node_new(ui, 0);
-    cui_node *pn = &ui->nodes[panel];
-    pn->w = CUI_FILL;
-    pn->pad[0] = pn->pad[2] = 8 * c->u;
-    pn->pad[1] = pn->pad[3] = 11 * c->u;
-    pn->bg = c->code_bg;
-    pn->border = 1;
-    pn->border_color = c->rule_c;
-    pn->radius = CUI_CORNERS(8 * c->u);
-    cui__open(ui, panel);
+    if (!ir) return 0;
     md_font f = md_body(c);
     f.size *= 1.12f;
-    f.lh *= 1.12f;
-    md_inline in = md_parse_inline(ui, txt, tn, false);
-    for (int k = 0; k < in.nruns; k++) in.runs[k].style |= MS_MATH;
-    md_inline_emit(c, &in, &f, b->fg, CUI_TEXT_CENTER, b->w - 24 * c->u);
-    cui__close(ui);
+    md_mpaint mp;
+    memset(&mp, 0, sizeof mp);
+    mp.fs = f.size;
+    mp.u = c->u;
+    mp.lh = 0.22f * f.size;
+    mp.fg = c->custom_color ? b->fg : cui_mix(c->link_c, b->fg, 0.45f);
+    mp.bg = c->code_bg;
+    mp.border = c->rule_c;
+    float avail = (b->w > 60 ? b->w : 600) - 30 * c->u;
+    md_m_layout(ui, ir, f.size, avail, &mp);
+    float h = mp.h + 26 * c->u;
+    cui_canvas(ui, cui__frame_printf(ui, "math%d", c->code_seq++), CUI_FILL,
+               CUI_PX(h), md_math_paint_cb, &mp, sizeof mp);
     return 0;
 }
 

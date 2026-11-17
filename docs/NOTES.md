@@ -20,20 +20,26 @@ RapidEditor 所需的 `CMakeLists.txt`、`cmake/`、`include/cui/`、`src/`、`t
    - `src/rapideditor.c` 每帧排空队列并调用 `np_open_path()`。
 
 4. **Markdown 数学公式 / Mermaid**（`src/cui_markdown.c`）：
-   - 行内 `$...$` 与块级 `$$...$$`：把常用 TeX 命令映射为 Unicode 符号，上下标用
-     上标数字 / `^(...)`、`_(...)` 近似；块级公式渲染为居中的浅色面板，不依赖
-     KaTeX 或浏览器。符号映射逐项核对过内嵌 Inter 与 CJK 回退字体（msyh）的 cmap，
-     两边都没有字形的命令退化为可读的 ASCII/文字（如 `\Rightarrow`→`=>`、`\subseteq`→`<=`、
-     `\nabla`→`grad`），不会出现空白方块；
-   - 另支持 `\frac/\binom/\pmod`、矩阵环境（`pmatrix/bmatrix/vmatrix/cases` 加对应定界符）、
-     重音（`\hat/\bar/\tilde/\vec/\dot` 等，优先用预组合字符，如 `\hat y`→`ŷ`）、
-     `\quad/\qquad`、`\left./\bigl` 等尺寸提示、字面转义 `\{ \% \&`；
+   - TeX 子集先解析为保留结构的 IR（`md_math_ir`：TXT/GAP/FRAC/SQRT/SCRIPT/BINOM/MAT/
+     ROWBR/COLBR）。行内 `$...$` 把 IR 压平回 Unicode 近似（与旧版行为一致）；
+   - **块级 `$$...$$` 走真实排版**（`md_m_layout` + `md_math_paint_cb`，CUI canvas 自绘）：
+     分数上下堆叠 + 分数线（`\frac/\dfrac/\tfrac`）、上下标用 0.7 倍字号真实升/降
+     （不再出现 `^(...)` 记法）、`\sqrt` 带覆盖被开方数的顶线、`\binom` 上下堆叠 + 括号、
+     矩阵环境（`pmatrix/bmatrix/vmatrix/Vmatrix/cases/align/aligned/array`）列对齐 +
+     跨全部行的定界符（括号用折线画，`|`/`‖` 用直线）、`\\` 分行 `&` 对齐、
+     字母（ASCII + 希腊）用 `md_shear` 合成斜体；超宽时按 item 折行、每行居中；
+   - 符号映射逐项核对过内嵌 Inter 与 CJK 回退字体（msyh）的 cmap，两边都没有字形的
+     命令退化为可读的 ASCII/文字（如 `\Rightarrow`→`=>`、`\nabla`→`grad`），不会出现
+     空白方块；重音（`\hat/\bar/\tilde/\vec/\dot` 等）优先用预组合字符（`\hat y`→`ŷ`）；
+   - 行内多字符上标：逐字符映射上标字形（`x^{n+1}`→`xⁿ⁺¹`），无字形才退回 `^(...)`；
+     `\left(x\right)` 不再丢弃定界符；
    - ```` ```mermaid ```` 代码块：解析 `graph/flowchart TD|LR` 的节点声明（`[]`、`()`、`{}`、
      `(())`、`[[]]` 子例程）和连线（`-->`、`---`、`-.->`（虚线）、`==>`，支持 `|标签|` 与
      链式 `A --> B --> C`、自环 `A --> A`），用 CUI canvas 自绘。布局按破环后的最长路径
      分层并做重心排序减少交叉；正向边走正交折线并按车道错开，同层边直连，回边走图外
-     侧通道，自环画在节点空侧；节点带阴影、起点节点用强调色；边标签最后统一绘制在
-     不透明底板上，任何线条都不会穿过文字；无法识别的内容回退为普通代码块。
+     侧通道，自环画在节点空侧；节点带阴影、起点节点用强调色；边标签不骑线：水平线段
+     的标签整体放在线上方、垂直线段放右侧、斜线段沿法线方向整体偏移（都带不透明底板，
+     任何线条都不会穿过文字）；无法识别的内容回退为普通代码块。
 
 5. **编辑器字体 API**（`include/cui/cui.h`、`src/cui_text.c`）：
    - `cui_font_load_deflated()`：从 raw DEFLATE 流加载 TrueType 字体，内部复用
