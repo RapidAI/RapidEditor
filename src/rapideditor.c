@@ -322,6 +322,12 @@ typedef struct notepad {
     int  preview_tex_page;         /* page index currently loaded */
     char preview_owner[NP_PATH_CAP]; /* doc path the preview belongs to */
 
+    /* Immersive ("zen") edit mode: hides the menu bar, toolbar, side panes
+     * and status bar so only the tab strip and editor remain.  Panel state
+     * is saved here and restored when the mode is left again. */
+    bool zen;
+    bool zen_prev_sidebar, zen_prev_output, zen_prev_preview;
+
     /* Embedded WebView2 (Win32, HTML preview only) --------------------- */
     bool wv_init_done;             /* np_webview_init() attempted once */
     bool wv_available;             /* runtime present + controller created */
@@ -355,6 +361,22 @@ static void np_size_str(char *out, size_t cap, size_t n) {
         snprintf(out, cap, "%.1f KB", (double)n / 1024.0);
     else
         snprintf(out, cap, "%zu B", n);
+}
+
+/* Enter/leave immersive edit mode; panes come back on exit. */
+static void np_zen_set(notepad *a, bool on) {
+    if (a->zen == on) return;
+    a->zen = on;
+    if (on) {
+        a->zen_prev_sidebar = a->show_sidebar;
+        a->zen_prev_output  = a->show_output;
+        a->zen_prev_preview = a->show_preview;
+        a->show_sidebar = a->show_output = a->show_preview = false;
+    } else {
+        a->show_sidebar = a->zen_prev_sidebar;
+        a->show_output  = a->zen_prev_output;
+        a->show_preview = a->zen_prev_preview;
+    }
 }
 
 /* A small rolling log for the output pane, like EditPlus's output window. */
@@ -1704,6 +1726,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "Ctrl H          查找和替换",
             "Ctrl Shift F    在文件中查找（目录搜索）",
             "F1              快捷键帮助  / F7 输出窗口",
+            "F11             沉浸式编辑（隐藏菜单栏/工具栏/状态栏，再按退出）",
             "Ctrl Shift P    预览面板（Markdown 实时 / LaTeX·PDF 编译 / HTML Web）",
             "Ctrl Shift L    在当前文件中列出所有匹配行",
             "Ctrl G          转到行",
@@ -3290,6 +3313,18 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
             }
         }
 
+        /* Immersive mode: the menu bar is hidden, so touch devices (no F11)
+         * need a small, quiet way out - one ghost icon right of the tabs. */
+        if (a->zen) {
+            cui_row(ui, .width = CUI_FILL, .gap = 4, .pad_y = 2, .pad_right = 6) {
+                cui_spacer(ui);
+                if (cui_icon_button(ui, CUI_ICON_MINIMIZE_2,
+                                    .tooltip = "退出沉浸式编辑  F11",
+                                    .variant = CUI_BUTTON_GHOST, .size = CUI_SIZE_SM))
+                    np_zen_set(a, false);
+            }
+        }
+
         np_doc *d = np_cur(a);
         bool welcome = a->count == 1 && !d->is_hex && !a->welcome_dismissed &&
                        np_blank_untitled(d);
@@ -3419,6 +3454,7 @@ static void np_frame(cui_ctx *ui, void *user) {
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) a->show_sidebar = !a->show_sidebar;
         if (cui_key_pressed(ui, CUI_KEY_F7)) a->show_output = !a->show_output;
+        if (cui_key_pressed(ui, CUI_KEY_F11)) np_zen_set(a, !a->zen);
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P))
             a->show_preview = !a->show_preview;
         if (cui_key_pressed(ui, CUI_KEY_F1)) a->dlg_help = true;
@@ -3463,6 +3499,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                .bg = CUI_COLOR_BACKGROUND, .gap = 0) {
         /* Brand identity lives in the OS title bar / window icon now; the
          * density and help controls remain in the View menu and toolbar. */
+        if (!a->zen) {
         cui_column(ui, .width = CUI_FILL, .bg = CUI_COLOR_SURFACE, .gap = 0) {
         cui_menu_bar(ui, "menubar", .no_border = true) {
             cui_menu_bar_menu(ui, "文件") {
@@ -3694,6 +3731,10 @@ static void np_frame(cui_ctx *ui, void *user) {
                     a->line_numbers = !a->line_numbers;
                 if (cui_menu_item(ui, "显示状态栏", .checked = a->show_status))
                     a->show_status = !a->show_status;
+                cui_menu_separator(ui);
+                if (cui_menu_item(ui, "沉浸式编辑（隐藏菜单/工具/状态栏）",
+                                  .checked = a->zen, .shortcut = "F11"))
+                    np_zen_set(a, !a->zen);
             }
 
             cui_menu_bar_menu(ui, "文档") {
@@ -3826,6 +3867,7 @@ static void np_frame(cui_ctx *ui, void *user) {
             }
         }
         }   /* top chrome surface */
+        }   /* !zen: menu bar + toolbar hidden in immersive edit mode */
 
         /* Main workspace: directory pane | (tabs + editor + output pane).
          * Both dividers are draggable; the ratios live in the app state. */
@@ -3841,7 +3883,7 @@ static void np_frame(cui_ctx *ui, void *user) {
         }
 
         /* Status bar -------------------------------------------------- */
-        if (a->show_status) {
+        if (a->show_status && !a->zen) {
             cui_status_bar(ui, "status") {
                 if (d->dirty)
                     cui_status_bar_text(ui, "未保存", .icon = CUI_ICON_DOT, .tone = CUI_TONE_WARNING);
