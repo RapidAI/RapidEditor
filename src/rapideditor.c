@@ -44,6 +44,7 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#include <pthread.h>   /* background template/TinyTeX workers */
 #endif
 #include <sys/stat.h>
 
