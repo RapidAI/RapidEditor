@@ -226,6 +226,8 @@ void np_updater_open_folder(void) {}  /* Android installs from app storage */
 #include "np_net.h"
 #include <ctype.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 
 #if defined(_WIN32)
