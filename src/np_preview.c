@@ -306,14 +306,24 @@ static void pv_tex_worker(void *arg) {
 
         if (engine) {
             char cmd[NP_PV_PATH_CAP * 4];
+            char qcwd[NP_PV_PATH_CAP * 2];
+            pv_quote(j->work_dir, qcwd, sizeof qcwd);
+            /* Run from the project directory: multi-file documents resolve
+             * \input/\include, .bib files and images relative to the main
+             * .tex, not to the editor's launch folder. */
+#ifdef _WIN32
+            const char *cd = "cd /d";
+#else
+            const char *cd = "cd";
+#endif
             /* Two passes so cross-references and the TOC settle. */
             snprintf(cmd, sizeof cmd,
-                     "%s -interaction=nonstopmode -halt-on-error -output-directory=%s %s > %s 2>&1",
-                     engine, qdir, qtex, qlog);
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -output-directory=%s %s > %s 2>&1",
+                     cd, qcwd, engine, qdir, qtex, qlog);
             pv_run(cmd);
             snprintf(cmd, sizeof cmd,
-                     "%s -interaction=nonstopmode -halt-on-error -output-directory=%s %s >> %s 2>&1",
-                     engine, qdir, qtex, qlog);
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -output-directory=%s %s >> %s 2>&1",
+                     cd, qcwd, engine, qdir, qtex, qlog);
             pv_run(cmd);
 
             snprintf(pdf, sizeof pdf, "%s.pdf", j->base);

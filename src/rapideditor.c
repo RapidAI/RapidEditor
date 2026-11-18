@@ -22,11 +22,12 @@
 #include "np_webview.h"
 #include "np_font_bundle.h"
 #include "np_updater.h"
+#include "np_latex_templates.h"
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.2.0"
+#define NP_APP_VERSION "1.2.1"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -141,6 +142,8 @@ static const char *np_ext(const char *path) {
     return dot ? dot + 1 : "";
 }
 
+static void np_dir_of(const char *path, char *out, size_t cap);  /* defined below */
+
 static bool np_ext_in(const char *list, const char *ext) {
     size_t n = strlen(ext);
     if (!n) return false;
@@ -207,6 +210,9 @@ typedef struct np_doc {
     uint64_t matches_key;               /* cached find-match count */
     int match_count;
     char path[NP_PATH_CAP];
+    char tex_root[NP_PATH_CAP];         /* multi-file LaTeX: main .tex to compile */
+    bool tex_root_manual;               /* user explicitly pinned a main file */
+    bool tex_root_probed;               /* auto-detect already ran for this tab */
     char editor_id[48];                 /* unique: CUI keeps undo/caret per id */
     char tab_title[NP_PATH_CAP + 64];   /* "name###key" for cui_doc_tabs */
     char tab_tip[NP_PATH_CAP + 128];
@@ -268,6 +274,8 @@ typedef struct notepad {
 
     /* dialogs */
     bool dlg_confirm, dlg_replace, dlg_goto, dlg_help, dlg_about, dlg_lang;
+    bool dlg_latex_tpl;                 /* new LaTeX document from a template */
+    int  latex_tpl_pick;
     bool dlg_update;                    /* Android: check GitHub Releases */
     char update_buf[512];               /* scratch lines for the update dialog */
     int  upd_last_check, upd_last_dl;   /* poll caches: request redraw on flip */
@@ -395,7 +403,7 @@ static void np_logf(notepad *a, const char *fmt, ...) {
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
            a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
-           a->dlg_update;
+           a->dlg_update || a->dlg_latex_tpl;
 }
 
 #ifdef __ANDROID__
@@ -518,6 +526,37 @@ static np_doc *np_doc_new(notepad *a) {
     np_bump_editor(a, d);
     a->docs[a->count] = d;
     return a->docs[a->count++];
+}
+
+/* Create a new untitled tab pre-filled with a built-in LaTeX template. The
+ * text goes through the same buffer setup as a file load, so the existing
+ * "\\documentclass" sniff turns the preview into LaTeX automatically. */
+static void np_close_doc(notepad *a, int idx);   /* defined just below */
+
+static np_doc *np_doc_from_latex_template(notepad *a, int index) {
+    const np_latex_template *t = np_latex_template_at(index);
+    if (!t || !t->text) return NULL;
+    np_doc *d = np_doc_new(a);
+    if (!d) return NULL;
+    size_t n = strlen(t->text);
+    if (!np_ensure_cap(d, n + 1)) {
+        np_close_doc(a, a->count - 1);
+        np_toast(a, "内存不足", "无法载入模板", CUI_TONE_DANGER);
+        return NULL;
+    }
+    memcpy(d->text, t->text, n + 1);
+    d->len = (int)n;
+    d->rev++;
+    d->content_rev++;
+    d->dirty = true;                       /* a fresh template is unsaved work */
+    d->lang = NP_LANG_TEXT;                /* no LaTeX highlighter in CUI */
+    d->lang_manual = false;
+    d->line = d->column = 1;
+    snprintf(d->path, sizeof d->path, "%s", t->filename); /* suggested save name */
+    np_text_changed(a, d);
+    np_bump_editor(a, d);
+    np_logf(a, "从模板新建  %s", t->name);
+    return d;
 }
 
 static void np_doc_free(np_doc *d) {
@@ -1016,13 +1055,27 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
                 np_enc_name(d->enc), d->crlf ? "CRLF" : "LF");
     }
     np_toast(a, "已保存", path, CUI_TONE_SUCCESS);
-    /* "Save to recompile": force the LaTeX preview to rebuild from the
-     * freshly written file on the next frame. */
-    if (np_preview_detect(path) == NP_PREVIEW_LATEX && a->show_preview) {
-        np_preview_release_tex_image(a);
-        np_tex_job_free(&a->tex_job);
-        np_tex_job_init(&a->tex_job);
-        a->preview_owner[0] = 0;          /* sync() will start a new compile */
+    /* "Save to recompile": force the LaTeX preview to rebuild. For multi-file
+     * projects, saving a .sty/.cls/.bib/chapter in the same directory as the
+     * compiled main file must also trigger a rebuild. */
+    if (a->show_preview) {
+        bool rebuild = false;
+        if (np_preview_detect(path) == NP_PREVIEW_LATEX) rebuild = true;
+        else if (a->preview_owner[0] && d->path[0]) {
+            const char *dot = strrchr(path, '.');
+            if (dot && np_ext_in("cls;sty;bib;bst", dot + 1)) {
+                char sd[NP_PATH_CAP], od[NP_PATH_CAP];
+                np_dir_of(path, sd, sizeof sd);
+                np_dir_of(a->preview_owner, od, sizeof od);
+                rebuild = strcmp(sd, od) == 0;
+            }
+        }
+        if (rebuild) {
+            np_preview_release_tex_image(a);
+            np_tex_job_free(&a->tex_job);
+            np_tex_job_init(&a->tex_job);
+            a->preview_owner[0] = 0;          /* sync() will start a new compile */
+        }
     }
     return true;
 }
@@ -1712,6 +1765,42 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
+    /* LaTeX template picker ------------------------------------------- */
+    cui_dialog(ui, "从模板新建 LaTeX 文档", &a->dlg_latex_tpl,
+               .description = "选择一个自包含模板，编译预览会立即启用",
+               .width = 460) {
+        int n = np_latex_template_count();
+        const char *names[32];
+        for (int i = 0; i < n && i < 32; i++)
+            names[i] = np_latex_template_at(i)->name;
+        if (n > 0) {
+            a->latex_tpl_pick = NP_MAX(0, NP_MIN(a->latex_tpl_pick, n - 1));
+            cui_select(ui, "latex-tpl-pick", names, n, &a->latex_tpl_pick,
+                       .label = "模板", .placeholder = "选择模板", .width = CUI_FILL);
+            const np_latex_template *t = np_latex_template_at(a->latex_tpl_pick);
+            if (t) {
+                cui_text(ui, t->desc, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                char hint[200];
+                snprintf(hint, sizeof hint, "新建后保存为 %s；模板来自 MIT 开源库，可自由修改。",
+                         t->filename);
+                cui_text(ui, hint, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            }
+        }
+        cui_text(ui, "更多在线模板：Overleaf Gallery 提供海量模板（多为多文件项目）。",
+                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "在线模板库", .variant = CUI_BUTTON_GHOST,
+                           .tooltip = "在浏览器中打开 Overleaf 模板库"))
+                np_open_url("https://www.overleaf.com/latex/templates");
+            if (cui_button(ui, "取消")) a->dlg_latex_tpl = false;
+            if (cui_button(ui, "新建", .variant = CUI_BUTTON_PRIMARY, .disabled = n <= 0)) {
+                np_doc *fresh = np_doc_from_latex_template(a, a->latex_tpl_pick);
+                if (fresh) np_activate(a, a->count - 1, true);
+                a->dlg_latex_tpl = false;
+            }
+        }
+    }
+
     cui_dialog(ui, "快捷键", &a->dlg_help, .width = 480) {
         static const char *lines[] = {
             "Ctrl N          新建标签",
@@ -1887,6 +1976,79 @@ static void np_dir_join(char *out, size_t cap, const char *dir, const char *name
 #else
     snprintf(out, cap, "%s%s%s", dir, sep ? "" : "/", name);
 #endif
+}
+
+/* True when a .tex file looks like a compilable entry point (has a
+ * documentclass declaration). Reads only the first 8 KB. */
+static bool np_tex_file_is_main(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strstr(buf, "\\documentclass") != NULL;
+}
+
+/* Multi-file LaTeX: find the main .tex of the project a document belongs to.
+ * A file in a LaTeX project (main .tex, chapters, .cls/.sty/.bib) should
+ * compile through the project's main entry, not as a standalone fragment.
+ * Heuristic: prefer a .tex whose stem matches a common main name, else the
+ * first .tex in the directory containing \\documentclass. Cached per tab so
+ * this directory scan happens once, not every frame. */
+static void np_tex_detect_root(notepad *a, np_doc *d) {
+    if (!d || !d->path[0] || d->tex_root[0] || d->tex_root_probed) return;
+    d->tex_root_probed = true;   /* probe once even if nothing is found */
+    char dir[NP_PATH_CAP];
+    np_dir_of(d->path, dir, sizeof dir);
+
+    /* A .tex that itself is a standalone document is its own root. */
+    bool self_is_tex = false;
+    const char *dot = strrchr(d->path, '.');
+    if (dot) {
+        const char *ext = dot + 1;
+        self_is_tex = (np_ext_in("tex;latex;ltx", ext));
+    }
+    if (self_is_tex && d->len > 0 &&
+        (strstr(d->text, "\\documentclass") || strstr(d->text, "\\begin{document}"))) {
+        snprintf(d->tex_root, sizeof d->tex_root, "%s", d->path);
+        return;
+    }
+
+    cui_file_entry ents[NP_DIR_MAX];
+    char names[NP_DIR_MAX * 96];
+    int n = cui_fs_list(NULL, dir, ents, NP_DIR_MAX, names, sizeof names, false);
+    if (n <= 0) return;
+
+    /* Priority stems for the likely main file. */
+    static const char *preferred[] = { "main", "index", "master", "paper", "thesis", "report" };
+    char candidate[NP_PATH_CAP];
+    for (int p = 0; p < (int)(sizeof preferred / sizeof preferred[0]); p++) {
+        for (int i = 0; i < n; i++) {
+            if (ents[i].dir) continue;
+            const char *dot2 = strrchr(ents[i].name, '.');
+            if (!dot2 || !np_ext_in("tex;latex;ltx", dot2 + 1)) continue;
+            const char *pref = preferred[p];
+            size_t plen = strlen(pref);
+            if (strncmp(ents[i].name, pref, plen) != 0) continue;
+            np_dir_join(candidate, sizeof candidate, dir, ents[i].name);
+            if (np_tex_file_is_main(candidate)) {
+                snprintf(d->tex_root, sizeof d->tex_root, "%s", candidate);
+                return;
+            }
+        }
+    }
+    /* Otherwise the first .tex in the directory with \\documentclass. */
+    for (int i = 0; i < n; i++) {
+        if (ents[i].dir) continue;
+        const char *dot2 = strrchr(ents[i].name, '.');
+        if (!dot2 || !np_ext_in("tex;latex;ltx", dot2 + 1)) continue;
+        np_dir_join(candidate, sizeof candidate, dir, ents[i].name);
+        if (np_tex_file_is_main(candidate)) {
+            snprintf(d->tex_root, sizeof d->tex_root, "%s", candidate);
+            return;
+        }
+    }
 }
 
 static void np_init_side_dir(notepad *a) {
@@ -3012,6 +3174,12 @@ static void np_sync_webview(notepad *a, cui_ctx *ui) {
 static np_preview_kind np_preview_for_doc(notepad *a, np_doc *d) {
     if (!d || d->is_hex) return NP_PREVIEW_OFF;
     np_preview_kind k = np_preview_detect(d->path);
+    if (k == NP_PREVIEW_OFF && d->path[0]) {
+        /* Multi-file LaTeX: style/class/bib sources belong to a LaTeX project
+         * and preview its main .tex, even though their own extension is not .tex. */
+        const char *dot = strrchr(d->path, '.');
+        if (dot && np_ext_in("cls;sty;bib;bst;aux", dot + 1)) k = NP_PREVIEW_LATEX;
+    }
     if (k == NP_PREVIEW_OFF) {
         /* Untitled buffers: sniff markdown/LaTeX from their text. */
         if (d->len > 0) {
@@ -3048,6 +3216,10 @@ static void np_preview_sync(notepad *a, np_doc *d) {
     bool owner_changed = strcmp(a->preview_owner, d->path) != 0;
 
     if (k == NP_PREVIEW_LATEX && d->path[0]) {
+        /* Multi-file projects: compile the project's main .tex, not the
+         * chapter/style file currently on screen. */
+        np_tex_detect_root(a, d);
+        const char *compile_path = d->tex_root[0] ? d->tex_root : d->path;
         /* Compile on first open / doc switch only. Subsequent rebuilds are
          * driven by Ctrl+S (np_save resets the job) or the manual button --
          * NOT on every keystroke, per the "save + manual" policy. */
@@ -3055,9 +3227,9 @@ static void np_preview_sync(notepad *a, np_doc *d) {
             np_preview_release_tex_image(a);
             np_tex_job_free(&a->tex_job);       /* join any old worker */
             np_tex_job_init(&a->tex_job);
-            np_tex_compile(&a->tex_job, d->path);
+            np_tex_compile(&a->tex_job, compile_path);
             a->tex_job.content_seen = d->content_rev;
-            snprintf(a->preview_owner, sizeof a->preview_owner, "%s", d->path);
+            snprintf(a->preview_owner, sizeof a->preview_owner, "%s", compile_path);
         }
     } else if (k == NP_PREVIEW_PDF && d->path[0]) {
         if (owner_changed || a->tex_job.state == 0) {
@@ -3506,6 +3678,10 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "新建标签", .icon = CUI_ICON_SQUARE_PEN, .shortcut = "Ctrl N")) {
                     if (np_doc_new(a)) np_activate(a, a->count - 1, true);
                 }
+                if (cui_menu_item(ui, "从 LaTeX 模板新建…", .icon = CUI_ICON_FILE_TEXT)) {
+                    a->latex_tpl_pick = 0;
+                    a->dlg_latex_tpl = true;
+                }
                 if (cui_menu_item(ui, "打开…", .icon = CUI_ICON_FOLDER_OPEN, .shortcut = "Ctrl O"))
                     np_open_dialog(a);
                 cui_menu_separator(ui);
@@ -3644,6 +3820,29 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "打开文件所在目录", .icon = CUI_ICON_FOLDER,
                                   .disabled = !d->path[0]))
                     np_system_open(a, d->path, true);
+                cui_menu_separator(ui);
+                if (cui_menu_item(ui, "指定 LaTeX 主文件…", .icon = CUI_ICON_FILE_TEXT,
+                                  .disabled = !d->path[0])) {
+                    char pick[NP_PATH_CAP] = "";
+                    if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                            .kind = CUI_FILE_OPEN, .title = "选择 LaTeX 主文件（main .tex）",
+                            .filter_name = "LaTeX 文档", .filter = "tex;latex;ltx" },
+                            pick, sizeof pick)) {
+                        snprintf(d->tex_root, sizeof d->tex_root, "%s", pick);
+                        d->tex_root_manual = true;
+                        d->tex_root_probed = true;
+                        snprintf(a->preview_owner, sizeof a->preview_owner, "%s", pick);
+                        np_logf(a, "LaTeX 主文件  %s", pick);
+                        np_toast(a, "已指定主文件", pick, CUI_TONE_SUCCESS);
+                    }
+                }
+                if (cui_menu_item(ui, "清除 LaTeX 主文件绑定",
+                                  .disabled = !d->tex_root[0])) {
+                    d->tex_root[0] = 0;
+                    d->tex_root_manual = false;
+                    d->tex_root_probed = false;
+                    a->preview_owner[0] = 0;   /* force re-detect next frame */
+                }
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "保存时创建 .bak 备份", .checked = a->make_backup))
                     a->make_backup = !a->make_backup;
