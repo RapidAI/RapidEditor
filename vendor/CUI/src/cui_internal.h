@@ -469,7 +469,7 @@ typedef struct cui_toast_item {
 } cui_toast_item;
 
 /* Scope stacks used while building one frame (kept per context). */
-typedef struct cui__popup_build { cui_id id; bool disabled_pushed; bool menu; int item_index; } cui__popup_build;
+typedef struct cui__popup_build { cui_id id; bool disabled_pushed; bool menu; bool scrolled; int item_index; } cui__popup_build;
 typedef struct cui__modal_build { cui_id id; bool disabled_pushed; } cui__modal_build;
 typedef struct cui__vlist_build { int count; float row_h; int first; } cui__vlist_build;
 

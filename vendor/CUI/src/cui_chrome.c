@@ -324,6 +324,20 @@ bool cui_menu_bar_menu_begin(cui_ctx *ui, const char *label, const cui_menu_bar_
     if (p && p->open != open) cui__popup_set(ui, pid, open);
     bool was_open = p && p->open;
     bool shown = cui__popup_begin(ui, pid, tid, CUI_PLACE_BOTTOM_START, o->width, 6, 0, true);
+    if (shown) {
+        /* Long menus (Markdown 段落, LaTeX quick input) have 30+ items and
+         * overflow the popup's 420px cap. Wrap the items in a scroll box so
+         * every entry stays reachable instead of being clipped. */
+        cui_box sb;
+        memset(&sb, 0, sizeof sb);
+        sb.height = CUI_FIT;
+        sb.max_height = 400;
+        cui__scroll_begin_ex(ui, pid ^ 0x5C011u, &sb, false);
+        ui->nodes[cui__current(ui)].h = CUI_FIT;
+        ui->nodes[cui__current(ui)].min_h = 0;
+        cui__popup_build *pb = ui->pb_depth > 0 ? &ui->pb_stack[ui->pb_depth - 1] : NULL;
+        if (pb) pb->scrolled = true;
+    }
     if (was_open && !p->open) cui__bar_menu_closed(ui, st, k);   /* Esc or a click elsewhere */
     st->cur = k;
     st->cur_was_open = p && p->open;
@@ -332,6 +346,8 @@ bool cui_menu_bar_menu_begin(cui_ctx *ui, const char *label, const cui_menu_bar_
 }
 
 void cui_menu_bar_menu_end(cui_ctx *ui) {
+    cui__popup_build *pb = ui->pb_depth > 0 ? &ui->pb_stack[ui->pb_depth - 1] : NULL;
+    if (pb && pb->scrolled) { cui__scroll_end_ex(ui); pb->scrolled = false; }
     cui__popup_end(ui);
     cui__menubar_state *st = cui__slots(ui)->bar;
     if (!st || !st->cur_was_open || st->cur < 0 || st->cur >= CUI__BAR_MAX) return;

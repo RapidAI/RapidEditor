@@ -31,7 +31,7 @@
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.2.3"
+#define NP_APP_VERSION "1.2.4"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -2597,6 +2597,8 @@ static void np_tex_detect_root(notepad *a, np_doc *d) {
 /* Import a LaTeX project distributed as a ZIP (Overleaf/GitHub downloads).
  * Unpack next to the archive into a unique folder, then open its main .tex
  * with tex_root pinned so the multi-file compile pipeline picks it up. */
+static bool np_file_exists(const char *path);  /* defined below; UTF-8 aware */
+
 /* Extract a project ZIP into a fresh sibling folder of `zip`, open its main
  * .tex and wire up the multi-file preview. Shared by the local import dialog
  * and the online template downloader. Returns true on success. */
@@ -2609,25 +2611,27 @@ static bool np_unpack_and_open(notepad *a, const char *zip, const char *stem) {
     if (dot) *dot = 0;
     if (!use_stem[0]) snprintf(use_stem, sizeof use_stem, "latex-project");
 
-    struct stat st;
+    /* np_file_exists is UTF-8 aware on Windows (wide stat). Plain stat()
+     * cannot see a CJK directory and would make every retry reuse a name
+     * that already exists. */
     for (int i = 0; i < 1000; i++) {
         char leaf[NP_PATH_CAP];
         if (i == 0) snprintf(leaf, sizeof leaf, "%s", use_stem);
         else snprintf(leaf, sizeof leaf, "%s-%d", use_stem, i + 1);
         np_dir_join(dest, sizeof dest, dir, leaf);
-        if (stat(dest, &st) != 0) break;
+        if (!np_file_exists(dest)) break;
     }
 #ifdef _WIN32
     {
         wchar_t w[NP_PATH_CAP];
         if (MultiByteToWideChar(CP_UTF8, 0, dest, -1, w, NP_PATH_CAP) <= 0 ||
-            !CreateDirectoryW(w, NULL)) {
+            (!CreateDirectoryW(w, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)) {
             np_toast(a, "导入失败", "无法创建项目目录", CUI_TONE_DANGER);
             return false;
         }
     }
 #else
-    if (mkdir(dest, 0755) != 0 && stat(dest, &st) != 0) {
+    if (mkdir(dest, 0755) != 0 && !np_file_exists(dest)) {
         np_toast(a, "导入失败", "无法创建项目目录", CUI_TONE_DANGER);
         return false;
     }
@@ -2756,7 +2760,15 @@ static void np_start_template_download(notepad *a, const np_online_template *t) 
     char url[NP_PATH_CAP];
     np_online_zip_url(t, url, sizeof url);
     snprintf(a->tpl_dl_url, sizeof a->tpl_dl_url, "%s", url);
-    snprintf(a->tpl_dl_stem, sizeof a->tpl_dl_stem, "%s", t->name);
+    /* Use the ASCII repo name ("tuna/thuthesis" -> "thuthesis") as the
+     * project folder, never the Chinese display name. On Windows the LaTeX
+     * compiler and ZIP writer take ANSI paths; a CJK folder breaks both. */
+    {
+        const char *repo = strrchr(t->full_name, '/');
+        repo = repo ? repo + 1 : t->full_name;
+        if (!repo[0]) repo = t->name;
+        snprintf(a->tpl_dl_stem, sizeof a->tpl_dl_stem, "%s", repo);
+    }
     /* temp zip under the config/side directory */
     char dir[NP_PATH_CAP];
     if (a->side_dir[0]) np_dir_of(a->side_dir, dir, sizeof dir);

@@ -34,6 +34,20 @@ extern size_t cui__inflate(const void *src, size_t src_len, void *dst, size_t ds
 #define NPZ_MAX_FILE    (64u * 1024 * 1024)   /* per-entry uncompressed cap */
 #define NPZ_PATH_CAP    1024
 
+/* All paths in this module are UTF-8. Windows' plain fopen()/stat() use the
+ * process ANSI code page, so a CJK directory (or a CJK filename inside the
+ * archive) silently fails to open. Route file I/O through wide APIs. */
+static FILE *npz_fopen(const char *path, const char *mode) {
+#ifdef _WIN32
+    wchar_t wp[NPZ_PATH_CAP], wm[16];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, NPZ_PATH_CAP) <= 0) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, mode, -1, wm, 16) <= 0) return NULL;
+    return _wfopen(wp, wm);
+#else
+    return fopen(path, mode);
+#endif
+}
+
 typedef struct {
     unsigned method;
     unsigned long comp_size, uncomp_size, local_off;
@@ -136,12 +150,22 @@ static int npz_main_rank(const char *name, const char *text) {
     if (!npz_is_tex(name) || !strstr(text, "\\documentclass")) return 99;
     const char *base = strrchr(name, '/');
     base = base ? base + 1 : name;
-    static const char *preferred[] = { "main", "index", "master", "paper", "thesis", "report", "cv", "resume" };
+    /* Template repos ship dozens of compilable test fixtures. They must not
+     * win over the real entry point just because they appear first in the
+     * ZIP. Same for nested example/sample trees. */
+    if (strstr(name, "/test") || strstr(name, "/example/") ||
+        strstr(name, "/sample") || strstr(name, "/doc/")) return 90;
+    /* Real projects almost always keep the entry .tex at the archive root. */
+    int depth = 0;
+    for (const char *p = name; *p; p++) if (*p == '/') depth++;
+    static const char *preferred[] = { "main", "index", "master", "paper",
+                                       "thesis", "report", "cv", "resume",
+                                       "example", "sample", "demo" };
     for (unsigned i = 0; i < sizeof preferred / sizeof *preferred; i++) {
         size_t l = strlen(preferred[i]);
         if (strncmp(base, preferred[i], l) == 0) return (int)i;
     }
-    return 50;
+    return 50 + depth * 5;
 }
 
 int np_zip_extract(const char *zip_path, const char *dest_dir, bool strip_root,
@@ -152,7 +176,7 @@ int np_zip_extract(const char *zip_path, const char *dest_dir, bool strip_root,
     if (err && err_cap) err[0] = 0;
     if (!zip_path || !dest_dir) { npz_err(err, err_cap, "参数无效"); return -1; }
 
-    FILE *f = fopen(zip_path, "rb");
+    FILE *f = npz_fopen(zip_path, "rb");
     if (!f) { npz_err(err, err_cap, "无法打开 ZIP 文件"); return -1; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); npz_err(err, err_cap, "无法读取 ZIP 文件"); return -1; }
     long fsize = ftell(f);
@@ -301,7 +325,7 @@ int np_zip_extract(const char *zip_path, const char *dest_dir, bool strip_root,
             if (!npz_mkdir_p(outpath)) { *slash = save; npz_err(err, err_cap, "无法创建项目目录"); goto fail; }
             *slash = save;
         }
-        FILE *o = fopen(outpath, "wb");
+        FILE *o = npz_fopen(outpath, "wb");
         if (!o) { npz_err(err, err_cap, "无法写入项目文件"); goto fail; }
         bool ok = (!content_len || fwrite(content, 1, content_len, o) == content_len);
         fclose(o);

@@ -128,6 +128,7 @@ bool cui__popup_begin(cui_ctx *ui, cui_id id, cui_id anchor, int placement, floa
     b->id = id;
     b->menu = menu;
     b->item_index = 0;
+    b->scrolled = false;
     b->disabled_pushed = !p->open;
     if (!p->open) cui_push_disabled(ui, true);
     cui_push_id_int(ui, (int)id);
