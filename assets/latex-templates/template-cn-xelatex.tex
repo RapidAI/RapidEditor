@@ -1,0 +1,30 @@
+%!TEX TS-program = xelatex
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\usepackage{hyperref}
+
+\title{中文文档模板}
+\author{你的名字}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{简介}
+这是一个中文 \LaTeX{} 模板，使用 \texttt{xelatex} 编译，支持中文与数学公式。
+
+\section{数学公式}
+行内公式如 $E = mc^2$，独立公式：
+\begin{equation}
+    \int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi}
+\end{equation}
+
+\section{列表}
+\begin{itemize}
+    \item 第一项
+    \item 第二项
+\end{itemize}
+
+\end{document}
