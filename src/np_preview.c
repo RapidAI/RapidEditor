@@ -312,9 +312,8 @@ static void pv_tex_worker(void *arg) {
     np_tex_job *j = ctx->job;
 
     char log_path[NP_PV_PATH_CAP];
-    char qdir[NP_PV_PATH_CAP * 2], qlog[NP_PV_PATH_CAP * 2];
+    char qlog[NP_PV_PATH_CAP * 2];
     snprintf(log_path, sizeof log_path, "%s/rapideditor-tex.log", j->work_dir);
-    pv_quote(j->work_dir, qdir, sizeof qdir);
     pv_quote(log_path, qlog, sizeof qlog);
 
     int pages = 0;
@@ -330,7 +329,13 @@ static void pv_tex_worker(void *arg) {
             snprintf(j->log, sizeof j->log, "找不到 PDF 文件：%s", pdf);
     } else {
         char qtex[NP_PV_PATH_CAP * 2];
-        pv_quote(j->tex_path, qtex, sizeof qtex);
+        /* TeX parses its command line in "extended mode": the input filename
+         * is read as TeX tokens, so any backslash in a Windows path (e.g.
+         * \Awesome, \WorkBuddy) becomes an undefined control sequence and the
+         * compile fails with "No pages of output". We already cd into the
+         * project's work directory below, so hand the engine only the bare
+         * file name -- never an absolute path. */
+        pv_quote(pv_base(j->tex_path), qtex, sizeof qtex);
 
         /* Make an app-private TinyTeX (if installed) visible to child
          * processes: pdflatex/xelatex and tlmgr are resolved from PATH. */
@@ -362,14 +367,17 @@ static void pv_tex_worker(void *arg) {
 #else
             const char *cd = "cd";
 #endif
-            /* Two passes so cross-references and the TOC settle. */
+            /* Two passes so cross-references and the TOC settle. Already cwd
+             * = work_dir, so the engine writes PDF/SyncTeX right next to the
+             * source; no -output-directory (which would need a path token the
+             * TeX command line cannot parse safely on Windows). */
             snprintf(cmd, sizeof cmd,
-                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 -output-directory=%s %s > %s 2>&1",
-                     cd, qcwd, engine, qdir, qtex, qlog);
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 %s > %s 2>&1",
+                     cd, qcwd, engine, qtex, qlog);
             pv_run(cmd);
             snprintf(cmd, sizeof cmd,
-                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 -output-directory=%s %s >> %s 2>&1",
-                     cd, qcwd, engine, qdir, qtex, qlog);
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 %s >> %s 2>&1",
+                     cd, qcwd, engine, qtex, qlog);
             pv_run(cmd);
 
             snprintf(pdf, sizeof pdf, "%s.pdf", j->base);
