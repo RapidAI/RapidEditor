@@ -1308,6 +1308,123 @@ static void np_insert_at_caret(notepad *a, const char *ins) {
     cui_code_editor_select(a->ui, d->editor_id, s0 + (int)ilen, s0 + (int)ilen);
 }
 
+/* LaTeX paragraph menu: wrap the current selection (or insert a template) with
+ * a structural command. `%s` in `fmt` is replaced by the selected text; without
+ * a selection the placeholder becomes an empty `{}` and the caret lands inside. */
+static void np_latex_wrap(notepad *a, const char *fmt) {
+    np_doc *d = np_cur(a);
+    if (!d) return;
+    int len = d->len;
+    int s0 = NP_MIN(d->caret, d->anchor), s1 = NP_MAX(d->caret, d->anchor);
+    s0 = NP_MAX(0, NP_MIN(s0, len)); s1 = NP_MAX(s0, NP_MIN(s1, len));
+    int sel_len = s1 - s0;
+    const char *ph = strstr(fmt, "%s");
+    const char *before = fmt;
+    char after[128] = {0};
+    size_t before_len = ph ? (size_t)(ph - fmt) : strlen(fmt);
+    if (ph) snprintf(after, sizeof after, "%s", ph + 2);
+
+    /* Build: before + [selection] + after. Caret returns to right after the
+     * inserted body so typing continues inside the command. */
+    char buf[1024];
+    size_t need = before_len + (size_t)sel_len + strlen(after) + 1;
+    if (need > sizeof buf) { np_toast(a, "内容过长", "选区太大，无法套用格式", CUI_TONE_WARNING); return; }
+    memcpy(buf, before, before_len);
+    if (sel_len) memcpy(buf + before_len, d->text + s0, (size_t)sel_len);
+    memcpy(buf + before_len + (size_t)sel_len, after, strlen(after) + 1);
+
+    size_t ilen = strlen(buf);
+    if (!np_ensure_cap(d, (size_t)(len - sel_len) + ilen + 1)) {
+        np_toast(a, "文本已满", "已达到 256 MB 上限", CUI_TONE_WARNING); return;
+    }
+    memmove(d->text + s0 + ilen, d->text + s1, (size_t)(len - s1) + 1);
+    memcpy(d->text + s0, buf, ilen);
+    np_text_changed(a, d);
+    int caret = s0 + (int)before_len + sel_len;
+    cui_code_editor_select(a->ui, d->editor_id, caret, caret);
+}
+
+/* Insert a whole block (environment, list, table) at the caret. */
+static void np_latex_block(notepad *a, const char *text) {
+    np_insert_at_caret(a, text);
+}
+
+/* Whether the active document is a LaTeX source (by extension or by content
+ * for untitled buffers) — drives the visibility of the LaTeX menu. */
+static bool np_doc_is_latex(const np_doc *d) {
+    if (!d || d->is_hex) return false;
+    if (d->path[0]) {
+        const char *dot = strrchr(d->path, '.');
+        if (dot && np_preview_detect(d->path) == NP_PREVIEW_LATEX) return true;
+        if (dot && np_ext_in("cls;sty;bib;bst;aux", dot + 1)) return true;
+        return false;
+    }
+    return d->len > 0 && (strstr(d->text, "\\documentclass") ||
+                          strstr(d->text, "\\begin{document}"));
+}
+
+/* One LaTeX quick-insert entry. kind 0 = wrap selection with a command using
+ * %s as the body placeholder, 1 = insert a literal block at the caret. */
+typedef struct {
+    const char *label;
+    const char *shortcut;
+    int  kind;
+    const char *text;
+} np_latex_snip;
+
+#define NP_LS_WRAP 0
+#define NP_LS_BLOCK 1
+static const np_latex_snip NP_LATEX_SNIPS[] = {
+    { "一级标题 \\section",       NULL, NP_LS_WRAP,  "\\section{%s}" },
+    { "二级标题 \\subsection",    NULL, NP_LS_WRAP,  "\\subsection{%s}" },
+    { "三级标题 \\subsubsection", NULL, NP_LS_WRAP,  "\\subsubsection{%s}" },
+    { "四级标题 \\paragraph",     NULL, NP_LS_WRAP,  "\\paragraph{%s}" },
+    { "加粗 \\textbf",     NULL, NP_LS_WRAP, "\\textbf{%s}" },
+    { "斜体 \\emph",       NULL, NP_LS_WRAP, "\\emph{%s}" },
+    { "下划线 \\underline",NULL, NP_LS_WRAP, "\\underline{%s}" },
+    { "等宽 \\texttt",     NULL, NP_LS_WRAP, "\\texttt{%s}" },
+    { "行内公式 $...$",    NULL, NP_LS_WRAP, "$%s$" },
+    { "引用 \\cite",       NULL, NP_LS_WRAP, "\\cite{%s}" },
+    { "交叉引用 \\ref",    NULL, NP_LS_WRAP, "\\ref{%s}" },
+    { "标签 \\label",      NULL, NP_LS_WRAP, "\\label{%s}" },
+    { "超链接 \\href",     NULL, NP_LS_WRAP, "\\href{https://}{%s}" },
+    { "强调式公式块", NULL, NP_LS_BLOCK,
+      "\\[\n\t%s\n\\]\n" },
+    { "行间公式 equation", NULL, NP_LS_BLOCK,
+      "\\begin{equation}\n\t%s\n\\label{eq:}\n\\end{equation}\n" },
+    { "多行公式 align", NULL, NP_LS_BLOCK,
+      "\\begin{align}\n\t%s &= \\\\\n\t\n\\end{align}\n" },
+    { "无序列表 itemize", NULL, NP_LS_BLOCK,
+      "\\begin{itemize}\n\t\\item %s\n\\end{itemize}\n" },
+    { "有序列表 enumerate", NULL, NP_LS_BLOCK,
+      "\\begin{enumerate}\n\t\\item %s\n\\end{enumerate}\n" },
+    { "表格 tabular", NULL, NP_LS_BLOCK,
+      "\\begin{table}[htbp]\n\t\\centering\n\t\\begin{tabular}{lcr}\n\t\t%s &  & \\\\\n\t\t &  & \\\\\n\t\\end{tabular}\n\t\\caption{}\n\t\\label{tab:}\n\\end{table}\n" },
+    { "图片 figure", NULL, NP_LS_BLOCK,
+      "\\begin{figure}[htbp]\n\t\\centering\n\t\\includegraphics[width=0.8\\linewidth]{}\n\t\\caption{%s}\n\t\\label{fig:}\n\\end{figure}\n" },
+    { "定理 theorem", NULL, NP_LS_BLOCK,
+      "\\begin{theorem}\n\t%s\n\\end{theorem}\n" },
+    { "证明 proof", NULL, NP_LS_BLOCK,
+      "\\begin{proof}\n\t%s\n\\end{proof}\n" },
+    { "代码块 verbatim", NULL, NP_LS_BLOCK,
+      "\\begin{verbatim}\n%s\n\\end{verbatim}\n" },
+    { "算法块 algorithm", NULL, NP_LS_BLOCK,
+      "\\begin{algorithm}\n\t\\caption{}\n\t\\begin{algorithmic}[1]\n\t\t%s\n\t\\end{algorithmic}\n\\end{algorithm}\n" },
+    { "参考文献段 thebibliography", NULL, NP_LS_BLOCK,
+      "\\begin{thebibliography}{99}\n\t\\bibitem{key} %s\n\\end{thebibliography}\n" },
+    { "注释 %", NULL, NP_LS_WRAP, "%% %s" },
+    { "强制换行 \\\\", NULL, NP_LS_BLOCK, "\\\\\n" },
+    { "分页 \\newpage", NULL, NP_LS_BLOCK, "\\newpage\n" },
+};
+#define NP_LATEX_SNIP_COUNT ((int)(sizeof NP_LATEX_SNIPS / sizeof NP_LATEX_SNIPS[0]))
+
+static void np_apply_latex_snip(notepad *a, int i) {
+    if (i < 0 || i >= NP_LATEX_SNIP_COUNT) return;
+    const np_latex_snip *s = &NP_LATEX_SNIPS[i];
+    if (s->kind == NP_LS_WRAP) np_latex_wrap(a, s->text);
+    else np_latex_block(a, s->text);
+}
+
 static void np_open_find(notepad *a) {
     np_doc *d = np_cur(a);
     if (!d) return;
@@ -4051,6 +4168,23 @@ static void np_frame(cui_ctx *ui, void *user) {
                     d->lang = np_detect_lang(d->path, d->text);
                     d->lang_manual = false;
                 }
+                }
+            }
+
+            /* LaTeX quick input: shows only while editing a TeX source. */
+            if (np_doc_is_latex(d)) {
+                cui_menu_bar_menu(ui, "LaTeX") {
+                    cui_menu_label(ui, "选中文字后套用格式，否则插入占位模板");
+                    for (int i = 0; i < NP_LATEX_SNIP_COUNT; i++) {
+                        const np_latex_snip *s = &NP_LATEX_SNIPS[i];
+                        if (cui_menu_item(ui, s->label, .shortcut = s->shortcut))
+                            np_apply_latex_snip(a, i);
+                    }
+                    cui_menu_separator(ui);
+                    if (cui_menu_item(ui, "LaTeX 模板新建…", .icon = CUI_ICON_FILE_TEXT)) {
+                        a->latex_tpl_pick = 0;
+                        a->dlg_latex_tpl = true;
+                    }
                 }
             }
 
