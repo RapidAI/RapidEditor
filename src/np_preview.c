@@ -7,6 +7,7 @@
  */
 #include "np_preview.h"
 #include "np_tinytex.h"
+#include "np_synctex.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -253,6 +254,12 @@ static int pv_render_pdf(np_tex_job *j, const char *pdf, const char *base,
                         n = atoi(line + 6);
                         break;
                     }
+                    if (strncmp(line, "Page size:", 10) == 0) {
+                        float w = 0, h = 0;
+                        if (sscanf(line + 10, "%f x %f", &w, &h) == 2 && w > 0 && h > 0) {
+                            j->page_w = w; j->page_h = h;
+                        }
+                    }
                 }
                 fclose(f);
             }
@@ -357,11 +364,11 @@ static void pv_tex_worker(void *arg) {
 #endif
             /* Two passes so cross-references and the TOC settle. */
             snprintf(cmd, sizeof cmd,
-                     "%s %s && %s -interaction=nonstopmode -halt-on-error -output-directory=%s %s > %s 2>&1",
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 -output-directory=%s %s > %s 2>&1",
                      cd, qcwd, engine, qdir, qtex, qlog);
             pv_run(cmd);
             snprintf(cmd, sizeof cmd,
-                     "%s %s && %s -interaction=nonstopmode -halt-on-error -output-directory=%s %s >> %s 2>&1",
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 -output-directory=%s %s >> %s 2>&1",
                      cd, qcwd, engine, qdir, qtex, qlog);
             pv_run(cmd);
 
@@ -376,6 +383,11 @@ static void pv_tex_worker(void *arg) {
     }
 
     if (pages > 0) {
+        if (ctx->mode == 0) {
+            char stx_path[NP_PV_PATH_CAP];
+            snprintf(stx_path, sizeof stx_path, "%s.synctex", j->base);
+            j->synctex = np_synctex_load(stx_path);
+        }
         j->pages = pages;
         j->state = 2;
     } else {
@@ -453,8 +465,22 @@ int np_tex_render_pdf(np_tex_job *job, const char *pdf_path) {
     return pv_tex_start(job, 1);
 }
 
+int  np_tex_locate_source(np_tex_job *job, int page, float x, float y,
+                          char *file, size_t file_cap, int *line) {
+    if (!job || !job->synctex) return 0;
+    int col = 1;
+    int ok = np_synctex_locate((np_synctex *)job->synctex, page, x, y,
+                               file, file_cap, line, &col);
+    return ok;
+}
+
 void np_tex_job_free(np_tex_job *job) {
-    if (!job || !job->opaque) return;
+    if (!job) return;
+    if (job->synctex) {
+        np_synctex_free((np_synctex *)job->synctex);
+        job->synctex = NULL;
+    }
+    if (!job->opaque) return;
     pv_tex_ctx *ctx = (pv_tex_ctx *)job->opaque;
 #ifdef _WIN32
     if (ctx->th) {
@@ -499,6 +525,27 @@ static void pv_url_decode(const char *in, char *out, size_t cap) {
         }
     }
     out[j] = 0;
+}
+
+/* Pull one key=value pair out of a URL query, stopping at '&'. */
+static void pv_query_value(const char *query, const char *key, char *out, size_t cap) {
+    out[0] = 0;
+    if (!query || !key) return;
+    size_t kl = strlen(key);
+    for (const char *p = query; *p; ) {
+        const char *end = strchr(p, '&');
+        if (!end) end = p + strlen(p);
+        if ((size_t)(end - p) > kl && !strncmp(p, key, kl) && p[kl] == '=') {
+            size_t n = (size_t)(end - p) - kl - 1;
+            char tmp[NP_PV_PATH_CAP];
+            if (n >= sizeof tmp) n = sizeof tmp - 1;
+            memcpy(tmp, p + kl + 1, n);
+            tmp[n] = 0;
+            pv_url_decode(tmp, out, cap);
+            return;
+        }
+        p = *end ? end + 1 : end;
+    }
 }
 
 static const char *pv_mime(const char *path) {
@@ -560,17 +607,35 @@ static void pv_http_serve(pv_http_ctx *ctx) {
 #endif
         } while (got > 0 && !strstr(req, "\r\n\r\n") && strlen(req) < sizeof req - 1);
 
-        char path[NP_PV_PATH_CAP], full[NP_PV_PATH_CAP];
+        char path[NP_PV_PATH_CAP], full[NP_PV_PATH_CAP], query[NP_PV_PATH_CAP];
+        path[0] = full[0] = query[0] = 0;
         if (strncmp(req, "GET ", 4) == 0) {
             const char *sp = strchr(req + 4, ' ');
             size_t tok = sp ? (size_t)(sp - (req + 4)) : strlen(req + 4);
             char raw[NP_PV_PATH_CAP];
             if (tok >= sizeof raw) tok = sizeof raw - 1;
             memcpy(raw, req + 4, tok); raw[tok] = 0;
+            const char *qm = strchr(raw, '?');
+            if (qm) {
+                size_t ql = strlen(qm + 1);
+                if (ql >= sizeof query) ql = sizeof query - 1;
+                memcpy(query, qm + 1, ql);
+                query[ql] = 0;
+                *(char *)qm = 0;
+            }
             pv_url_decode(raw, path, sizeof path);
-        } else {
-            path[0] = 0;
         }
+
+        /* The embedded WebView reports clicked text here so the editor can
+         * jump to the corresponding markup. Never served from disk. */
+        if (!strncmp(path, "/__np_click", 11)) {
+            pv_query_value(query, "t", ctx->server->click_text,
+                           sizeof ctx->server->click_text);
+            ctx->server->click_pending = 1;
+            pv_send(ci, "204 No Content", "text/plain; charset=utf-8", "", 0);
+            goto next;
+        }
+
         if (!path[0] || strcmp(path, "/") == 0)
             snprintf(path, sizeof path, "/index.html");
 
@@ -589,6 +654,30 @@ static void pv_http_serve(pv_http_ctx *ctx) {
             char *buf = (char *)malloc(sz > 0 ? (size_t)sz : 1);
             if (buf) {
                 size_t nr = fread(buf, 1, (size_t)sz, f);
+                bool html = pv_ieq(pv_mime(full), "text/html; charset=utf-8") ||
+                            pv_ieq(pv_mime(full), "text/html");
+                static const char inject[] =
+                    "<script>(function(){"
+                    "function send(e){"
+                    "var n=e,c='';"
+                    "while(n&&n!==document.body){"
+                    "var t=(n.textContent||'').trim();"
+                    "if(t.length>=2&&t.length<=240){c=t;"
+                    "if(n.matches&&n.matches('td,th,p,li,h1,h2,h3,h4,h5,h6,pre,code'))break;}"
+                    "n=n.parentElement;}"
+                    "if(!c)c=(document.body.textContent||'').trim().slice(0,240);"
+                    "if(c)fetch('/__np_click?t='+encodeURIComponent(c));}"
+                    "document.addEventListener('click',send,true);"
+                    "})();</script>";
+                if (html) {
+                    size_t need = nr + sizeof inject;
+                    char *out = (char *)realloc(buf, need);
+                    if (out) {
+                        buf = out;
+                        memcpy(buf + nr, inject, sizeof inject);
+                        nr += sizeof inject - 1;
+                    }
+                }
                 pv_send(ci, "200 OK", pv_mime(full), buf, (long)nr);
                 free(buf);
             } else {
@@ -600,6 +689,7 @@ static void pv_http_serve(pv_http_ctx *ctx) {
             const char *msg = "<!doctype html><meta charset=utf-8><title>404</title><h1>404 Not Found</h1>";
             pv_send(ci, "404 Not Found", "text/html; charset=utf-8", msg, (long)strlen(msg));
         }
+next:
 #ifdef _WIN32
         closesocket(c);
 #else
@@ -615,6 +705,14 @@ void np_http_init(np_http_server *s) {
 
 int np_http_running(const np_http_server *s) { return s ? s->state == 1 : 0; }
 
+int np_http_take_click(np_http_server *s, char *buf, size_t cap) {
+    if (!s || !buf || cap == 0 || !s->click_pending) return 0;
+    snprintf(buf, cap, "%s", s->click_text);
+    s->click_pending = 0;
+    s->click_text[0] = 0;
+    return 1;
+}
+
 static void pv_http_worker(void *arg) {
     pv_http_ctx *ctx = (pv_http_ctx *)arg;
     pv_http_serve(ctx);
@@ -626,6 +724,8 @@ static void pv_http_worker(void *arg) {
 int np_http_start(np_http_server *s, const char *root_dir) {
     if (!s || s->state == 1) return s ? s->port : 0;
     snprintf(s->root, sizeof s->root, "%s", root_dir ? root_dir : ".");
+    s->click_text[0] = 0;
+    s->click_pending = 0;
 
     pv_http_ctx *ctx = (pv_http_ctx *)calloc(1, sizeof *ctx);
     if (!ctx) return 0;

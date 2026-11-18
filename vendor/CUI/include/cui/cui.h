@@ -1681,6 +1681,8 @@ typedef struct cui_markdown_result {
     int task_offset;           /* a task box was toggled: byte offset in text of the character between its brackets, else -1 */
     int task_line;             /* that item's 1 based line in text, 0 when none */
     bool task_checked;         /* the state the box was toggled to */
+    int source_offset;         /* a text block was clicked: byte range in the source text, else -1 */
+    int source_end;            /* exclusive end of that range */
     float height;              /* height of the view in the latest layout */
 } cui_markdown_result;
 CUI_API cui_markdown_result cui_markdown_ex(cui_ctx *ui, const char *id, const char *text, const cui_markdown_opts *opts);

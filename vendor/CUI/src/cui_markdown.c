@@ -68,7 +68,12 @@ static bool md_has(md_line L, char c) { return L.len > 0 && memchr(L.s, c, (size
 enum { MS_STRONG = 1, MS_EM = 2, MS_STRIKE = 4, MS_CODE = 8, MS_BREAK = 16, MS_MATH = 32 };
 typedef struct { const char *p; int len; uint8_t style; int link; } md_run;
 typedef struct { const char *url; int len; bool www, pending, autolink; } md_link;
-typedef struct { md_run *runs; int nruns; md_link *links; int nlinks; } md_inline;
+typedef struct {
+    md_run *runs; int nruns; md_link *links; int nlinks;
+    const char *base; int base_len;         /* buffer handed to the parser */
+    const char *src; int src_len;           /* whole markdown source */
+    const int *srcmap;                      /* base byte -> source byte, or NULL */
+} md_inline;
 
 enum { TK_TXT, TK_DELIM, TK_CODE, TK_BR, TK_LOPEN, TK_LCLOSE, TK_AUTO, TK_MATH };
 typedef struct {
@@ -1301,9 +1306,12 @@ static int md_math_span(const char *s, int n, int at) {
 
 /* Parses inline markdown into styled runs. tail: the text is still arriving
  * and this is its end, so unclosed markers render as if closed. */
-static md_inline md_parse_inline(cui_ctx *ui, const char *s, int n, bool tail) {
+static md_inline md_parse_inline(cui_ctx *ui, const char *s, int n, bool tail,
+                                 const int *srcmap, const char *src, int src_len) {
     md_inline out;
     memset(&out, 0, sizeof out);
+    out.base = s; out.base_len = n; out.srcmap = srcmap;
+    out.src = src; out.src_len = src_len;
     if (n <= 0) return out;
     int specials = 0;
     for (int i = 0; i < n; i++) {
@@ -1571,7 +1579,7 @@ typedef struct {
     float pad;                   /* inline code: padding inside its tint */
 } md_font;
 
-typedef struct { const char *p; int len; float x, w; int line, run, link; uint8_t style, lead; } md_seg;
+typedef struct { const char *p; int len; float x, w; int line, run, link; int src_off; uint8_t style, lead; } md_seg;
 typedef struct { md_seg *seg; int n, cap; int lines; float widest; } md_lay;
 
 static cui_font md_font_of(const md_font *f, int style) { return (style & MS_CODE) ? f->mono : (style & MS_STRONG) ? f->bold : f->reg; }
@@ -1597,9 +1605,22 @@ static float md_runs_width(cui_ctx *ui, const md_inline *in, const md_font *f) {
 
 static void md_seg_add(cui_ctx *ui, md_lay *L, const md_inline *in, int run, const char *p, int len, float x, float w) {
     const md_run *R = &in->runs[run];
+    int off = -1;
+    if (in->srcmap) {
+        if (p >= in->base) {
+            int idx = (int)(p - in->base);
+            if (idx >= 0 && idx < in->base_len) off = in->srcmap[idx];
+        }
+    } else if (in->src && p >= in->src && p + len <= in->src + in->src_len) {
+        off = (int)(p - in->src);
+    }
     if (L->n > 0) {
         md_seg *q = &L->seg[L->n - 1];
-        if (q->line == L->lines && q->run == run && q->p + q->len == p) { q->len += len; q->w = x + w - q->x; return; }
+        bool contiguous_src = (q->src_off >= 0 && off >= 0 && q->src_off + q->len == off) ||
+                              (q->src_off < 0 && off < 0);
+        if (q->line == L->lines && q->run == run && q->p + q->len == p && contiguous_src) {
+            q->len += len; q->w = x + w - q->x; return;
+        }
     }
     if (L->n == L->cap) {
         int ncap = L->cap ? L->cap * 2 : 32;
@@ -1609,6 +1630,7 @@ static void md_seg_add(cui_ctx *ui, md_lay *L, const md_inline *in, int run, con
     }
     md_seg *s = &L->seg[L->n++];
     s->p = p; s->len = len; s->x = x; s->w = w; s->line = L->lines; s->run = run; s->link = R->link;
+    s->src_off = off;
     s->style = R->style; s->lead = (R->style & MS_CODE) && p == R->p;
 }
 
@@ -1797,7 +1819,7 @@ typedef struct {
     float body;                  /* unscaled body size */
     float u;                     /* spacing unit: body / 13 */
     cui_color fg, fg2, link_c, code_bg, marker_c, rule_c, rail_c;
-    int link_seq, code_seq, table_seq;
+    int link_seq, code_seq, table_seq, source_seq;
     cui_markdown_result *res;
 } md_ctx;
 
@@ -1833,6 +1855,24 @@ static float md_gap_before(md_ctx *c, const md_box *b, int prev, int kind, int l
 }
 
 static cui_id md_link_id(md_ctx *c, int seq) { return cui__hash(&seq, sizeof seq, c->id ^ 0x3D11Au); }
+static cui_id md_source_id(md_ctx *c, int seq) { return cui__hash(&seq, sizeof seq, c->id ^ 0x5C0CEu); }
+
+/* Segment under a point inside the inline block; falls back to the nearest
+ * segment on the nearest line so clicks in the margins still select text. */
+static const md_seg *md_seg_at(const md_lay *L, const md_font *f, float lx, float ly) {
+    const md_seg *best = NULL;
+    float bd = 1e30f;
+    for (int q = 0; q < L->n; q++) {
+        const md_seg *s = &L->seg[q];
+        float top = (float)s->line * f->lh;
+        float dx = lx < s->x ? s->x - lx : lx > s->x + s->w ? lx - (s->x + s->w) : 0;
+        float dy = ly < top ? top - ly : ly > top + f->lh ? ly - (top + f->lh) : 0;
+        float d = dx + dy * 1.5f;
+        if (s->src_off < 0) d += 1000.0f;
+        if (d < bd) { bd = d; best = s; }
+    }
+    return best;
+}
 
 /* Builds a laid out inline block: one painted node, a hit box per link piece. */
 static float md_inline_emit(md_ctx *c, const md_inline *in, const md_font *f, cui_color fg, int align, float W) {
@@ -1871,6 +1911,16 @@ static float md_inline_emit(md_ctx *c, const md_inline *in, const md_font *f, cu
     p->underline_rest = c->custom_color;
     ui->nodes[leaf].paint = md_paint_inline;
     ui->nodes[leaf].paint_data = p;
+
+    /* Whole-block hit region for preview -> source synchronization. Marked
+     * before the link pieces so a link click still wins where they overlap. */
+    cui_id sid = md_source_id(c, c->source_seq++);
+    cui_interact sr = cui__interact(ui, sid, 0);
+    cui_rect sbox = cui__prev_rect(ui, sid);
+    int sabs = cui__absolute(ui, sid, 0, 0, CUI_MAX(W, 24.0f),
+                             CUI_MAX(1.0f, (float)L.lines * f->lh));
+    cui__mark_interactive(ui, sabs, 0);
+
     if (in->nlinks > 0) {
         cui__open(ui, leaf);
         for (int q = 0; q < L.n; q++) {
@@ -1883,16 +1933,26 @@ static float md_inline_emit(md_ctx *c, const md_inline *in, const md_font *f, cu
         }
         cui__close(ui);
     }
+    if (sr.clicked && !c->res->link && c->res->source_offset < 0 && sbox.w > 0) {
+        float lx = ui->mx - sbox.x, ly = ui->my - sbox.y;
+        const md_seg *s = md_seg_at(&L, f, lx, ly);
+        if (s && s->src_off >= 0) {
+            c->res->source_offset = s->src_off;
+            c->res->source_end = CUI_MIN(c->len, s->src_off + s->len);
+        }
+    }
     return c->fit ? md_runs_width(ui, in, f) : 0;
 }
 
-static float md_inline_block(md_ctx *c, const char *s, int n, const md_font *f, cui_color fg, bool tail, float W) {
-    md_inline in = md_parse_inline(c->ui, s, n, tail);
+static float md_inline_block(md_ctx *c, const char *s, int n, const int *srcmap,
+                             const md_font *f, cui_color fg, bool tail, float W) {
+    md_inline in = md_parse_inline(c->ui, s, n, tail, srcmap, c->src, c->len);
     return md_inline_emit(c, &in, f, fg, CUI_TEXT_LEFT, W);
 }
 
 /* Joins paragraph lines: soft breaks become spaces, hard breaks '\n'. */
-static const char *md_join(md_ctx *c, const md_line *L, int n, int *out_len) {
+static const char *md_join(md_ctx *c, const md_line *L, int n, int *out_len, int **out_map) {
+    *out_map = NULL;
     if (n == 1) {
         md_line T = md_trim(L[0]);
         *out_len = T.len;
@@ -1901,6 +1961,7 @@ static const char *md_join(md_ctx *c, const md_line *L, int n, int *out_len) {
     int total = n;
     for (int k = 0; k < n; k++) total += L[k].len;
     char *buf = cui__frame_alloc(c->ui, (size_t)total + 1);
+    int *map = cui__frame_alloc(c->ui, sizeof(int) * (size_t)(total + 1));
     int o = 0;
     for (int k = 0; k < n; k++) {
         int b;
@@ -1914,22 +1975,30 @@ static const char *md_join(md_ctx *c, const md_line *L, int n, int *out_len) {
             else if (sp == 0 && e > 0 && T.s[e - 1] == '\\') { hard = true; e--; }
         }
         memcpy(buf + o, T.s, (size_t)e);
+        for (int q = 0; q < e; q++) map[o + q] = T.off + q;
         o += e;
-        if (!last) buf[o++] = hard ? '\n' : ' ';
+        if (!last) {
+            map[o] = T.off + T.len;
+            buf[o++] = hard ? '\n' : ' ';
+        }
     }
     buf[o] = 0;
+    map[o] = c->len;
     *out_len = o;
+    *out_map = map;
     return buf;
 }
 
 static float md_paragraph(md_ctx *c, const md_box *b, const md_line *L, int n) {
     int len;
-    const char *s = md_join(c, L, n, &len);
+    int *map = NULL;
+    const char *s = md_join(c, L, n, &len, &map);
     md_font f = md_body(c);
-    return md_inline_block(c, s, len, &f, b->fg, md_tail(c, L[n - 1]), b->w);
+    return md_inline_block(c, s, len, map, &f, b->fg, md_tail(c, L[n - 1]), b->w);
 }
 
-static float md_heading(md_ctx *c, const md_box *b, int level, const char *s, int len, bool tail) {
+static float md_heading(md_ctx *c, const md_box *b, int level, const char *s, int len,
+                        const int *srcmap, bool tail) {
     cui_theme *t = &c->ui->theme;
     float scale = c->body / t->text_body;
     float size;
@@ -1938,7 +2007,7 @@ static float md_heading(md_ctx *c, const md_box *b, int level, const char *s, in
     size *= scale;
     cui_font font = size >= 26 ? CUI_FONT_DISPLAY : CUI_FONT_MEDIUM;
     md_font f = md_make_font(c, size, font, font, size >= 26 ? 1.2f : 1.35f);
-    return md_inline_block(c, s, len, &f, level >= 6 ? c->fg2 : b->fg, tail, b->w);
+    return md_inline_block(c, s, len, srcmap, &f, level >= 6 ? c->fg2 : b->fg, tail, b->w);
 }
 
 static void md_lower(char *d, const char *s, int n) {
@@ -3082,7 +3151,8 @@ static int md_table(md_ctx *c, const md_box *b, const md_line *L, int n, int i, 
         bool tail = r == nrows && md_tail(c, R);
         for (int k = 0; k < rowc[r]; k++) {
             md_inline *in = &cells[r * ncols + k];
-            *in = md_parse_inline(ui, raw[k].s, raw[k].len, tail && k == rowc[r] - 1);
+            *in = md_parse_inline(ui, raw[k].s, raw[k].len, tail && k == rowc[r] - 1,
+                                  NULL, c->src, c->len);
             float w = md_runs_width(ui, in, r == 0 ? &hf : &f);
             if (r == 0) { floor_w[k] = w + 16; colw[k] = w + 16; }
             else colw[k] = CUI_MAX(colw[k], w + 16);
@@ -3205,7 +3275,7 @@ static float md_blocks(md_ctx *c, const md_line *L, int n, const md_box *b) {
             i = j < n ? j + 1 : n;
         } else if (md_atx(T, &level, &content)) {
             md_space(c, md_gap_before(c, b, prev, BK_HEADING, level));
-            w = md_heading(c, b, level, content.s, content.len, md_tail(c, Li));
+            w = md_heading(c, b, level, content.s, content.len, NULL, md_tail(c, Li));
             prev = BK_HEADING;
             i++;
         } else if (md_hrule(T)) {
@@ -3240,9 +3310,10 @@ static float md_blocks(md_ctx *c, const md_line *L, int n, const md_box *b) {
                 i = j + 1;
             } else if (setext) {
                 int len;
-                const char *s = md_join(c, L + i, j - i, &len);
+                int *map = NULL;
+                const char *s = md_join(c, L + i, j - i, &len, &map);
                 md_space(c, md_gap_before(c, b, prev, BK_HEADING, setext));
-                w = md_heading(c, b, setext, s, len, false);
+                w = md_heading(c, b, setext, s, len, map, false);
                 prev = BK_HEADING;
                 i = j + 1;
             } else {
@@ -3268,6 +3339,8 @@ cui_markdown_result cui_markdown_ex(cui_ctx *ui, const char *id_str, const char 
     cui_markdown_result res;
     memset(&res, 0, sizeof res);
     res.task_offset = -1;
+    res.source_offset = -1;
+    res.source_end = -1;
     if (!text) text = "";
     if (!id_str) id_str = "markdown";
     int len = o->length > 0 ? o->length : (int)strlen(text);

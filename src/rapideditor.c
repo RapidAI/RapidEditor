@@ -31,7 +31,7 @@
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.2.2"
+#define NP_APP_VERSION "1.2.3"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -308,7 +308,7 @@ typedef struct notepad {
     volatile long tpl_dl_done;          /* 0 running, 1 ok, 2 error, 3 cancelled */
     bool tpl_dl_busy;
 
-    bool dlg_update;                    /* Android: check GitHub Releases */
+    bool dlg_update;                    /* Online update: check GitHub Releases */
     char update_buf[512];               /* scratch lines for the update dialog */
     int  upd_last_check, upd_last_dl;   /* poll caches: request redraw on flip */
     char find_query[256];
@@ -438,7 +438,6 @@ static bool np_any_dialog(const notepad *a) {
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex;
 }
 
-#ifdef __ANDROID__
 /* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
  * Unknown shapes (letters beyond the v prefix) fall back to inequality. */
 static bool np_update_tag_is_newer(const char *tag) {
@@ -454,7 +453,6 @@ static bool np_update_tag_is_newer(const char *tag) {
         if (lat[i] != cur[i]) return lat[i] > cur[i];
     return false;
 }
-#endif
 
 static np_doc *np_cur(notepad *a) {
     if (a->count == 0) return NULL;
@@ -2383,29 +2381,29 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
-#ifdef __ANDROID__
     /* Software update: poll the np_updater state machine each frame. The
-     * network and the installer run in Java threads; the dialog just mirrors
-     * their state. */
-    cui_dialog(ui, "检查更新", &a->dlg_update,
-               .description = "从 GitHub Releases 获取 RapidEditor 最新版", .width = 440) {
+     * network and the installer run on a worker thread; the dialog just
+     * mirrors their state. */
+    cui_dialog(ui, "在线更新", &a->dlg_update,
+               .description = "从 GitHub Releases 获取 RapidEditor 最新版", .width = 480) {
         cui_column(ui, .width = CUI_FILL, .gap = 6) {
             int cs = np_updater_check_state();
             int ds = np_updater_dl_state();
-            /* The states flip on Java worker threads; CUI only redraws on
-             * demand, so request a frame whenever something changed. */
+            /* Worker threads flip these states; request a redraw on change. */
             if (cs != a->upd_last_check || ds != a->upd_last_dl) {
                 a->upd_last_check = cs;
                 a->upd_last_dl = ds;
                 cui_request_redraw(ui);
             }
             if (ds == NP_UPD_DL_RUNNING) cui_request_redraw(ui);  /* live progress */
-            if (cs == NP_UPD_RUNNING) {
+            if (cs == NP_UPD_IDLE) {
+                cui_text(ui, "点击下方「检查更新」获取最新版本。", .size = 12);
+            } else if (cs == NP_UPD_RUNNING) {
                 cui_text(ui, "正在连接 GitHub…", .size = 12);
             } else if (cs == NP_UPD_FAILED) {
                 cui_text(ui, "检查失败", .size = 14, .font = CUI_FONT_MEDIUM);
                 cui_text(ui, np_updater_check_error(), .size = 12);
-                cui_text(ui, "请确认设备可以访问 github.com。", .size = 12);
+                cui_text(ui, "请确认可以访问 github.com。", .size = 12);
             } else if (cs == NP_UPD_OK) {
                 const char *tag = np_updater_latest_tag();
                 if (!tag[0]) {
@@ -2415,25 +2413,38 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                     snprintf(a->update_buf, sizeof a->update_buf,
                              "当前版本 %s（最新 %s）", NP_APP_VERSION, tag);
                     cui_text(ui, a->update_buf, .size = 12);
-                } else if (!np_updater_apk_url()[0]) {
+                } else if (!np_updater_asset_url()[0]) {
                     snprintf(a->update_buf, sizeof a->update_buf,
-                             "发现新版本 %s，但 Release 未附带 .apk 安装包。", tag);
+                             "发现新版本 %s，但 Release 未附带适用于本系统的安装包。", tag);
                     cui_text(ui, a->update_buf, .size = 12);
                 } else {
                     snprintf(a->update_buf, sizeof a->update_buf,
                              "发现新版本 %s（当前 %s）", tag, NP_APP_VERSION);
                     cui_text(ui, a->update_buf, .size = 14, .font = CUI_FONT_MEDIUM);
-                    int ds = np_updater_dl_state();
+#ifndef __ANDROID__
+                    if (np_updater_asset_name()[0]) {
+                        snprintf(a->update_buf, sizeof a->update_buf,
+                                 "安装包：%s", np_updater_asset_name());
+                        cui_text(ui, a->update_buf, .size = 12);
+                    }
+#endif
                     if (ds == NP_UPD_DL_IDLE) {
-                        cui_text(ui, "点击下方按钮下载并安装（约 7 MB）。", .size = 12);
+                        cui_text(ui, "点击下方按钮下载安装包。", .size = 12);
                     } else if (ds == NP_UPD_DL_RUNNING) {
                         int pc = np_updater_dl_progress();
                         snprintf(a->update_buf, sizeof a->update_buf, "下载中 %d%%", pc);
                         cui_text(ui, a->update_buf, .size = 12);
                         cui_progress(ui, (float)pc / 100.0f);
                     } else if (ds == NP_UPD_DL_DONE) {
+#ifdef __ANDROID__
                         cui_text(ui, "下载完成。点击「安装」后请在系统弹窗中确认。", .size = 12);
                         cui_text(ui, "首次安装会要求允许「安装未知应用」。", .size = 12);
+#else
+                        snprintf(a->update_buf, sizeof a->update_buf,
+                                 "下载完成：%s", np_updater_dest_path());
+                        cui_text(ui, a->update_buf, .size = 12);
+                        cui_text(ui, "点击「安装」运行安装包；也可打开所在文件夹。", .size = 12);
+#endif
                     } else if (ds == NP_UPD_DL_FAILED) {
                         cui_text(ui, "下载失败", .size = 14, .font = CUI_FONT_MEDIUM);
                         cui_text(ui, np_updater_dl_error(), .size = 12);
@@ -2443,26 +2454,30 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
         cui_dialog_footer(ui) {
             int cs2 = np_updater_check_state();
-            int ds2 = np_updater_dl_state();            /* Re-check is offered whenever the background job has settled. */
+            int ds2 = np_updater_dl_state();
+            /* Re-check is offered whenever the background job has settled. */
             if (cs2 != NP_UPD_RUNNING && ds2 != NP_UPD_DL_RUNNING) {
-                if (cui_button(ui, "重新检查"))
+                if (cui_button(ui, cs2 == NP_UPD_IDLE ? "检查更新" : "重新检查"))
                     np_updater_start_check();
             }
+#ifndef __ANDROID__
+            if (ds2 == NP_UPD_DL_DONE && cui_button(ui, "打开所在文件夹"))
+                np_updater_open_folder();
+#endif
             if (cs2 == NP_UPD_OK && np_update_tag_is_newer(np_updater_latest_tag())
-                && np_updater_apk_url()[0]
+                && np_updater_asset_url()[0]
                 && (ds2 == NP_UPD_DL_IDLE || ds2 == NP_UPD_DL_FAILED)
-                && cui_button(ui, "下载并安装", .variant = CUI_BUTTON_PRIMARY)) {
+                && cui_button(ui, "下载安装包", .variant = CUI_BUTTON_PRIMARY)) {
                 np_updater_start_download();
             }
             if (cs2 == NP_UPD_OK && np_update_tag_is_newer(np_updater_latest_tag())
-                && np_updater_apk_url()[0] && ds2 == NP_UPD_DL_DONE
+                && np_updater_asset_url()[0] && ds2 == NP_UPD_DL_DONE
                 && cui_button(ui, "安装", .variant = CUI_BUTTON_PRIMARY)) {
                 np_updater_install();
             }
             if (cui_button(ui, "关闭")) a->dlg_update = false;
         }
     }
-#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -3989,9 +4004,128 @@ static void np_preview_sync(notepad *a, np_doc *d) {
     }
 }
 
+/* ---- Preview -> source selection helpers --------------------------- */
+
+static bool np_is_ws_byte(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f';
+}
+
+/* Locate `text` in the document. First an exact byte match, then a match that
+ * ignores runs of whitespace (HTML textContent collapses them differently). */
+static int np_source_span(const char *src, int len, const char *text, int *span) {
+    *span = 0;
+    if (!src || !text || !*text) return -1;
+    size_t nl = strlen(text);
+    if (nl > (size_t)len) return -1;
+    for (int i = 0; i + (int)nl <= len; i++) {
+        if (!memcmp(src + i, text, nl)) { *span = (int)nl; return i; }
+    }
+    char *a = (char *)malloc((size_t)len + 1);
+    char *b = (char *)malloc(nl + 1);
+    int *map = (int *)malloc(((size_t)len + 1) * sizeof(int));
+    if (!a || !b || !map) { free(a); free(b); free(map); return -1; }
+    int an = 0;
+    for (int i = 0; i < len; i++) {
+        if (np_is_ws_byte(src[i])) {
+            if (an > 0 && !np_is_ws_byte(a[an - 1])) { a[an] = ' '; map[an] = i; an++; }
+        } else { a[an] = src[i]; map[an] = i; an++; }
+    }
+    a[an] = 0;
+    int bn = 0;
+    for (size_t i = 0; i < nl; i++) {
+        if (np_is_ws_byte(text[i])) {
+            if (bn > 0 && !np_is_ws_byte(b[bn - 1])) b[bn++] = ' ';
+        } else b[bn++] = text[i];
+    }
+    b[bn] = 0;
+    int off = -1;
+    if (an > 0 && bn > 0) {
+        char *p = strstr(a, b);
+        if (p) {
+            int bi = (int)(p - a);
+            int last = bi + bn - 1;
+            off = map[bi];
+            *span = map[last] + 1 - off;
+        }
+    }
+    free(a); free(b); free(map);
+    return off;
+}
+
+static void np_select_span(notepad *a, np_doc *d, int off, int span) {
+    if (!d || off < 0 || off > d->len) return;
+    if (span <= 0) span = 0;
+    if (off + span > d->len) span = d->len - off;
+    cui_code_editor_select(a->ui, d->editor_id, off, off + span);
+}
+
+static void np_select_line(notepad *a, np_doc *d, int line) {
+    if (!d || line < 1) return;
+    int cur = 1, start = 0;
+    for (int i = 0; i < d->len && cur < line; i++) {
+        if (d->text[i] == '\n') { start = i + 1; cur++; }
+    }
+    int end = start;
+    while (end < d->len && d->text[end] != '\n' && d->text[end] != '\r') end++;
+    np_select_span(a, d, start, end - start);
+}
+
+static bool np_same_path(const char *a, const char *b) {
+    if (!a || !b) return false;
+    for (; *a && *b; a++, b++) {
+        char ca = (*a == '\\') ? '/' : *a;
+        char cb = (*b == '\\') ? '/' : *b;
+        if (ca != cb) return false;
+    }
+    return !*a && !*b;
+}
+
+static void np_goto_tex_source(notepad *a, const char *file, int line) {
+    if (!file || !*file || line < 1) return;
+    for (int i = 0; i < a->count; i++) {
+        np_doc *d = a->docs[i];
+        if (np_same_path(d->path, file) ||
+            (!d->path[0] && np_same_path(d->tab_title, file))) {
+            np_select_line(a, d, line);
+            return;
+        }
+    }
+    char full[NP_PATH_CAP];
+    snprintf(full, sizeof full, "%s", file);
+    if (full[0] != '/' && !(strlen(full) > 1 && full[1] == ':')) {
+        np_doc *d = np_cur(a);
+        const char *root = (d && d->tex_root[0]) ? d->tex_root : (d ? d->path : NULL);
+        if (root && root[0]) {
+            char dir[NP_PATH_CAP];
+            np_dir_of(root, dir, sizeof dir);
+            snprintf(full, sizeof full, "%s/%s", dir, file);
+        }
+    }
+    if (np_file_exists(full) && np_open_path(a, full, true)) {
+        np_doc *d = np_cur(a);
+        if (d) np_select_line(a, d, line);
+    }
+}
+
+static void np_preview_image_paint(cui_ctx *ui, cui_rect r, void *user) {
+    cui_texture tex = *(cui_texture *)user;
+    if (!tex) return;
+    cui_rect uv = { 0, 0, 1, 1 };
+    cui_draw_image(ui, tex, r, uv, CUI_CORNERS(0), (cui_color){ 255, 255, 255, 255 });
+}
+
 /* Right-hand pane. Renders the three preview kinds into the same slot. */
 static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     np_preview_sync(a, d);
+
+    if (a->preview_kind == NP_PREVIEW_HTML) {
+        char clicked[512];
+        if (np_http_take_click(&a->web_server, clicked, sizeof clicked)) {
+            int span = 0;
+            int off = np_source_span(d->text, d->len, clicked, &span);
+            if (off >= 0) np_select_span(a, d, off, span);
+        }
+    }
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6,
                .bg = CUI_COLOR_SURFACE) {
@@ -4021,8 +4155,11 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
              * view updates live as the left editor's buffer changes. */
             cui_scroll(ui, .id = "md-preview", .width = CUI_FILL, .height = CUI_FILL,
                        .pad = 6) {
-                cui_markdown(ui, "md-preview-doc", d->text, .length = d->len,
-                             .width = CUI_FILL);
+            cui_markdown_result mr = cui_markdown_ex(
+                ui, "md-preview-doc", d->text,
+                &(cui_markdown_opts){ .length = d->len, .width = CUI_FILL });
+            if (mr.source_offset >= 0 && mr.source_offset <= d->len)
+                np_select_span(a, d, mr.source_offset, mr.source_end - mr.source_offset);
             }
         } else if (k == NP_PREVIEW_LATEX) {
             int st = a->tex_job.state;
@@ -4074,13 +4211,25 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                     }
                 }
                 if (a->preview_tex) {
-                    int iw = 0, ih = 0;
-                    char page_path[NP_PATH_CAP];
-                    np_tex_page_path(&a->tex_job, page, page_path, sizeof page_path);
-                    /* image_viewer owns zoom/pan; sizes come from a fresh probe. */
-                    cui_texture probe = 0;
-                    (void)probe; (void)iw; (void)ih; (void)page_path;
-                    cui_image(ui, a->preview_tex, .width = CUI_FILL, .height = CUI_FILL);
+                    /* Clicking the rendered page uses SyncTeX to jump to the
+                     * exact source line in the editor. */
+                    cui_canvas_result cv = cui_canvas(
+                        ui, "tex-preview-page", CUI_FILL, CUI_FILL,
+                        np_preview_image_paint, &a->preview_tex,
+                        sizeof a->preview_tex);
+                    if (cv.clicked && cv.rect.w > 0 && cv.rect.h > 0) {
+                        float u = cv.mouse.x / cv.rect.w;
+                        float v = cv.mouse.y / cv.rect.h;
+                        if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+                            float pw = a->tex_job.page_w > 0 ? a->tex_job.page_w : 595.28f;
+                            float ph = a->tex_job.page_h > 0 ? a->tex_job.page_h : 841.89f;
+                            char file[NP_PATH_CAP];
+                            int line = 0;
+                            if (np_tex_locate_source(&a->tex_job, page, u * pw, v * ph,
+                                                     file, sizeof file, &line))
+                                np_goto_tex_source(a, file, line);
+                        }
+                    }
                 }
             } else {
                 cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
@@ -4124,7 +4273,9 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                     }
                 }
                 if (a->preview_tex)
-                    cui_image(ui, a->preview_tex, .width = CUI_FILL, .height = CUI_FILL);
+                    cui_canvas(ui, "pdf-preview-page", CUI_FILL, CUI_FILL,
+                               np_preview_image_paint, &a->preview_tex,
+                               sizeof a->preview_tex);
             } else {
                 cui_text(ui, a->tex_job.log[0] ? a->tex_job.log : "PDF 渲染失败。",
                          .size = 11, .color = CUI_COLOR_TEXT_MUTED, .font = CUI_FONT_MONO);
@@ -4873,12 +5024,10 @@ static void np_frame(cui_ctx *ui, void *user) {
 
             cui_menu_bar_menu(ui, "帮助") {
                 if (cui_menu_item(ui, "快捷键", .icon = CUI_ICON_KEYBOARD)) a->dlg_help = true;
-#ifdef __ANDROID__
-                if (cui_menu_item(ui, "检查更新…", .icon = CUI_ICON_DOWNLOAD)) {
+                if (cui_menu_item(ui, "在线更新…", .icon = CUI_ICON_DOWNLOAD)) {
                     a->dlg_update = true;
                     np_updater_start_check();
                 }
-#endif
                 if (cui_menu_item(ui, "关于", .icon = CUI_ICON_INFO)) a->dlg_about = true;
             }
         }

@@ -1,7 +1,6 @@
-/* Android in-app updater: thin JNI bridge over the Updater Java helper.
- * See np_updater.h for the states. Everything heavy (HTTPS, JSON hosting,
- * the package installer) lives on the Java side; this file only starts
- * operations, caches the parsed release metadata and exposes pollers. */
+/* In-app updater: JNI bridge on Android, native HTTP + shell on desktop.
+ * See np_updater.h for the states. The C side starts operations, then polls
+ * state each frame from the update dialog. */
 #include "np_updater.h"
 
 #ifdef __ANDROID__
@@ -152,7 +151,15 @@ int np_updater_check_state(void) {
 
 const char *np_updater_latest_tag(void)  { return upd.tag; }
 const char *np_updater_apk_url(void)     { return upd.apk_url; }
+const char *np_updater_asset_url(void)   { return upd.apk_url; }
+const char *np_updater_asset_name(void)  { return "RapidEditor-update.apk"; }
 const char *np_updater_check_error(void) { return upd.check_err; }
+const char *np_updater_dest_path(void) {
+    static char dest[1024];
+    const char *base = SDL_AndroidGetInternalStoragePath();
+    snprintf(dest, sizeof dest, "%s/update.apk", base ? base : "/data/local");
+    return dest;
+}
 
 void np_updater_start_download(void) {
     if (!upd.apk_url[0]) return;
@@ -212,17 +219,339 @@ void np_updater_install(void) {
     (*env)->DeleteLocalRef(env, jdst);
 }
 
-#else /* !__ANDROID__: inert stubs so the editor builds unchanged */
+void np_updater_open_folder(void) {}  /* Android installs from app storage */
 
-void        np_updater_start_check(void) {}
-int         np_updater_check_state(void) { return NP_UPD_IDLE; }
-const char *np_updater_latest_tag(void)  { return ""; }
-const char *np_updater_apk_url(void)     { return ""; }
-const char *np_updater_check_error(void) { return ""; }
-void        np_updater_start_download(void) {}
-int         np_updater_dl_state(void)   { return NP_UPD_DL_IDLE; }
-int         np_updater_dl_progress(void) { return 0; }
-const char *np_updater_dl_error(void)   { return ""; }
-void        np_updater_install(void) {}
+#elif !defined(__ANDROID__) /* ---------------- desktop update ------------ */
+
+#include "np_net.h"
+#include <ctype.h>
+#include <stdint.h>
+#include <sys/stat.h>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <shellapi.h>
+#include <process.h>
+#include <direct.h>
+#define UPD_MKDIR(p) _mkdir(p)
+#define UPD_THREAD_FN static unsigned __stdcall
+#define UPD_THREAD_RET return 0
+#else
+#include <pthread.h>
+#include <unistd.h>
+#define UPD_MKDIR(p) mkdir((p), 0700)
+#define UPD_THREAD_FN static void *
+#define UPD_THREAD_RET return NULL
+#endif
+
+#define UPD_API_URL "https://api.github.com/repos/RapidAI/RapidEditor/releases/latest"
+
+static struct {
+    volatile long check_state, dl_state, progress;
+    char tag[64];
+    char name[256];
+    char url[1024];
+    char dest[1024];
+    char check_err[512];
+    char dl_err[512];
+} pc;
+
+static bool pc_contains_ci(const char *s, size_t n, const char *needle) {
+    size_t m = strlen(needle);
+    if (!m || n < m) return false;
+    for (size_t i = 0; i + m <= n; i++) {
+        size_t k = 0;
+        while (k < m && tolower((unsigned char)s[i + k]) == tolower((unsigned char)needle[k])) k++;
+        if (k == m) return true;
+    }
+    return false;
+}
+
+static bool pc_ends_ci(const char *s, size_t n, const char *suffix) {
+    size_t m = strlen(suffix);
+    return n >= m && pc_contains_ci(s + n - m, m, suffix);
+}
+
+/* Score an asset name for this OS/CPU. Highest score wins; 0 = unusable. */
+static int pc_asset_score(const char *name, size_t n) {
+#if defined(_WIN32)
+    if (!pc_ends_ci(name, n, ".exe")) return 0;
+    int score = 1;
+    if (pc_contains_ci(name, n, "windows")) score += 2;
+#if defined(_M_ARM64)
+    if (pc_contains_ci(name, n, "arm64")) score += 8;
+    if (pc_contains_ci(name, n, "universal")) score += 4;
+#else
+    if (pc_contains_ci(name, n, "x64")) score += 8;
+    if (pc_contains_ci(name, n, "universal")) score += 4;
+#endif
+    return score;
+#elif defined(__APPLE__)
+    if (!pc_ends_ci(name, n, ".pkg")) return 0;
+    return pc_contains_ci(name, n, "macos") ? 10 : 1;
+#else
+    if (!pc_ends_ci(name, n, ".appimage")) return 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const char *arch = "aarch64";
+#else
+    const char *arch = "x86_64";
+#endif
+    return pc_contains_ci(name, n, arch) ? 10 : 1;
+#endif
+}
+
+/* Pull `"key":"value"` out of the release JSON (flat fields only). */
+static void pc_json_str(const char *json, const char *key, char *out, size_t cap) {
+    char pat[80];
+    snprintf(pat, sizeof pat, "\"%s\":\"", key);
+    out[0] = '\0';
+    const char *p = strstr(json, pat);
+    if (!p) return;
+    p += strlen(pat);
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < cap) {
+        if (*p == '\\' && p[1]) p++;
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+}
+
+/* Walk the assets array and pick the best installer for this platform. */
+static bool pc_pick_asset(const char *json, char *name_out, size_t name_cap,
+                          char *url_out, size_t url_cap) {
+    const char *assets = strstr(json, "\"assets\":[");
+    if (!assets) return false;
+    const char *key = "\"browser_download_url\":\"";
+    const char *p = assets;
+    int best = 0;
+    while ((p = strstr(p, "\"name\":\"")) != NULL) {
+        p += 8;
+        const char *ne = strchr(p, '"');
+        if (!ne) break;
+        size_t nl = (size_t)(ne - p);
+        const char *u = strstr(ne, key);
+        if (!u) break;
+        u += strlen(key);
+        const char *ue = strchr(u, '"');
+        if (!ue) break;
+        size_t ul = (size_t)(ue - u);
+        int score = pc_asset_score(p, nl);
+        if (score > best) {
+            best = score;
+            if (nl >= name_cap) nl = name_cap - 1;
+            if (ul >= url_cap) ul = url_cap - 1;
+            memcpy(name_out, p, nl); name_out[nl] = '\0';
+            memcpy(url_out, u, ul);  url_out[ul] = '\0';
+        }
+        p = ue + 1;
+    }
+    return best > 0;
+}
+
+static void pc_set_dest(void) {
+    char base[1024];
+#if defined(_WIN32)
+    base[0] = 0;
+    GetTempPathA((DWORD)sizeof base, base);
+    if (!base[0]) snprintf(base, sizeof base, ".");
+#else
+    const char *tmp = getenv("TMPDIR");
+    snprintf(base, sizeof base, "%s", tmp && tmp[0] ? tmp : "/tmp");
+#endif
+    char dir[1024], dest[1024];
+#if defined(_WIN32)
+    size_t bl = strlen(base);
+    if (bl && (base[bl - 1] == '\\' || base[bl - 1] == '/')) base[bl - 1] = 0;
+    snprintf(dir, sizeof dir, "%s\\RapidEditor-Update", base);
+#else
+    snprintf(dir, sizeof dir, "%s/RapidEditor-Update", base);
+#endif
+    UPD_MKDIR(dir);  /* already existing is fine */
+    /* Asset names come from GitHub; never let them escape the folder. */
+    for (char *q = pc.name; *q; q++)
+        if (*q == '/' || *q == '\\' || *q == ':') *q = '_';
+#if defined(_WIN32)
+    snprintf(dest, sizeof dest, "%s\\%s", dir, pc.name);
+#else
+    snprintf(dest, sizeof dest, "%s/%s", dir, pc.name);
+#endif
+    snprintf(pc.dest, sizeof pc.dest, "%s", dest);
+}
+
+UPD_THREAD_FN pc_check_worker(void *arg) {
+    (void)arg;
+    np_net_opts o;
+    memset(&o, 0, sizeof o);
+    o.timeout_sec = 20;
+    o.err = pc.check_err;
+    o.err_cap = sizeof pc.check_err;
+    char *json = np_net_fetch(UPD_API_URL, &o);
+    if (!json) {
+        if (!pc.check_err[0])
+            snprintf(pc.check_err, sizeof pc.check_err, "无法读取 GitHub Releases");
+        pc.check_state = NP_UPD_FAILED;
+        UPD_THREAD_RET;
+    }
+    pc_json_str(json, "tag_name", pc.tag, sizeof pc.tag);
+    char name[256] = "", url[1024] = "";
+    bool found = pc_pick_asset(json, name, sizeof name, url, sizeof url);
+    free(json);
+    if (!pc.tag[0] || !found) {
+        snprintf(pc.check_err, sizeof pc.check_err,
+                 !pc.tag[0] ? "Release 缺少版本信息"
+                            : "该 Release 没有适用于当前系统的安装包");
+        pc.tag[0] = 0;
+        pc.check_state = NP_UPD_FAILED;
+        UPD_THREAD_RET;
+    }
+    snprintf(pc.name, sizeof pc.name, "%s", name);
+    snprintf(pc.url, sizeof pc.url, "%s", url);
+    pc_set_dest();
+    pc.check_state = NP_UPD_OK;
+    UPD_THREAD_RET;
+}
+
+UPD_THREAD_FN pc_dl_worker(void *arg) {
+    (void)arg;
+    np_net_opts o;
+    memset(&o, 0, sizeof o);
+    o.progress = &pc.progress;
+    o.timeout_sec = 600;
+    o.err = pc.dl_err;
+    o.err_cap = sizeof pc.dl_err;
+    bool ok = np_net_download(pc.url, pc.dest, &o);
+    if (ok) {
+        struct stat st;
+        if (stat(pc.dest, &st) != 0 || st.st_size == 0) {
+            ok = false;
+            snprintf(pc.dl_err, sizeof pc.dl_err, "下载文件为空");
+        }
+    }
+    pc.progress = ok ? 100 : 0;
+    pc.dl_state = ok ? NP_UPD_DL_DONE : NP_UPD_DL_FAILED;
+    UPD_THREAD_RET;
+}
+
+static void pc_spawn_check(void) {
+#if defined(_WIN32)
+    if (!_beginthreadex(NULL, 0, pc_check_worker, NULL, 0, NULL)) {
+        snprintf(pc.check_err, sizeof pc.check_err, "无法启动检查线程");
+        pc.check_state = NP_UPD_FAILED;
+    }
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, pc_check_worker, NULL) != 0) {
+        snprintf(pc.check_err, sizeof pc.check_err, "无法启动检查线程");
+        pc.check_state = NP_UPD_FAILED;
+    } else pthread_detach(t);
+#endif
+}
+
+static void pc_spawn_download(void) {
+#if defined(_WIN32)
+    if (!_beginthreadex(NULL, 0, pc_dl_worker, NULL, 0, NULL)) {
+        snprintf(pc.dl_err, sizeof pc.dl_err, "无法启动下载线程");
+        pc.dl_state = NP_UPD_DL_FAILED;
+    }
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, pc_dl_worker, NULL) != 0) {
+        snprintf(pc.dl_err, sizeof pc.dl_err, "无法启动下载线程");
+        pc.dl_state = NP_UPD_DL_FAILED;
+    } else pthread_detach(t);
+#endif
+}
+
+void np_updater_start_check(void) {
+    if (pc.check_state == NP_UPD_RUNNING) return;
+    pc.check_state = NP_UPD_RUNNING;
+    pc.dl_state = NP_UPD_DL_IDLE;
+    pc.progress = 0;
+    pc.tag[0] = pc.name[0] = pc.url[0] = pc.dest[0] = 0;
+    pc.check_err[0] = pc.dl_err[0] = 0;
+    pc_spawn_check();
+}
+
+int np_updater_check_state(void) { return (int)pc.check_state; }
+const char *np_updater_latest_tag(void)  { return pc.tag; }
+const char *np_updater_asset_url(void)   { return pc.url; }
+const char *np_updater_asset_name(void)  { return pc.name; }
+const char *np_updater_dest_path(void)   { return pc.dest; }
+const char *np_updater_apk_url(void)     { return pc.url; }
+const char *np_updater_check_error(void) { return pc.check_err; }
+
+void np_updater_start_download(void) {
+    if (!pc.url[0] || pc.dl_state == NP_UPD_DL_RUNNING) return;
+    pc.dl_state = NP_UPD_DL_RUNNING;
+    pc.progress = 0;
+    pc.dl_err[0] = 0;
+    pc_spawn_download();
+}
+
+int np_updater_dl_state(void)   { return (int)pc.dl_state; }
+int np_updater_dl_progress(void) { return (int)pc.progress; }
+const char *np_updater_dl_error(void) { return pc.dl_err; }
+
+/* Quote a path for the shell used by open/xdg-open. */
+static const char *pc_shell_path(const char *path) {
+    static char q[2048];
+    size_t n = 0;
+    q[n++] = '\'';
+    for (const char *p = path; *p && n + 5 < sizeof q; p++) {
+        if (*p == '\'') { memcpy(q + n, "'\\''", 4); n += 4; }
+        else q[n++] = *p;
+    }
+    q[n++] = '\'';
+    q[n] = 0;
+    return q;
+}
+
+void np_updater_install(void) {
+    if (!pc.dest[0]) return;
+    struct stat st;
+    if (stat(pc.dest, &st) != 0) return;
+#if defined(_WIN32)
+    WCHAR w[2048];
+    MultiByteToWideChar(CP_UTF8, 0, pc.dest, -1, w, 2048);
+    if ((intptr_t)ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL) <= 32)
+        snprintf(pc.dl_err, sizeof pc.dl_err, "无法启动安装包（可能被系统拦截）");
+#elif defined(__APPLE__)
+    char cmd[3072];
+    snprintf(cmd, sizeof cmd, "open %s", pc_shell_path(pc.dest));
+    if (system(cmd) != 0)
+        snprintf(pc.dl_err, sizeof pc.dl_err, "无法打开安装包");
+#else
+    chmod(pc.dest, 0755);
+    char cmd[3072];
+    snprintf(cmd, sizeof cmd, "xdg-open %s", pc_shell_path(pc.dest));
+    if (system(cmd) != 0)
+        snprintf(pc.dl_err, sizeof pc.dl_err, "无法打开安装包，请在下载目录中手动运行");
+#endif
+}
+
+void np_updater_open_folder(void) {
+    if (!pc.dest[0]) return;
+#if defined(_WIN32)
+    char params_u8[2300];
+    WCHAR params[2400];
+    snprintf(params_u8, sizeof params_u8, "/select,\"%s\"", pc.dest);
+    MultiByteToWideChar(CP_UTF8, 0, params_u8, -1, params, 2400);
+    ShellExecuteW(NULL, L"open", L"explorer.exe", params, NULL, SW_SHOWNORMAL);
+#else
+    char cmd[3072];
+#if defined(__APPLE__)
+    snprintf(cmd, sizeof cmd, "open -R %s", pc_shell_path(pc.dest));
+#else
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", pc.dest);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0;
+    snprintf(cmd, sizeof cmd, "xdg-open %s", pc_shell_path(dir));
+#endif
+    system(cmd);
+#endif
+}
 
 #endif

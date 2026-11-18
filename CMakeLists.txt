@@ -5,13 +5,13 @@ cmake_minimum_required(VERSION 3.16)
 # "required internal CMake variable not set: CMAKE_OBJCXX_COMPILE_OBJECT".
 if(APPLE)
     project(RapidEditor
-        VERSION 1.2.2
+        VERSION 1.2.3
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX OBJCXX)
 else()
     project(RapidEditor
-        VERSION 1.2.2
+        VERSION 1.2.3
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX)
@@ -61,7 +61,8 @@ find_package(Threads REQUIRED)
 
 set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                src/np_updater.c src/np_latex_templates.c src/np_zip.c
-               src/np_net.c src/np_tinytex.c src/np_templates_online.c)
+               src/np_net.c src/np_tinytex.c src/np_templates_online.c
+               src/np_synctex.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)
