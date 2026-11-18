@@ -60,7 +60,8 @@ add_subdirectory(vendor/CUI)
 find_package(Threads REQUIRED)
 
 set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
-               src/np_updater.c src/np_latex_templates.c src/np_zip.c)
+               src/np_updater.c src/np_latex_templates.c src/np_zip.c
+               src/np_net.c src/np_tinytex.c src/np_templates_online.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)
@@ -120,7 +121,7 @@ if(WIN32)
 
     # CommandLineToArgvW / LocalFree for UTF-8 command lines; ws2_32 for the
     # built-in loopback HTTP server used by the HTML Web preview.
-    target_link_libraries(RapidEditor PRIVATE shell32 ws2_32)
+    target_link_libraries(RapidEditor PRIVATE shell32 ws2_32 winhttp)
 
     # Copy the architecture-matching WebView2Loader.dll next to the exe so the
     # runtime loader can find it. Detect the target CPU from the toolchain or

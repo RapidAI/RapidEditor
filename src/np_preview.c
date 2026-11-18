@@ -6,6 +6,7 @@
  * a missing one is reported through the async job / server state.
  */
 #include "np_preview.h"
+#include "np_tinytex.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,10 +147,34 @@ static void pv_quote(const char *s, char *out, size_t cap) {
 }
 
 /* Run a command line synchronously; returns the process exit code.
- * stdout/stderr are redirected by the caller's command string. */
+ * stdout/stderr are redirected by the caller's command string.
+ *
+ * Windows: launch cmd.exe with CREATE_NO_WINDOW so the GUI never flashes a
+ * black console window for every pdflatex/pdftoppm invocation. We pass the
+ * whole line to `cmd /c` so the existing `cd && exe > log 2>&1` chaining still
+ * works, but the console is fully hidden. */
 static int pv_run(const char *cmd) {
 #ifdef _WIN32
-    return system(cmd);
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof si);
+    memset(&pi, 0, sizeof pi);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    /* Cmd needs its own writable copy of the command line. */
+    char cmdline[8192];
+    snprintf(cmdline, sizeof cmdline, "cmd.exe /d /c %s", cmd);
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                             NULL, NULL, &si, &pi);
+    if (!ok) return -1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)code;
 #else
     return system(cmd);
 #endif
@@ -299,6 +324,20 @@ static void pv_tex_worker(void *arg) {
     } else {
         char qtex[NP_PV_PATH_CAP * 2];
         pv_quote(j->tex_path, qtex, sizeof qtex);
+
+        /* Make an app-private TinyTeX (if installed) visible to child
+         * processes: pdflatex/xelatex and tlmgr are resolved from PATH. */
+        {
+            char full[NP_PV_PATH_CAP * 2];
+            snprintf(full, sizeof full, "%s", getenv("PATH") ? getenv("PATH") : "");
+            np_tinytex_path_value(full, sizeof full);
+#ifdef _WIN32
+            SetEnvironmentVariableA("PATH", full);
+#else
+            setenv("PATH", full, 1);
+#endif
+        }
+
         const char *engine = NULL;
         if (pv_has_tool("xelatex")) engine = "xelatex";
         else if (pv_has_tool("pdflatex")) engine = "pdflatex";

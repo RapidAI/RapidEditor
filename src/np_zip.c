@@ -136,7 +136,7 @@ static int npz_main_rank(const char *name, const char *text) {
     if (!npz_is_tex(name) || !strstr(text, "\\documentclass")) return 99;
     const char *base = strrchr(name, '/');
     base = base ? base + 1 : name;
-    static const char *preferred[] = { "main", "index", "master", "paper", "thesis", "report" };
+    static const char *preferred[] = { "main", "index", "master", "paper", "thesis", "report", "cv", "resume" };
     for (unsigned i = 0; i < sizeof preferred / sizeof *preferred; i++) {
         size_t l = strlen(preferred[i]);
         if (strncmp(base, preferred[i], l) == 0) return (int)i;

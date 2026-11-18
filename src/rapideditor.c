@@ -24,6 +24,9 @@
 #include "np_updater.h"
 #include "np_latex_templates.h"
 #include "np_zip.h"
+#include "np_net.h"
+#include "np_tinytex.h"
+#include "np_templates_online.h"
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -277,6 +280,33 @@ typedef struct notepad {
     bool dlg_confirm, dlg_replace, dlg_goto, dlg_help, dlg_about, dlg_lang;
     bool dlg_latex_tpl;                 /* new LaTeX document from a template */
     int  latex_tpl_pick;
+
+    /* Online LaTeX template library ----------------------------------- */
+    bool dlg_tpl_online;
+    bool dlg_tinytex;
+    np_online_template tpl_items[NP_ONT_MAX];
+    int  tpl_count, tpl_pick;
+    char tpl_query[128];                /* GitHub search input */
+    char tpl_status[256];               /* progress / error line */
+    volatile long tpl_progress;         /* 0..100, written by worker thread */
+    volatile bool tpl_cancel;           /* set by UI to abort worker */
+    int  tpl_mode;                      /* 0 curated, 1 search results */
+
+    /* TinyTeX auto-install -------------------------------------------- */
+    volatile long tt_progress;
+    volatile bool tt_cancel;
+    bool tt_busy;
+    char tt_status[256];
+
+    /* Background template download: worker fills these, UI polls and imports */
+    char tpl_dl_url[NP_PATH_CAP];       /* set by UI before starting worker */
+    char tpl_dl_stem[128];              /* suggested project folder name */
+    char tpl_dl_result[NP_PATH_CAP];    /* downloaded zip path, set by worker */
+    char tpl_dl_error[256];
+    int  tpl_dl_kind;                   /* 1 download, 2 search */
+    volatile long tpl_dl_done;          /* 0 running, 1 ok, 2 error, 3 cancelled */
+    bool tpl_dl_busy;
+
     bool dlg_update;                    /* Android: check GitHub Releases */
     char update_buf[512];               /* scratch lines for the update dialog */
     int  upd_last_check, upd_last_dl;   /* poll caches: request redraw on flip */
@@ -404,7 +434,7 @@ static void np_logf(notepad *a, const char *fmt, ...) {
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
            a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
-           a->dlg_update || a->dlg_latex_tpl;
+           a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex;
 }
 
 #ifdef __ANDROID__
@@ -536,6 +566,10 @@ static void np_close_doc(notepad *a, int idx);   /* defined just below */
 
 static np_doc *np_doc_from_latex_template(notepad *a, int index);
 static void np_import_latex_zip(notepad *a);   /* defined near the LaTeX project helpers */
+static bool np_unpack_and_open(notepad *a, const char *zip, const char *stem);
+static void np_start_template_download(notepad *a, const np_online_template *t);
+static void np_start_tpl_search(notepad *a);
+static void np_start_tinytex_install(notepad *a);
 
 static np_doc *np_doc_from_latex_template(notepad *a, int index) {
     const np_latex_template *t = np_latex_template_at(index);
@@ -1915,14 +1949,152 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 a->dlg_latex_tpl = false;
                 np_import_latex_zip(a);
             }
-            if (cui_button(ui, "在线模板库", .variant = CUI_BUTTON_GHOST,
-                           .tooltip = "在浏览器中打开 Overleaf 模板库"))
-                np_open_url("https://www.overleaf.com/latex/templates");
+            if (cui_button(ui, "在线模板库…", .variant = CUI_BUTTON_GHOST,
+                           .tooltip = "从 GitHub 搜索并直接下载导入模板")) {
+                a->dlg_latex_tpl = false;
+                a->dlg_tpl_online = true;
+            }
             if (cui_button(ui, "取消")) a->dlg_latex_tpl = false;
             if (cui_button(ui, "新建", .variant = CUI_BUTTON_PRIMARY, .disabled = n <= 0)) {
                 np_doc *fresh = np_doc_from_latex_template(a, a->latex_tpl_pick);
                 if (fresh) np_activate(a, a->count - 1, true);
                 a->dlg_latex_tpl = false;
+            }
+        }
+    }
+
+    /* Online LaTeX template library ----------------------------------- */
+    /* Poll the worker once per frame; import on completion, redraw on change. */
+    if (a->dlg_tpl_online && a->tpl_dl_busy) {
+        long done = a->tpl_dl_done;
+        if (done == 1 && a->tpl_dl_kind == 1 && a->tpl_dl_result[0]) {
+            char zip[NP_PATH_CAP];
+            snprintf(zip, sizeof zip, "%s", a->tpl_dl_result);
+            a->tpl_dl_busy = false;
+            a->tpl_dl_result[0] = 0;
+            np_unpack_and_open(a, zip, a->tpl_dl_stem);
+            snprintf(a->tpl_status, sizeof a->tpl_status, "模板已导入并打开");
+            if (a->ui) cui_request_redraw(a->ui);
+        } else if (done == 1 && a->tpl_dl_kind == 2) {
+            a->tpl_dl_busy = false;   /* search finished */
+            if (a->ui) cui_request_redraw(a->ui);
+        } else if (done == 2 || done == 3) {
+            if (done == 2 && a->tpl_dl_error[0])
+                snprintf(a->tpl_status, sizeof a->tpl_status, "%s", a->tpl_dl_error);
+            a->tpl_dl_busy = false;
+            if (a->ui) cui_request_redraw(a->ui);
+        } else if (a->ui) cui_request_redraw(a->ui);  /* live progress */
+    }
+
+    cui_dialog(ui, "在线 LaTeX 模板库", &a->dlg_tpl_online,
+               .description = "精选模板 + GitHub 搜索，选中后自动下载并作为多文件项目打开",
+               .width = 560) {
+        /* Search row */
+        cui_row(ui, .gap = 8, .width = CUI_FILL) {
+            cui_input(ui, "tpl-search", a->tpl_query, sizeof a->tpl_query,
+                      .label = "搜索 GitHub", .placeholder = "例如：beamer / thesis / resume",
+                      .width = CUI_FILL);
+            if (cui_button(ui, "搜索", .disabled = a->tpl_dl_busy || !a->tpl_query[0]))
+                np_start_tpl_search(a);
+            if (cui_button(ui, "精选", .variant = CUI_BUTTON_GHOST,
+                           .disabled = a->tpl_dl_busy)) {
+                a->tpl_count = np_online_curated(a->tpl_items, NP_ONT_MAX);
+                a->tpl_pick = 0;
+                a->tpl_mode = 0;
+                snprintf(a->tpl_status, sizeof a->tpl_status, "显示 %d 个精选模板", a->tpl_count);
+            }
+        }
+        if (!a->tpl_items[0].name[0] && a->tpl_count == 0) {
+            a->tpl_count = np_online_curated(a->tpl_items, NP_ONT_MAX);
+            a->tpl_mode = 0;
+            snprintf(a->tpl_status, sizeof a->tpl_status, "显示 %d 个精选模板", a->tpl_count);
+        }
+        if (a->tpl_count > 0) {
+            const char *names[NP_ONT_MAX];
+            char labels[NP_ONT_MAX][160];
+            for (int i = 0; i < a->tpl_count && i < NP_ONT_MAX; i++) {
+                const np_online_template *t = &a->tpl_items[i];
+                if (t->stars >= 0)
+                    snprintf(labels[i], sizeof labels[i], "%s  (★ %d)  %s", t->name, t->stars, t->full_name);
+                else
+                    snprintf(labels[i], sizeof labels[i], "%s  %s", t->name, t->full_name);
+                names[i] = labels[i];
+            }
+            a->tpl_pick = NP_MAX(0, NP_MIN(a->tpl_pick, a->tpl_count - 1));
+            cui_select(ui, "tpl-list", names, a->tpl_count, &a->tpl_pick,
+                       .label = "模板", .width = CUI_FILL);
+            const np_online_template *t = &a->tpl_items[a->tpl_pick];
+            if (t) {
+                cui_text(ui, t->desc, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                char repo[200];
+                snprintf(repo, sizeof repo, "仓库：%s  ·  分支：%s", t->full_name, t->branch);
+                cui_text(ui, repo, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            }
+        }
+        if (a->tpl_dl_busy) cui_progress(ui, (float)a->tpl_progress / 100.0f);
+        if (a->tpl_status[0]) cui_text(ui, a->tpl_status, .size = 12,
+                                       .color = CUI_COLOR_TEXT_MUTED);
+
+        /* TinyTeX hint */
+        {
+            char engine[NP_PATH_CAP];
+            bool has = np_tinytex_engine(engine, sizeof engine);
+            if (!has)
+                cui_text(ui, "未检测到 LaTeX 引擎：点「安装 TinyTeX」可自动部署（约 24MB）。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        }
+
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "安装 TinyTeX…", .variant = CUI_BUTTON_GHOST)) {
+                a->dlg_tpl_online = false;
+                a->dlg_tinytex = true;
+            }
+            if (a->tpl_dl_busy && cui_button(ui, "取消", .variant = CUI_BUTTON_GHOST))
+                a->tpl_cancel = true;
+            if (cui_button(ui, "关闭")) a->dlg_tpl_online = false;
+            if (cui_button(ui, "下载并导入", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = a->tpl_count <= 0 || a->tpl_dl_busy)) {
+                np_start_template_download(a, &a->tpl_items[a->tpl_pick]);
+            }
+        }
+    }
+
+    /* TinyTeX auto-install dialog -------------------------------------- */
+    if (a->dlg_tinytex && a->tt_busy) {
+        if (np_tinytex_state() == 2 || np_tinytex_state() == 3)
+            a->tt_busy = false;
+        if (a->ui) cui_request_redraw(a->ui);  /* live progress */
+    }
+    cui_dialog(ui, "安装 TinyTeX", &a->dlg_tinytex,
+               .description = "自动下载并安装轻量 LaTeX 环境到应用私有目录",
+               .width = 480) {
+        char engine[NP_PATH_CAP], dir[NP_PATH_CAP];
+        bool has = np_tinytex_engine(engine, sizeof engine);
+        np_tinytex_dir(dir, sizeof dir);
+        if (has) {
+            cui_text(ui, "已检测到 LaTeX 引擎：", .size = 12);
+            cui_text(ui, engine, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            cui_text(ui, "无需安装。编译会优先使用它。", .size = 12);
+        } else {
+            cui_text(ui, "未检测到 LaTeX 引擎。点击下方按钮自动下载 TinyTeX 基础包", .size = 12);
+            cui_text(ui, "（Windows 约 24MB / Linux 约 1.4MB），安装到：", .size = 12);
+            cui_text(ui, dir, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            cui_text(ui, "首次编译缺宏包时会自动联网补装。", .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        }
+        if (a->tt_busy) cui_progress(ui, (float)a->tt_progress / 100.0f);
+        if (a->tt_status[0]) cui_text(ui, a->tt_status, .size = 12,
+                                      .color = CUI_COLOR_TEXT_MUTED);
+        cui_dialog_footer(ui) {
+            if (a->tt_busy && cui_button(ui, "取消", .variant = CUI_BUTTON_GHOST))
+                a->tt_cancel = true;
+            if (cui_button(ui, has ? "关闭" : "稍后")) a->dlg_tinytex = false;
+            if (cui_button(ui, has ? "重新检测" : "下载并安装",
+                           .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = a->tt_busy)) {
+                if (has) {
+                    np_tinytex_reset();
+                    snprintf(a->tt_status, sizeof a->tt_status, "已检测到引擎：%s", engine);
+                } else np_start_tinytex_install(a);
             }
         }
     }
@@ -2180,26 +2352,23 @@ static void np_tex_detect_root(notepad *a, np_doc *d) {
 /* Import a LaTeX project distributed as a ZIP (Overleaf/GitHub downloads).
  * Unpack next to the archive into a unique folder, then open its main .tex
  * with tex_root pinned so the multi-file compile pipeline picks it up. */
-static void np_import_latex_zip(notepad *a) {
-    char zip[NP_PATH_CAP];
-    if (!cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
-            .kind = CUI_FILE_OPEN, .title = "导入 LaTeX 项目 (ZIP)",
-            .filter_name = "ZIP 项目模板", .filter = "zip" },
-            zip, sizeof zip))
-        return;
-
-    /* Destination: <zip folder>\<zip stem>\  (append -2/-3 if it exists). */
-    char dir[NP_PATH_CAP], stem[NP_PATH_CAP], dest[NP_PATH_CAP];
+/* Extract a project ZIP into a fresh sibling folder of `zip`, open its main
+ * .tex and wire up the multi-file preview. Shared by the local import dialog
+ * and the online template downloader. Returns true on success. */
+static bool np_unpack_and_open(notepad *a, const char *zip, const char *stem) {
+    if (!zip || !*zip) return false;
+    char dir[NP_PATH_CAP], use_stem[NP_PATH_CAP], dest[NP_PATH_CAP];
     np_dir_of(zip, dir, sizeof dir);
-    snprintf(stem, sizeof stem, "%s", np_base(zip));
-    char *dot = strrchr(stem, '.');
+    snprintf(use_stem, sizeof use_stem, "%s", stem && *stem ? stem : np_base(zip));
+    char *dot = strrchr(use_stem, '.');
     if (dot) *dot = 0;
-    if (!stem[0]) snprintf(stem, sizeof stem, "latex-project");
+    if (!use_stem[0]) snprintf(use_stem, sizeof use_stem, "latex-project");
+
     struct stat st;
     for (int i = 0; i < 1000; i++) {
         char leaf[NP_PATH_CAP];
-        if (i == 0) snprintf(leaf, sizeof leaf, "%s", stem);
-        else snprintf(leaf, sizeof leaf, "%s-%d", stem, i + 1);
+        if (i == 0) snprintf(leaf, sizeof leaf, "%s", use_stem);
+        else snprintf(leaf, sizeof leaf, "%s-%d", use_stem, i + 1);
         np_dir_join(dest, sizeof dest, dir, leaf);
         if (stat(dest, &st) != 0) break;
     }
@@ -2209,13 +2378,13 @@ static void np_import_latex_zip(notepad *a) {
         if (MultiByteToWideChar(CP_UTF8, 0, dest, -1, w, NP_PATH_CAP) <= 0 ||
             !CreateDirectoryW(w, NULL)) {
             np_toast(a, "导入失败", "无法创建项目目录", CUI_TONE_DANGER);
-            return;
+            return false;
         }
     }
 #else
     if (mkdir(dest, 0755) != 0 && stat(dest, &st) != 0) {
         np_toast(a, "导入失败", "无法创建项目目录", CUI_TONE_DANGER);
-        return;
+        return false;
     }
 #endif
 
@@ -2225,11 +2394,11 @@ static void np_import_latex_zip(notepad *a) {
     if (n < 0) {
         np_logf(a, "ZIP 导入失败  %s  ·  %s", np_base(zip), err);
         np_toast(a, "导入失败", err, CUI_TONE_DANGER);
-        return;
+        return false;
     }
     if (!main_tex[0]) {
         np_toast(a, "导入失败", "ZIP 中没有找到含 \\documentclass 的 .tex 主文件", CUI_TONE_DANGER);
-        return;
+        return false;
     }
 
     np_open_path(a, main_tex, true);
@@ -2238,7 +2407,7 @@ static void np_import_latex_zip(notepad *a) {
         snprintf(d->tex_root, sizeof d->tex_root, "%s", main_tex);
         d->tex_root_manual = false;
         d->tex_root_probed = true;
-        a->preview_owner[0] = 0;   /* force preview to re-bind to the new root */
+        a->preview_owner[0] = 0;
     }
     a->show_preview = true;
     snprintf(a->side_dir, sizeof a->side_dir, "%s", dest);
@@ -2248,6 +2417,139 @@ static void np_import_latex_zip(notepad *a) {
     snprintf(msg, sizeof msg, "已展开 %d 个文件 · 主文件 %s", n, np_base(main_tex));
     np_logf(a, "导入 LaTeX 项目  %s  ·  %s", np_base(zip), msg);
     np_toast(a, "项目已导入", msg, CUI_TONE_SUCCESS);
+    return true;
+}
+
+static void np_import_latex_zip(notepad *a) {
+    char zip[NP_PATH_CAP];
+    if (!cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+            .kind = CUI_FILE_OPEN, .title = "导入 LaTeX 项目 (ZIP)",
+            .filter_name = "ZIP 项目模板", .filter = "zip" },
+            zip, sizeof zip))
+        return;
+    np_unpack_and_open(a, zip, NULL);
+}
+
+/* ---- Background workers (download / search / TinyTeX install) --------- */
+
+#ifdef _WIN32
+#include <process.h>
+#define NP_BEGIN_THREAD(fn, arg) _beginthreadex(NULL, 0, \
+    (unsigned (__stdcall *)(void *))(fn), (arg), 0, NULL)
+#else
+#define NP_BEGIN_THREAD(fn, arg) ({ pthread_t _t; \
+    pthread_create(&_t, NULL, (void *(*)(void *))(fn), (arg)); \
+    pthread_detach(_t); (void)0; })
+#endif
+
+/* Download one template ZIP to a temp file. Only touches worker-owned buffers
+ * and the shared progress/cancel/done fields — never CUI state. */
+static void np_tpl_download_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    char err[256] = {0};
+    long prog = 0;
+    np_net_opts o = {0};
+    o.progress = &prog; o.cancel = &a->tpl_cancel; o.err = err; o.err_cap = sizeof err;
+    o.timeout_sec = 180;
+    bool ok = np_net_download(a->tpl_dl_url, a->tpl_dl_result, &o);
+    a->tpl_progress = prog;
+    snprintf(a->tpl_status, sizeof a->tpl_status, "%s",
+             a->tpl_cancel ? "已取消" : (ok ? "下载完成，正在导入…" : err));
+    a->tpl_dl_done = a->tpl_cancel ? 3 : (ok ? 1 : 2);
+    if (!ok) snprintf(a->tpl_dl_error, sizeof a->tpl_dl_error, "%s",
+                      a->tpl_cancel ? "已取消" : (err[0] ? err : "下载失败"));
+#ifdef _WIN32
+    _endthreadex(0);
+#endif
+}
+
+/* GitHub search on a worker thread; result count lands in tpl_search_done. */
+static void np_tpl_search_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    char err[256] = {0};
+    /* Search into a worker-local buffer, then copy on completion. */
+    np_online_template buf[NP_ONT_MAX];
+    long prog = 0;
+    int n = np_online_search(a->tpl_query, buf, NP_ONT_MAX,
+                             &prog, &a->tpl_cancel, err, sizeof err);
+    a->tpl_progress = prog;
+    if (n > 0) {
+        memcpy(a->tpl_items, buf, (size_t)n * sizeof buf[0]);
+        a->tpl_count = n;
+        a->tpl_pick = 0;
+        a->tpl_mode = 1;
+        snprintf(a->tpl_status, sizeof a->tpl_status, "找到 %d 个模板", n);
+    } else {
+        snprintf(a->tpl_status, sizeof a->tpl_status, "%s",
+                 n < 0 ? (err[0] ? err : "搜索失败") : "没有找到匹配的模板");
+    }
+    a->tpl_dl_done = (n > 0) ? 1 : 2;   /* reuse done flag for search result */
+#ifdef _WIN32
+    _endthreadex(0);
+#endif
+}
+
+/* TinyTeX install on a worker thread. */
+static void np_tt_install_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    long prog = 0;
+    np_tinytex_opts o = {0};
+    o.progress = &prog; o.cancel = &a->tt_cancel;
+    o.err = a->tt_status; o.err_cap = sizeof a->tt_status;
+    /* Common packages so Chinese + beamer templates compile first try. */
+    bool ok = np_tinytex_install("ctex ctexcap xecjk beamer enumitem geometry graphics xcolor bookmark", &o);
+    a->tt_progress = prog;
+    if (ok) snprintf(a->tt_status, sizeof a->tt_status, "TinyTeX 安装完成");
+    a->tt_busy = false;
+#ifdef _WIN32
+    _endthreadex(0);
+#endif
+}
+
+static void np_start_template_download(notepad *a, const np_online_template *t) {
+    if (a->tpl_dl_busy) return;
+    char url[NP_PATH_CAP];
+    np_online_zip_url(t, url, sizeof url);
+    snprintf(a->tpl_dl_url, sizeof a->tpl_dl_url, "%s", url);
+    snprintf(a->tpl_dl_stem, sizeof a->tpl_dl_stem, "%s", t->name);
+    /* temp zip under the config/side directory */
+    char dir[NP_PATH_CAP];
+    if (a->side_dir[0]) np_dir_of(a->side_dir, dir, sizeof dir);
+    else snprintf(dir, sizeof dir, ".");
+#ifdef _WIN32
+    snprintf(a->tpl_dl_result, sizeof a->tpl_dl_result, "%s\\rapideditor-template.zip", dir);
+#else
+    snprintf(a->tpl_dl_result, sizeof a->tpl_dl_result, "%s/rapideditor-template.zip", dir);
+#endif
+    a->tpl_cancel = false;
+    a->tpl_progress = 0;
+    a->tpl_dl_done = 0;
+    a->tpl_dl_error[0] = 0;
+    a->tpl_dl_kind = 1;                 /* download */
+    a->tpl_dl_busy = true;
+    snprintf(a->tpl_status, sizeof a->tpl_status, "正在下载 %s…", t->name);
+    NP_BEGIN_THREAD(np_tpl_download_worker, a);
+}
+
+static void np_start_tpl_search(notepad *a) {
+    if (a->tpl_dl_busy || !a->tpl_query[0]) return;
+    a->tpl_cancel = false;
+    a->tpl_progress = 0;
+    a->tpl_dl_done = 0;
+    a->tpl_dl_kind = 2;                 /* search */
+    a->tpl_dl_busy = true;
+    snprintf(a->tpl_status, sizeof a->tpl_status, "正在搜索 GitHub…");
+    NP_BEGIN_THREAD(np_tpl_search_worker, a);
+}
+
+static void np_start_tinytex_install(notepad *a) {
+    if (a->tt_busy) return;
+    a->tt_cancel = false;
+    a->tt_progress = 0;
+    a->tt_busy = true;
+    np_tinytex_reset();
+    snprintf(a->tt_status, sizeof a->tt_status, "准备安装…");
+    NP_BEGIN_THREAD(np_tt_install_worker, a);
 }
 
 static void np_init_side_dir(notepad *a) {
@@ -4044,6 +4346,15 @@ static void np_frame(cui_ctx *ui, void *user) {
                     d->tex_root_probed = false;
                     a->preview_owner[0] = 0;   /* force re-detect next frame */
                 }
+                if (cui_menu_item(ui, "在线 LaTeX 模板库…", .icon = CUI_ICON_DOWNLOAD))
+                    a->dlg_tpl_online = true;
+                {
+                    char eng[NP_PATH_CAP];
+                    bool ready = np_tinytex_engine(eng, sizeof eng);
+                    if (cui_menu_item(ui, ready ? "LaTeX 引擎：已就绪" : "安装 TinyTeX…",
+                                      .icon = CUI_ICON_DOWNLOAD))
+                        a->dlg_tinytex = true;
+                }
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "保存时创建 .bak 备份", .checked = a->make_backup))
                     a->make_backup = !a->make_backup;
@@ -4185,6 +4496,8 @@ static void np_frame(cui_ctx *ui, void *user) {
                         a->latex_tpl_pick = 0;
                         a->dlg_latex_tpl = true;
                     }
+                    if (cui_menu_item(ui, "在线模板库…", .icon = CUI_ICON_DOWNLOAD))
+                        a->dlg_tpl_online = true;
                 }
             }
 
