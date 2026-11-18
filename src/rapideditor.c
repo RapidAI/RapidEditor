@@ -23,6 +23,7 @@
 #include "np_font_bundle.h"
 #include "np_updater.h"
 #include "np_latex_templates.h"
+#include "np_zip.h"
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -532,6 +533,9 @@ static np_doc *np_doc_new(notepad *a) {
  * text goes through the same buffer setup as a file load, so the existing
  * "\\documentclass" sniff turns the preview into LaTeX automatically. */
 static void np_close_doc(notepad *a, int idx);   /* defined just below */
+
+static np_doc *np_doc_from_latex_template(notepad *a, int index);
+static void np_import_latex_zip(notepad *a);   /* defined near the LaTeX project helpers */
 
 static np_doc *np_doc_from_latex_template(notepad *a, int index) {
     const np_latex_template *t = np_latex_template_at(index);
@@ -1786,9 +1790,14 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 cui_text(ui, hint, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
             }
         }
-        cui_text(ui, "更多在线模板：Overleaf Gallery 提供海量模板（多为多文件项目）。",
+        cui_text(ui, "更多在线模板：Overleaf Gallery 的 ZIP 项目可直接导入（支持多文件）。",
                  .size = 11, .color = CUI_COLOR_TEXT_MUTED);
         cui_dialog_footer(ui) {
+            if (cui_button(ui, "导入 ZIP 项目…", .variant = CUI_BUTTON_GHOST,
+                           .tooltip = "从 Overleaf/GitHub 下载的 ZIP 模板创建多文件项目")) {
+                a->dlg_latex_tpl = false;
+                np_import_latex_zip(a);
+            }
             if (cui_button(ui, "在线模板库", .variant = CUI_BUTTON_GHOST,
                            .tooltip = "在浏览器中打开 Overleaf 模板库"))
                 np_open_url("https://www.overleaf.com/latex/templates");
@@ -2049,6 +2058,79 @@ static void np_tex_detect_root(notepad *a, np_doc *d) {
             return;
         }
     }
+}
+
+/* Import a LaTeX project distributed as a ZIP (Overleaf/GitHub downloads).
+ * Unpack next to the archive into a unique folder, then open its main .tex
+ * with tex_root pinned so the multi-file compile pipeline picks it up. */
+static void np_import_latex_zip(notepad *a) {
+    char zip[NP_PATH_CAP];
+    if (!cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+            .kind = CUI_FILE_OPEN, .title = "导入 LaTeX 项目 (ZIP)",
+            .filter_name = "ZIP 项目模板", .filter = "zip" },
+            zip, sizeof zip))
+        return;
+
+    /* Destination: <zip folder>\<zip stem>\  (append -2/-3 if it exists). */
+    char dir[NP_PATH_CAP], stem[NP_PATH_CAP], dest[NP_PATH_CAP];
+    np_dir_of(zip, dir, sizeof dir);
+    snprintf(stem, sizeof stem, "%s", np_base(zip));
+    char *dot = strrchr(stem, '.');
+    if (dot) *dot = 0;
+    if (!stem[0]) snprintf(stem, sizeof stem, "latex-project");
+    struct stat st;
+    for (int i = 0; i < 1000; i++) {
+        char leaf[NP_PATH_CAP];
+        if (i == 0) snprintf(leaf, sizeof leaf, "%s", stem);
+        else snprintf(leaf, sizeof leaf, "%s-%d", stem, i + 1);
+        np_dir_join(dest, sizeof dest, dir, leaf);
+        if (stat(dest, &st) != 0) break;
+    }
+#ifdef _WIN32
+    {
+        wchar_t w[NP_PATH_CAP];
+        if (MultiByteToWideChar(CP_UTF8, 0, dest, -1, w, NP_PATH_CAP) <= 0 ||
+            !CreateDirectoryW(w, NULL)) {
+            np_toast(a, "导入失败", "无法创建项目目录", CUI_TONE_DANGER);
+            return;
+        }
+    }
+#else
+    if (mkdir(dest, 0755) != 0 && stat(dest, &st) != 0) {
+        np_toast(a, "导入失败", "无法创建项目目录", CUI_TONE_DANGER);
+        return;
+    }
+#endif
+
+    char main_tex[NP_PATH_CAP], err[256];
+    int n = np_zip_extract(zip, dest, true, 128u * 1024 * 1024, 512,
+                           main_tex, sizeof main_tex, err, sizeof err);
+    if (n < 0) {
+        np_logf(a, "ZIP 导入失败  %s  ·  %s", np_base(zip), err);
+        np_toast(a, "导入失败", err, CUI_TONE_DANGER);
+        return;
+    }
+    if (!main_tex[0]) {
+        np_toast(a, "导入失败", "ZIP 中没有找到含 \\documentclass 的 .tex 主文件", CUI_TONE_DANGER);
+        return;
+    }
+
+    np_open_path(a, main_tex, true);
+    np_doc *d = np_cur(a);
+    if (d && strcmp(d->path, main_tex) == 0) {
+        snprintf(d->tex_root, sizeof d->tex_root, "%s", main_tex);
+        d->tex_root_manual = false;
+        d->tex_root_probed = true;
+        a->preview_owner[0] = 0;   /* force preview to re-bind to the new root */
+    }
+    a->show_preview = true;
+    snprintf(a->side_dir, sizeof a->side_dir, "%s", dest);
+    a->side_reload = true;
+
+    char msg[256];
+    snprintf(msg, sizeof msg, "已展开 %d 个文件 · 主文件 %s", n, np_base(main_tex));
+    np_logf(a, "导入 LaTeX 项目  %s  ·  %s", np_base(zip), msg);
+    np_toast(a, "项目已导入", msg, CUI_TONE_SUCCESS);
 }
 
 static void np_init_side_dir(notepad *a) {
@@ -3682,6 +3764,8 @@ static void np_frame(cui_ctx *ui, void *user) {
                     a->latex_tpl_pick = 0;
                     a->dlg_latex_tpl = true;
                 }
+                if (cui_menu_item(ui, "从 ZIP 导入 LaTeX 项目…", .icon = CUI_ICON_ARCHIVE))
+                    np_import_latex_zip(a);
                 if (cui_menu_item(ui, "打开…", .icon = CUI_ICON_FOLDER_OPEN, .shortcut = "Ctrl O"))
                     np_open_dialog(a);
                 cui_menu_separator(ui);

@@ -60,7 +60,7 @@ add_subdirectory(vendor/CUI)
 find_package(Threads REQUIRED)
 
 set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
-               src/np_updater.c src/np_latex_templates.c)
+               src/np_updater.c src/np_latex_templates.c src/np_zip.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)
