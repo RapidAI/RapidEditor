@@ -1460,6 +1460,235 @@ static void np_apply_latex_snip(notepad *a, int i) {
     else np_latex_block(a, s->text);
 }
 
+/* ------------------------------------------------------------------ */
+/* Markdown paragraph menu                                             */
+/* ------------------------------------------------------------------ */
+
+/* Whether the active document is Markdown (by extension, or by content
+ * for untitled buffers) — drives the visibility of the 段落 menu. */
+static bool np_doc_is_markdown(const np_doc *d) {
+    if (!d || d->is_hex) return false;
+    if (d->path[0]) return np_preview_detect(d->path) == NP_PREVIEW_MARKDOWN;
+    return d->len > 0 && (strstr(d->text, "# ") || strstr(d->text, "## ") ||
+                          strstr(d->text, "- ") || strstr(d->text, "```"));
+}
+
+/* Byte offset of the start of the line containing `pos`. */
+static int np_line_start(const np_doc *d, int pos) {
+    int p = NP_MAX(0, NP_MIN(pos, d->len));
+    while (p > 0 && d->text[p - 1] != '\n') p--;
+    return p;
+}
+
+/* Byte offset just past the end of the line containing `pos` (before '\n'). */
+static int np_line_end(const np_doc *d, int pos) {
+    int p = NP_MAX(0, NP_MIN(pos, d->len));
+    while (p < d->len && d->text[p] != '\n') p++;
+    return p;
+}
+
+/* Heading level (0..6) of the caret's line, for check marks in the menu. */
+static int np_md_line_hlevel(const np_doc *d) {
+    if (!d || d->is_hex) return 0;
+    int p = NP_MAX(0, NP_MIN(NP_MIN(d->caret, d->anchor), d->len));
+    int ls = np_line_start(d, p), le = np_line_end(d, p);
+    int h = 0;
+    while (ls + h < le && d->text[ls + h] == '#' && h < 6) h++;
+    return (h > 0 && ls + h < le && d->text[ls + h] == ' ') ? h : 0;
+}
+
+/* Set the heading level of the caret's line (0 = plain paragraph). Any
+ * existing leading "#{1,6} " marker is replaced. */
+static void np_md_set_heading(notepad *a, int level) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    int p = NP_MAX(0, NP_MIN(NP_MIN(d->caret, d->anchor), d->len));
+    int ls = np_line_start(d, p), le = np_line_end(d, p);
+    int i = ls, h = 0;
+    while (i < le && d->text[i] == '#' && h < 7) { i++; h++; }
+    if (h >= 1 && h <= 6 && i < le && d->text[i] == ' ') i++;
+    else i = ls;                       /* not a heading: keep the whole line */
+    char pre[9]; int pn = 0;
+    for (int k = 0; k < level; k++) pre[pn++] = '#';
+    if (level > 0) pre[pn++] = ' ';
+    pre[pn] = 0;
+    size_t ilen = (size_t)pn;
+    int removed = i - ls;
+    if (!np_ensure_cap(d, (size_t)(d->len - removed) + ilen + 1)) return;
+    memmove(d->text + ls + ilen, d->text + i, (size_t)(d->len - i) + 1);
+    memcpy(d->text + ls, pre, ilen);
+    d->len += (int)ilen - removed;
+    np_text_changed(a, d);
+    int off = d->caret - i; if (off < 0) off = 0;
+    int caret = ls + (int)ilen + off;
+    caret = NP_MAX(ls, NP_MIN(caret, d->len));
+    cui_code_editor_select(a->ui, d->editor_id, caret, caret);
+}
+
+/* Raise/lower the caret line's heading level by `delta`, clamped to 0..6. */
+static void np_md_adjust_heading(notepad *a, int delta) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    int p = NP_MAX(0, NP_MIN(NP_MIN(d->caret, d->anchor), d->len));
+    int ls = np_line_start(d, p), le = np_line_end(d, p);
+    int h = 0;
+    while (ls + h < le && d->text[ls + h] == '#' && h < 6) h++;
+    int level = (h > 0 && ls + h < le && d->text[ls + h] == ' ') ? h : 0;
+    int nl = NP_MAX(0, NP_MIN(6, level + delta));
+    np_md_set_heading(a, nl);
+}
+
+/* Indent (+) or outdent (-) every line touched by the selection by 2 spaces. */
+static void np_md_indent(notepad *a, int dir) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    int c0 = NP_MIN(d->caret, d->anchor), c1 = NP_MAX(d->caret, d->anchor);
+    int ls = np_line_start(d, c0), le = np_line_end(d, c1);
+    int n = le - ls;
+    if (n <= 0) return;
+    char *out = (char *)malloc((size_t)n * 2 + 8);
+    if (!out) return;
+    int o = 0, line = ls, caret_new = 0;
+    while (1) {
+        int end = line;
+        while (end < le && d->text[end] != '\n') end++;
+        int content_start = line;
+        if (dir > 0) { out[o++] = ' '; out[o++] = ' '; }
+        else {
+            int k = line;
+            while (k < end && k - line < 2 && d->text[k] == ' ') k++;
+            content_start = k;
+        }
+        int copied_at = o;
+        memcpy(out + o, d->text + content_start, (size_t)(end - content_start));
+        o += end - content_start;
+        if (c0 >= line && c0 <= end) {
+            int rel = c0 - content_start;
+            if (rel < 0) rel = 0;
+            if (rel > end - content_start) rel = end - content_start;
+            caret_new = copied_at + rel;
+        }
+        if (end >= le) break;
+        out[o++] = '\n';
+        line = end + 1;
+    }
+    out[o] = 0;
+    size_t ilen = (size_t)o;
+    if (!np_ensure_cap(d, (size_t)(d->len - n) + ilen + 1)) { free(out); return; }
+    memmove(d->text + ls + ilen, d->text + le, (size_t)(d->len - le) + 1);
+    memcpy(d->text + ls, out, ilen);
+    d->len += (int)ilen - n;
+    np_text_changed(a, d);
+    int caret = NP_MAX(ls, NP_MIN(ls + caret_new, d->len));
+    cui_code_editor_select(a->ui, d->editor_id, caret, caret);
+    free(out);
+}
+
+/* Toggle a Markdown task checkbox on the caret's line. If the line is a
+ * plain "- item", it becomes "- [ ] item" first. */
+static void np_md_toggle_task(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    int p = NP_MAX(0, NP_MIN(NP_MIN(d->caret, d->anchor), d->len));
+    int ls = np_line_start(d, p), le = np_line_end(d, p);
+    for (int i = ls; i + 2 < le; i++) {
+        if (d->text[i] == '[' && d->text[i + 1] == ' ' && d->text[i + 2] == ']') {
+            d->text[i + 1] = 'x'; np_text_changed(a, d); return;
+        }
+        if (d->text[i] == '[' && (d->text[i + 1] == 'x' || d->text[i + 1] == 'X') &&
+            d->text[i + 2] == ']') {
+            d->text[i + 1] = ' '; np_text_changed(a, d); return;
+        }
+    }
+    int i = ls;
+    while (i < le && d->text[i] == ' ') i++;
+    if (i < le && (d->text[i] == '-' || d->text[i] == '*' || d->text[i] == '+') &&
+        i + 1 < le && d->text[i + 1] == ' ') {
+        int at = i + 2;
+        if (np_ensure_cap(d, (size_t)d->len + 4 + 1)) {
+            memmove(d->text + at + 4, d->text + at, (size_t)(d->len - at) + 1);
+            memcpy(d->text + at, "[ ] ", 4);
+            d->len += 4;
+            np_text_changed(a, d);
+        }
+    }
+}
+
+/* Insert a blank paragraph above or below the caret's line. */
+static void np_md_insert_para(notepad *a, bool above) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    int p = NP_MAX(0, NP_MIN(NP_MIN(d->caret, d->anchor), d->len));
+    int at = above ? np_line_start(d, p) : np_line_end(d, p);
+    if (!np_ensure_cap(d, (size_t)d->len + 1 + 1)) return;
+    memmove(d->text + at + 1, d->text + at, (size_t)(d->len - at) + 1);
+    d->text[at] = '\n';
+    d->len += 1;
+    np_text_changed(a, d);
+    int caret = above ? at : at + 1;
+    cui_code_editor_select(a->ui, d->editor_id, caret, caret);
+}
+
+/* One Markdown quick-insert entry. `%s` is the selection / caret placeholder.
+ * `block` items start on a fresh line so tables/lists never land mid-line. */
+typedef struct {
+    const char *label;
+    const char *shortcut;
+    const char *fmt;
+    bool block;
+} np_md_snip;
+
+static const np_md_snip NP_MD_SNIPS[] = {
+    /* inline formatting */
+    { "加粗",          "Ctrl Alt B",  "**%s**",        false },
+    { "斜体",          "Ctrl Alt I",  "*%s*",          false },
+    { "删除线",        NULL,          "~~%s~~",        false },
+    { "行内代码",      NULL,          "`%s`",          false },
+    { "高亮",          NULL,          "==%s==",        false },
+    { "链接",          NULL,          "[%s](https://)", false },
+    { "脚注引用",      NULL,          "[^%s]",         false },
+    { "图片",          NULL,          "![%s](https://)", false },
+    /* blocks */
+    { "公式块",        "Ctrl Shift M", "$$\n%s\n$$\n",  true },
+    { "代码块",        "Ctrl Shift K", "```\n%s\n```\n", true },
+    { "引用",          "Ctrl Shift Q", "> %s\n",        true },
+    { "表格",          "Ctrl Shift T",
+      "| 列 1 | 列 2 | 列 3 |\n| :--- | :---: | ---: |\n| %s | 内容 | 内容 |\n| 内容 | 内容 | 内容 |\n", true },
+    { "无序列表",      "Ctrl Alt 8",  "- %s\n",         true },
+    { "有序列表",      "Ctrl Alt 9",  "1. %s\n",        true },
+    { "任务列表",      "Ctrl Shift X", "- [ ] %s\n",     true },
+    { "水平分割线",    NULL,          "---\n%s",        true },
+    { "内容目录",      NULL,          "[TOC]\n%s",      true },
+    { "YAML Front Matter", NULL,      "---\ntitle: %s\n---\n", true },
+    { "脚注定义",      NULL,          "[^%s]: 脚注内容\n", true },
+    /* GitHub alert callouts */
+    { "提示 NOTE",     NULL,          "> [!NOTE]\n> %s\n",    true },
+    { "技巧 TIP",      NULL,          "> [!TIP]\n> %s\n",     true },
+    { "重要 IMPORTANT",NULL,          "> [!IMPORTANT]\n> %s\n", true },
+    { "警告 WARNING",  NULL,          "> [!WARNING]\n> %s\n",  true },
+    { "注意 CAUTION",  NULL,          "> [!CAUTION]\n> %s\n",  true },
+};
+#define NP_MD_SNIP_COUNT ((int)(sizeof NP_MD_SNIPS / sizeof NP_MD_SNIPS[0]))
+
+/* Named lookup so menu shortcuts can call a snippet by label. */
+static int np_md_snip_index(const char *label) {
+    for (int i = 0; i < NP_MD_SNIP_COUNT; i++)
+        if (!strcmp(NP_MD_SNIPS[i].label, label)) return i;
+    return -1;
+}
+
+static void np_apply_md_snip(notepad *a, int i) {
+    if (i < 0 || i >= NP_MD_SNIP_COUNT) return;
+    const np_md_snip *s = &NP_MD_SNIPS[i];
+    np_doc *d = np_cur(a);
+    if (s->block && d && d->caret == d->anchor) {
+        /* Only break the line when there is no selection to preserve. */
+        int p = NP_MAX(0, NP_MIN(d->caret, d->len));
+        if (p > np_line_start(d, p)) np_insert_at_caret(a, "\n");
+    }
+    np_latex_wrap(a, s->fmt);
+}
+
 static void np_open_find(notepad *a) {
     np_doc *d = np_cur(a);
     if (!d) return;
@@ -4125,6 +4354,44 @@ static void np_frame(cui_ctx *ui, void *user) {
         for (int k = 0; k < 9 && k < a->count; k++)
             if (cui_shortcut(ui, CUI_MOD_PRIMARY, digit_keys[k])) np_activate(a, k, true);
 
+        /* Markdown paragraph shortcuts (only for .md documents). Kept off the
+         * plain Ctrl+digit range used for tab switching. */
+        if (d && np_doc_is_markdown(d)) {
+            static const int md_level_keys[6] = {
+                CUI_KEY_1, CUI_KEY_2, CUI_KEY_3, CUI_KEY_4, CUI_KEY_5, CUI_KEY_6
+            };
+            /* Ctrl+Alt+1..6 → headings; Ctrl+Alt+0 → paragraph */
+            for (int k = 0; k < 6; k++)
+                if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, md_level_keys[k]))
+                    np_md_set_heading(a, k + 1);
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_0))
+                np_md_set_heading(a, 0);
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_EQUAL))
+                np_md_adjust_heading(a, -1);
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_MINUS))
+                np_md_adjust_heading(a, 1);
+            /* block inserts */
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_M))
+                np_apply_md_snip(a, np_md_snip_index("公式块"));
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_K))
+                np_apply_md_snip(a, np_md_snip_index("代码块"));
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_Q))
+                np_apply_md_snip(a, np_md_snip_index("引用"));
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_T))
+                np_apply_md_snip(a, np_md_snip_index("表格"));
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_X))
+                np_apply_md_snip(a, np_md_snip_index("任务列表"));
+            /* inline formatting */
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_B))
+                np_apply_md_snip(a, np_md_snip_index("加粗"));
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_I))
+                np_apply_md_snip(a, np_md_snip_index("斜体"));
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_8))
+                np_apply_md_snip(a, np_md_snip_index("无序列表"));
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_9))
+                np_apply_md_snip(a, np_md_snip_index("有序列表"));
+        }
+
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) a->show_sidebar = !a->show_sidebar;
         if (cui_key_pressed(ui, CUI_KEY_F7)) a->show_output = !a->show_output;
@@ -4499,6 +4766,91 @@ static void np_frame(cui_ctx *ui, void *user) {
                     }
                     if (cui_menu_item(ui, "在线模板库…", .icon = CUI_ICON_DOWNLOAD))
                         a->dlg_tpl_online = true;
+                }
+            }
+
+            /* Markdown 段落 menu: mirrors Typora's paragraph menu, shown only
+             * while editing a Markdown source. */
+            if (np_doc_is_markdown(d)) {
+                cui_menu_bar_menu(ui, "段落") {
+                    cui_menu_label(ui, "标题 · 选中文字后套用格式，否则插入占位模板");
+                    if (cui_menu_item(ui, "一级标题", .shortcut = "Ctrl Alt 1",
+                                      .checked = np_md_line_hlevel(d) == 1)) np_md_set_heading(a, 1);
+                    if (cui_menu_item(ui, "二级标题", .shortcut = "Ctrl Alt 2",
+                                      .checked = np_md_line_hlevel(d) == 2)) np_md_set_heading(a, 2);
+                    if (cui_menu_item(ui, "三级标题", .shortcut = "Ctrl Alt 3",
+                                      .checked = np_md_line_hlevel(d) == 3)) np_md_set_heading(a, 3);
+                    if (cui_menu_item(ui, "四级标题", .shortcut = "Ctrl Alt 4",
+                                      .checked = np_md_line_hlevel(d) == 4)) np_md_set_heading(a, 4);
+                    if (cui_menu_item(ui, "五级标题", .shortcut = "Ctrl Alt 5",
+                                      .checked = np_md_line_hlevel(d) == 5)) np_md_set_heading(a, 5);
+                    if (cui_menu_item(ui, "六级标题", .shortcut = "Ctrl Alt 6",
+                                      .checked = np_md_line_hlevel(d) == 6)) np_md_set_heading(a, 6);
+                    cui_menu_separator(ui);
+                    if (cui_menu_item(ui, "段落", .shortcut = "Ctrl Alt 0",
+                                      .checked = np_md_line_hlevel(d) == 0)) np_md_set_heading(a, 0);
+                    if (cui_menu_item(ui, "提升标题级别", .shortcut = "Ctrl Alt ="))
+                        np_md_adjust_heading(a, -1);
+                    if (cui_menu_item(ui, "降低标题级别", .shortcut = "Ctrl Alt -"))
+                        np_md_adjust_heading(a, 1);
+                    cui_menu_separator(ui);
+
+                    /* Blocks inserted as templates. */
+                    const char *blocks[] = { "表格", "公式块", "代码块", "引用" };
+                    for (int i = 0; i < 4; i++) {
+                        int idx = np_md_snip_index(blocks[i]);
+                        if (idx >= 0 && cui_menu_item(ui, NP_MD_SNIPS[idx].label,
+                                                       .shortcut = NP_MD_SNIPS[idx].shortcut))
+                            np_apply_md_snip(a, idx);
+                    }
+                    cui_menu(ui, "代码工具") {
+                        const char *items[] = { "行内代码", "加粗", "斜体", "删除线", "高亮" };
+                        for (int i = 0; i < 5; i++) {
+                            int idx = np_md_snip_index(items[i]);
+                            if (idx >= 0 && cui_menu_item(ui, NP_MD_SNIPS[idx].label,
+                                                           .shortcut = NP_MD_SNIPS[idx].shortcut))
+                                np_apply_md_snip(a, idx);
+                        }
+                    }
+                    cui_menu(ui, "警告框") {
+                        const char *items[] = { "提示 NOTE", "技巧 TIP", "重要 IMPORTANT",
+                                                "警告 WARNING", "注意 CAUTION" };
+                        for (int i = 0; i < 5; i++) {
+                            int idx = np_md_snip_index(items[i]);
+                            if (idx >= 0 && cui_menu_item(ui, NP_MD_SNIPS[idx].label))
+                                np_apply_md_snip(a, idx);
+                        }
+                    }
+                    cui_menu_separator(ui);
+
+                    /* Lists + checkboxes + indentation. */
+                    const char *lists[] = { "有序列表", "无序列表", "任务列表" };
+                    for (int i = 0; i < 3; i++) {
+                        int idx = np_md_snip_index(lists[i]);
+                        if (idx >= 0 && cui_menu_item(ui, NP_MD_SNIPS[idx].label,
+                                                       .shortcut = NP_MD_SNIPS[idx].shortcut))
+                            np_apply_md_snip(a, idx);
+                    }
+                    cui_menu(ui, "任务状态") {
+                        if (cui_menu_item(ui, "切换完成状态 [ ] / [x]")) np_md_toggle_task(a);
+                    }
+                    cui_menu(ui, "列表缩进") {
+                        if (cui_menu_item(ui, "缩进")) np_md_indent(a, 1);
+                        if (cui_menu_item(ui, "反缩进")) np_md_indent(a, -1);
+                    }
+                    cui_menu_separator(ui);
+
+                    if (cui_menu_item(ui, "在上方插入段落")) np_md_insert_para(a, true);
+                    if (cui_menu_item(ui, "在下方插入段落")) np_md_insert_para(a, false);
+                    cui_menu_separator(ui);
+
+                    const char *misc[] = { "链接", "脚注引用", "脚注定义",
+                                           "图片", "水平分割线", "内容目录", "YAML Front Matter" };
+                    for (int i = 0; i < 7; i++) {
+                        int idx = np_md_snip_index(misc[i]);
+                        if (idx >= 0 && cui_menu_item(ui, NP_MD_SNIPS[idx].label))
+                            np_apply_md_snip(a, idx);
+                    }
                 }
             }
 
