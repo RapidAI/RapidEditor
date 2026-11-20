@@ -1,0 +1,25 @@
+// BMP bitmap (little endian, Windows BITMAPINFOHEADER)
+LittleEndian();
+struct BMP {
+    char   magic[2];       // "BM"
+    uint32 file_size;
+    ushort reserved1;
+    ushort reserved2;
+    uint32 pixel_offset;
+    uint32 header_size;    // 40 for BITMAPINFOHEADER
+    int32  width;
+    int32  height;
+    ushort planes;
+    ushort bpp;
+    uint32 compression;
+    uint32 image_size;
+    int32  xppm;
+    int32  yppm;
+    uint32 colors_used;
+    uint32 colors_important;
+};
+BMP bmp;
+if (FTell() < FSize()) {
+    FSeek(bmp.pixel_offset);
+    ubyte pixels[FSize() - bmp.pixel_offset];
+}

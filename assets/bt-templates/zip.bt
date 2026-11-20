@@ -1,0 +1,25 @@
+// ZIP archive: local file headers
+LittleEndian();
+struct LocalHeader {
+    uint32 signature;      // 0x04034B50
+    ushort version;
+    ushort flags;
+    ushort method;
+    ushort modtime;
+    ushort moddate;
+    uint32 crc32;
+    uint32 compressed;
+    uint32 uncompressed;
+    ushort name_len;
+    ushort extra_len;
+    char   name[name_len];
+    ubyte  extra[extra_len];
+    ubyte  payload[compressed];
+};
+uint32 files = 0;
+while (!FEof()) {
+    if (FTell() + 30 > FSize()) break;
+    LocalHeader entry;
+    files = files + 1;
+    if (files >= 128) break;
+}

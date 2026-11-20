@@ -1,0 +1,22 @@
+// WAV audio (RIFF)
+LittleEndian();
+struct WAV {
+    char   riff[4];        // "RIFF"
+    uint32 file_size;
+    char   wave[4];        // "WAVE"
+    char   fmt_id[4];      // "fmt "
+    uint32 fmt_size;
+    ushort audio_format;
+    ushort channels;
+    uint32 sample_rate;
+    uint32 byte_rate;
+    ushort block_align;
+    ushort bits_per_sample;
+};
+WAV wav;
+// optional data chunk
+if (FTell() + 8 <= FSize()) {
+    char   data_id[4];
+    uint32 data_size;
+    ubyte  samples[data_size];
+}

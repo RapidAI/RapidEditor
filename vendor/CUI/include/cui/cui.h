@@ -1693,6 +1693,23 @@ CUI_API bool cui_markdown_apply_task(char *text, const cui_markdown_result *resu
 #define cui_markdown(ui, id, text, ...) cui_markdown_ex((ui), (id), (text), CUI__OPTS(cui_markdown_opts, __VA_ARGS__))
 #endif
 
+/* Standalone math renderer: lay out and draw a single TeX expression (the
+ * same subset used by $$...$$ blocks: fractions, roots, sub/superscripts,
+ * matrices, accents, greek) into a canvas. `expr` is the raw formula without
+ * the $ delimiters; `len` may be -1 to use strlen. Returns the rendered height
+ * in points (call it to size a container, then call it again to draw). The
+ * canvas fills the width given by `width`. */
+typedef struct cui_math_opts {
+    int _;
+    float size;                /* font size, default body text size */
+    bool boxed;                /* draw a subtle background panel + border */
+} cui_math_opts;
+CUI_API float cui_math_render(cui_ctx *ui, const char *id, const char *expr, int len,
+                              cui_size width, const cui_math_opts *opts);
+#ifndef __cplusplus
+#define cui_math(ui, id, expr, ...) cui_math_render((ui), (id), (expr), -1, CUI_FILL, CUI__OPTS(cui_math_opts, __VA_ARGS__))
+#endif
+
 /* ---- Code editor ---- */
 
 /* Code editor: editable code with the code block's highlighting, a line

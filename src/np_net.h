@@ -32,6 +32,13 @@ bool np_net_download(const char *url, const char *dest, const np_net_opts *opts)
  * frees with free(). Returns NULL on error. Used for the GitHub search API. */
 char *np_net_fetch(const char *url, const np_net_opts *opts);
 
+/* POST a JSON body with an optional Bearer token. Returns the response body
+ * in a heap buffer (caller frees), or NULL on any error / non-2xx status.
+ * `err` receives a short reason. `status_out`, if non-NULL, receives the
+ * HTTP status code (0 if no response). Used by the maclaw device-auth flow. */
+char *np_net_post_json(const char *url, const char *bearer, const char *json_body,
+                       const np_net_opts *opts, int *status_out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -27,6 +27,14 @@
 #include "np_net.h"
 #include "np_tinytex.h"
 #include "np_templates_online.h"
+#include "np_bt.h"
+#include "np_bt_templates.h"
+#include "np_latex_table.h"
+#include "np_latex_tidy.h"
+#include "np_font_scan.h"
+#include "np_ai.h"
+#include "np_qr.h"
+#include "np_maclaw.h"
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -65,6 +73,7 @@
 #define NP_LOAD_MAX   ((size_t)240 * 1024 * 1024)       /* largest file read in full */
 #define NP_BIG_FILE   ((size_t)8 * 1024 * 1024)         /* show a size hint above this */
 #define NP_PATH_CAP   1024
+#define BT_SRC_CAP    (32 * 1024)                       /* binary template script size */
 #define NP_DOC_MAX    16
 #define NP_RECENT_MAX 6
 #define NP_FONT_MIN   10
@@ -226,6 +235,15 @@ typedef struct np_doc {
     bool crlf;
     bool is_hex;                        /* binary file: shown in the hex editor */
     cui_hex_selection hexsel;           /* hex view selection (per document) */
+    /* Binary template (010 Editor style) applied to this hex document */
+    char      bt_name[96];              /* active template name, empty = none */
+    char      bt_source[BT_SRC_CAP];    /* active template script (loaded/embedded) */
+    np_bt_result bt_result;             /* last successful parse: fields to highlight */
+    uint64_t  bt_content_rev;           /* content_rev the result was parsed at */
+    int       bt_first;                 /* first visible field for the tree's virtual list */
+    int       bt_pick;                  /* selected field index */
+    bool      bt_show_tree;             /* field tree pane visible */
+    float     bt_ratio;                 /* hex/tree split ratio */
     bool lang_manual;                   /* user picked a language explicitly */
     int  lang;
     int  enc;
@@ -260,6 +278,7 @@ typedef struct notepad {
     char confirm_desc[NP_PATH_CAP + 128];
     char startup[NP_DOC_MAX][NP_PATH_CAP];
     int  startup_count;
+    char startup_bt[64];                /* --bt=<builtin> applied to opened hex docs */
     char recent[NP_RECENT_MAX][NP_PATH_CAP];
     int  recent_count;
 
@@ -338,6 +357,71 @@ typedef struct notepad {
     uint64_t hits_rev, hits_key;
     bool dlg_hexgoto;
     char hexgoto_buf[24];
+
+    /* Binary template (010 Editor style) ------------------------------- */
+    bool dlg_bt;                        /* choose a binary template */
+    int  bt_pick;                       /* selected builtin in the dialog */
+    char bt_error[256];                 /* last parse error to show */
+    char bt_custom_path[NP_PATH_CAP];   /* last custom template file loaded */
+
+    /* LaTeX table wizard (paste CSV/TSV -> three-line table) ---------- */
+    bool dlg_latex_table;
+    char ltable_src[16384];             /* pasted/typed grid text */
+    char ltable_caption[256];
+    char ltable_label[128];
+    char ltable_align[32];
+    int  ltable_style;                  /* 0 booktabs, 1 hline grid */
+    bool ltable_header, ltable_longtable, ltable_resize;
+    float ltable_width;
+    int  ltable_rows, ltable_cols;      /* last parsed dims, for the preview line */
+    char ltable_preview[8192];          /* last rendered LaTeX, shown read-only */
+    char ltable_err[256];
+
+    /* LaTeX source tidying + font setup ------------------------------- */
+    bool dlg_latex_tidy;
+    bool tidy_indent, tidy_join, tidy_trim;
+    int  tidy_spaces;
+    bool dlg_latex_fonts;
+    char font_latin_name[128], font_cjk_name[128];
+    char font_list[262144];             /* flat NUL-separated family names */
+    int  font_count;
+    int  font_latin_pick, font_cjk_pick;
+    int  font_scan_state;               /* 0 not scanned, 1 done */
+
+    /* LaTeX live math preview ----------------------------------------- */
+    bool dlg_math_preview;
+    char math_expr[1024];               /* formula being previewed (no $ delims) */
+
+    /* Controlled AI assistant (local agent) --------------------------- */
+    bool dlg_ai;
+    char ai_cmd[512];                   /* user-editable command template */
+    char ai_inst[512];                  /* instruction / task */
+    int  ai_task;                       /* 0 polish 1 translate 2 check 3 explain 4 custom */
+    int  ai_ctx;                        /* 0 selection 1 whole file */
+    int  ai_backend;                    /* 0 auto 1 claude 2 codex 3 custom */
+    char ai_ctx_path[NP_PATH_CAP];
+    char ai_out_path[NP_PATH_CAP];
+    char ai_result[65536];              /* agent output (owned copy) */
+    char ai_error[512];
+    volatile long ai_done;              /* 0 idle 1 running 2 ok 3 error */
+    int  ai_last_state;
+    char ai_orig[65536];                /* original text that was sent (for diff) */
+    int  ai_target_s, ai_target_e;      /* byte range in the doc to apply a rewrite */
+    char ai_target_path[NP_PATH_CAP];   /* doc path the range refers to */
+    bool ai_show_diff;
+
+    /* maclaw official-service login (scan QR with phone) --------------- */
+    bool dlg_maclaw;
+    char maclaw_hub[512];               /* Hub base URL (persisted) */
+    char maclaw_token[512];             /* viewer_token (persisted) */
+    char maclaw_email[256];
+    char maclaw_err[256];
+    np_maclaw_session maclaw_sess;
+    np_qr_code maclaw_qr;
+    bool maclaw_qr_ready;
+    volatile long maclaw_done;          /* 0 idle 1 creating 2 polling 3 ok 4 error */
+    int  maclaw_polls;
+    int  maclaw_last_state;
 
     /* EditPlus-style find in files ------------------------------------ */
     bool dlg_find_files;
@@ -432,10 +516,24 @@ static void np_logf(notepad *a, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Binary template helpers (defined near np_hex_pane, used by dialogs earlier). */
+static void np_bt_apply(notepad *a, np_doc *d, const char *name, const char *src);
+static void np_bt_clear(np_doc *d);
+static void np_bt_reparse(notepad *a, np_doc *d);
+static bool np_bt_load_file(const char *path, char *src, size_t src_cap,
+                            char *name, size_t name_cap);
+/* AI assistant helpers (defined with the background workers, used by dialogs). */
+static void np_ai_start(notepad *a);
+static void np_maclaw_login_start(notepad *a);
+static void np_maclaw_qr_paint(cui_ctx *ui, cui_rect r, void *user);
+static bool np_ai_apply(notepad *a);
+
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
            a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
-           a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex;
+           a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
+           a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
+           a->dlg_math_preview || a->dlg_ai || a->dlg_maclaw;
 }
 
 /* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
@@ -598,6 +696,7 @@ static np_doc *np_doc_from_latex_template(notepad *a, int index) {
 
 static void np_doc_free(np_doc *d) {
     if (!d) return;
+    np_bt_result_free(&d->bt_result);
     free(d->text); free(d->tmp); free(d);
 }
 
@@ -1458,6 +1557,216 @@ static void np_apply_latex_snip(notepad *a, int i) {
     else np_latex_block(a, s->text);
 }
 
+/* Ensure a \usepackage{...} line exists in the document preamble. Scans only
+ * the text before \begin{document} (or the first 32 KB), and inserts the
+ * package right after \documentclass if missing. Returns true if it inserted
+ * something (caller may warn the user that the preamble was touched). */
+static bool np_latex_ensure_package(notepad *a, np_doc *d, const char *pkg) {
+    if (!d || !pkg || !*pkg || d->is_hex) return false;
+    char needle[128];
+    snprintf(needle, sizeof needle, "\\usepackage{%s}", pkg);
+    /* Only look at the preamble. */
+    char *doc = strstr(d->text, "\\begin{document}");
+    size_t scan = doc ? (size_t)(doc - d->text) : (size_t)d->len;
+    if (scan > 32768) scan = 32768;
+    char head[32769];
+    memcpy(head, d->text, scan); head[scan] = 0;
+    if (strstr(head, needle)) return false;
+    /* Also skip the "\usepackage[opt]{pkg}" form. */
+    char bracket[160];
+    snprintf(bracket, sizeof bracket, "{%s}", pkg);
+    if (strstr(head, bracket)) return false;
+    /* Insert after the \documentclass{...} line. */
+    char *dc = strstr(d->text, "\\documentclass");
+    int at;
+    if (dc) {
+        char *nl = strchr(dc, '\n');
+        at = nl ? (int)(nl - d->text + 1) : (int)strlen(d->text);
+    } else {
+        at = 0;
+    }
+    char ins[160];
+    snprintf(ins, sizeof ins, "%s\n", needle);
+    size_t ilen = strlen(ins);
+    int len = d->len;
+    if (!np_ensure_cap(d, (size_t)len + ilen + 1)) return false;
+    memmove(d->text + at + ilen, d->text + at, (size_t)(len - at) + 1);
+    memcpy(d->text + at, ins, ilen);
+    np_text_changed(a, d);
+    return true;
+}
+
+/* Re-parse the table wizard's source text and render a preview. Updates the
+ * a->ltable_* preview/dims fields. Returns true when the source is valid. */
+static bool np_latex_table_repreview(notepad *a) {
+    a->ltable_err[0] = 0;
+    a->ltable_preview[0] = 0;
+    a->ltable_rows = a->ltable_cols = 0;
+    if (!a->ltable_src[0]) return false;
+    np_table_parse_opts po;
+    memset(&po, 0, sizeof po);
+    po.delim = NP_TBL_DELIM_AUTO;
+    np_latex_table tbl;
+    if (np_latex_table_parse(a->ltable_src, &po, &tbl,
+                             a->ltable_err, sizeof a->ltable_err) != 0)
+        return false;
+    np_table_render_opts ro;
+    memset(&ro, 0, sizeof ro);
+    ro.booktabs = a->ltable_style == 0;
+    ro.first_row_header = a->ltable_header;
+    ro.longtable = a->ltable_longtable;
+    ro.caption = a->ltable_caption;
+    ro.label = a->ltable_label;
+    ro.align = a->ltable_align;
+    ro.width = a->ltable_resize ? a->ltable_width : 0.0f;
+    int n = np_latex_table_render(&tbl, &ro, a->ltable_preview, sizeof a->ltable_preview);
+    a->ltable_rows = tbl.rows;
+    a->ltable_cols = tbl.cols;
+    np_latex_table_free(&tbl);
+    if (n < 0) {
+        snprintf(a->ltable_err, sizeof a->ltable_err, "表格过大，预览缓冲区不足");
+        a->ltable_preview[0] = 0;
+        return false;
+    }
+    return true;
+}
+
+/* Insert the rendered table at the caret and add required packages. */
+static bool np_latex_table_insert(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d) return false;
+    if (!np_latex_table_repreview(a)) return false;
+    if (!a->ltable_preview[0]) return false;
+    bool needs_bt = a->ltable_style == 0;
+    bool needs_lt = a->ltable_longtable;
+    bool needs_gfx = a->ltable_resize;
+    np_insert_at_caret(a, a->ltable_preview);
+    if (needs_bt && np_latex_ensure_package(a, d, "booktabs"))
+        np_toast(a, "已添加宏包", "导言区已加入 \\usepackage{booktabs}", CUI_TONE_INFO);
+    if (needs_lt && np_latex_ensure_package(a, d, "longtable"))
+        np_toast(a, "已添加宏包", "导言区已加入 \\usepackage{longtable}", CUI_TONE_INFO);
+    if (needs_gfx && np_latex_ensure_package(a, d, "graphicx"))
+        np_toast(a, "已添加宏包", "导言区已加入 \\usepackage{graphicx}（resizebox 需要）", CUI_TONE_INFO);
+    return true;
+}
+
+/* Apply source tidying to the whole current document. */
+static bool np_latex_tidy_apply(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex || d->len <= 0) return false;
+    np_tidy_opts o;
+    memset(&o, 0, sizeof o);
+    o.normalize_indent = a->tidy_indent;
+    o.join_hard_wraps = a->tidy_join;
+    o.trim_trailing_ws = a->tidy_trim;
+    o.indent_spaces = a->tidy_spaces;
+    char *tidied = NULL;
+    if (np_latex_tidy(d->text, (size_t)d->len, &o, &tidied) != 0 || !tidied) {
+        np_toast(a, "整理失败", "内存不足", CUI_TONE_WARNING);
+        return false;
+    }
+    size_t nlen = strlen(tidied);
+    int len = d->len;
+    if (nlen >= (size_t)len) {
+        if (!np_ensure_cap(d, nlen + 1)) { free(tidied); np_toast(a, "文本已满", "无法整理", CUI_TONE_WARNING); return false; }
+    }
+    memcpy(d->text, tidied, nlen + 1);
+    d->len = (int)nlen;
+    free(tidied);
+    np_text_changed(a, d);
+    if (d->caret > d->len) d->caret = d->len;
+    if (d->anchor > d->len) d->anchor = d->len;
+    cui_code_editor_select(a->ui, d->editor_id, d->caret, d->caret);
+    return true;
+}
+
+/* Insert one line just before \begin{document} (preamble), or at the very
+ * start for untitled buffers. Used by the font setup command. */
+static void np_latex_preamble_line(notepad *a, np_doc *d, const char *line) {
+    if (!d || !line || !*line) return;
+    char *doc = strstr(d->text, "\\begin{document}");
+    int at = doc ? (int)(doc - d->text) : 0;
+    /* Back up over the indentation/blank line right before \begin{document}
+     * so our line is not glued to an existing indented doc start. */
+    size_t ilen = strlen(line);
+    int len = d->len;
+    if (!np_ensure_cap(d, (size_t)len + ilen + 2)) return;
+    memmove(d->text + at + (int)ilen, d->text + at, (size_t)(len - at) + 1);
+    memcpy(d->text + at, line, ilen);
+    np_text_changed(a, d);
+}
+
+/* Insert fontspec / xeCJK setup inferred from the font picker. */
+static bool np_latex_fonts_apply(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return false;
+    if (!a->font_latin_name[0] && !a->font_cjk_name[0]) {
+        np_toast(a, "未选择字体", "请至少选择一种字体", CUI_TONE_WARNING);
+        return false;
+    }
+    /* The document must be compiled with xelatex for fontspec/xeCJK. */
+    np_latex_ensure_package(a, d, "fontspec");
+    if (a->font_latin_name[0]) {
+        char line[288];
+        snprintf(line, sizeof line, "\\setmainfont{%s}\n", a->font_latin_name);
+        np_latex_preamble_line(a, d, line);
+    }
+    if (a->font_cjk_name[0]) {
+        np_latex_ensure_package(a, d, "xeCJK");
+        char line[288];
+        snprintf(line, sizeof line, "\\setCJKmainfont{%s}\n", a->font_cjk_name);
+        np_latex_preamble_line(a, d, line);
+    }
+    np_toast(a, "字体已写入", "导言区已加入 fontspec/xeCJK 设置；请用 XeLaTeX 编译", CUI_TONE_INFO);
+    return true;
+}
+
+/* Extract the math expression under the caret (the nearest $...$ / $$...$$
+ * span enclosing or right before the caret) into a->math_expr. Returns true
+ * when something was found. Used to seed the live preview from the editor. */
+static bool np_math_expr_from_caret(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex || d->len <= 1) return false;
+    int pos = NP_MAX(0, NP_MIN(d->caret, d->len - 1));
+    /* Search backwards for an unescaped '$'. */
+    int open = -1;
+    for (int i = pos; i >= 0; i--) {
+        if (d->text[i] != '$') continue;
+        int bs = 0;
+        for (int k = i - 1; k >= 0 && d->text[k] == '\\'; k--) bs++;
+        if (bs % 2 == 0) { open = i; break; }
+    }
+    if (open < 0) return false;
+    bool display = (open + 1 < d->len && d->text[open + 1] == '$');
+    int start = open + (display ? 2 : 1);
+    /* Search forward for the matching delimiter. */
+    char *end = NULL;
+    if (display) end = strstr(d->text + start, "$$");
+    else {
+        for (int i = start; i < d->len; i++) {
+            if (d->text[i] != '$') continue;
+            int bs = 0;
+            for (int k = i - 1; k >= 0 && d->text[k] == '\\'; k--) bs++;
+            if (bs % 2 == 0) { end = d->text + i; break; }
+        }
+    }
+    int stop = end ? (int)(end - d->text) : d->len;
+    if (stop <= start) return false;
+    size_t n = (size_t)(stop - start);
+    if (n >= sizeof a->math_expr) n = sizeof a->math_expr - 1;
+    memcpy(a->math_expr, d->text + start, n);
+    a->math_expr[n] = 0;
+    return true;
+}
+
+/* Wrap the current preview expression as $...$ and insert at the caret. */
+static void np_math_expr_insert(notepad *a) {
+    if (!a->math_expr[0]) return;
+    char buf[1100];
+    snprintf(buf, sizeof buf, "$%s$", a->math_expr);
+    np_insert_at_caret(a, buf);
+}
+
 /* ------------------------------------------------------------------ */
 /* Markdown paragraph menu                                             */
 /* ------------------------------------------------------------------ */
@@ -2148,6 +2457,347 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
+    /* LaTeX source tidying: normalize indent, join wraps, trim trailing WS. */
+    cui_dialog(ui, "整理 LaTeX 源码", &a->dlg_latex_tidy,
+               .description = "规范缩进、合并段内硬回车、清理行尾空白；严格保护公式/代码/注释",
+               .width = 440) {
+        cui_checkbox(ui, "规范缩进（按环境层级）", &a->tidy_indent);
+        cui_checkbox(ui, "合并段内硬回车", &a->tidy_join);
+        cui_checkbox(ui, "清理行尾空白", &a->tidy_trim);
+        double sp = a->tidy_spaces;
+        if (cui_number(ui, "tidy-spaces", &sp, 0, 8, .label = "每层缩进空格数（0=制表符）", .decimals = 0, .step = 1))
+            a->tidy_spaces = (int)sp;
+        cui_text(ui, "verbatim / lstlisting / minted / 数学环境 / 注释行会原样保留。",
+                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) a->dlg_latex_tidy = false;
+            if (cui_button(ui, "整理全文", .variant = CUI_BUTTON_PRIMARY)) {
+                if (np_latex_tidy_apply(a)) {
+                    np_toast(a, "整理完成", "源码已按所选规则规范化", CUI_TONE_INFO);
+                    a->dlg_latex_tidy = false;
+                } else {
+                    np_toast(a, "整理失败", "当前文档无内容", CUI_TONE_WARNING);
+                }
+            }
+        }
+    }
+
+    /* Controlled AI assistant: local agent with explicit context + Diff apply. */
+    cui_dialog(ui, "AI 助手", &a->dlg_ai,
+               .description = "本机 Codex / Claude Code，或关联 maclaw 用户的官方服务；先审阅 Diff，确认后才写入正文",
+               .width = 680) {
+        /* Poll the worker state; request a redraw on transitions. */
+        long st = a->ai_done;
+        bool ai_rewrite = (a->ai_task == 0 || a->ai_task == 1 || a->ai_task == 4);
+        if (st != a->ai_last_state) { a->ai_last_state = st; cui_request_redraw(ui); }
+
+        const char *ctxs[] = { "当前选区", "整个文件" };
+        const char *tasks[] = { "润色改写", "翻译", "检查错误", "解释说明", "自定义指令" };
+        const char *backs[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "maclaw 官方服务" };
+        cui_row(ui, .width = CUI_FILL, .gap = 10) {
+            if (cui_select(ui, "ai-ctx", ctxs, 2, &a->ai_ctx, .label = "上下文", .width = 160)) { /* changed */ }
+            if (cui_select(ui, "ai-task", tasks, 5, &a->ai_task, .label = "任务", .width = 160)) {
+                const char *def = NULL;
+                switch (a->ai_task) {
+                    case 0: def = "请润色这段 LaTeX：改进措辞与表达，保持所有命令、公式和结构与原意不变。只输出润色后的完整源码。"; break;
+                    case 1: def = "请把这段 LaTeX 翻译成中文，保持所有 LaTeX 命令、公式和环境不变。只输出翻译后的完整源码。"; break;
+                    case 2: def = "请检查这段 LaTeX 的错误与问题（语法、宏包、引用、公式），逐条列出问题与建议。不要修改原文。"; break;
+                    case 3: def = "请解释这段 LaTeX 的作用与结构。不要修改原文。"; break;
+                    default: def = NULL; break;
+                }
+                if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
+            }
+            if (cui_select(ui, "ai-back", backs, 5, &a->ai_backend, .label = "后端", .width = 160)) {
+                a->ai_cmd[0] = 0;   /* regenerate default template on next ask */
+            }
+        }
+        cui_input(ui, "ai-inst", a->ai_inst, sizeof a->ai_inst,
+                  .label = "指令", .placeholder = "告诉 AI 要做什么", .width = CUI_FILL);
+        if (a->ai_backend == 4) {
+            cui_text(ui, a->maclaw_token[0]
+                     ? "maclaw 官方服务已授权；请求将以该 maclaw 用户的额度计费。"
+                     : "尚未授权 maclaw：请先扫码登录，再使用此后端。",
+                     .size = 12,
+                     .color = a->maclaw_token[0] ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
+        } else {
+            cui_textarea(ui, "ai-cmd", a->ai_cmd, sizeof a->ai_cmd,
+                         .label = "命令模板（{file}=上下文文件, {out}=结果文件；可改为任意本机 agent 命令）",
+                         .height = 56);
+        }
+
+        cui_row(ui, .width = CUI_FILL, .gap = 8) {
+            if (cui_button(ui, st == 1 ? "处理中…" : "Ask AI", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = st == 1 || !a->ai_inst[0])) {
+                np_ai_start(a);
+            }
+            if (cui_button(ui, "maclaw 登录…", .variant = CUI_BUTTON_GHOST)) a->dlg_maclaw = true;
+            if (cui_button(ui, "清空结果", .variant = CUI_BUTTON_GHOST, .disabled = st == 1)) {
+                a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0; a->ai_show_diff = false;
+            }
+        }
+
+        if (st == 1) {
+            cui_text(ui, "AI 正在处理，请稍候…", .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        } else if (st == 3) {
+            cui_text(ui, "AI 调用失败", .size = 13, .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_DANGER);
+            cui_text(ui, a->ai_error[0] ? a->ai_error : "未知错误", .size = 12);
+            if (a->ai_backend == 4) {
+                cui_text(ui, "提示：请确认 maclaw 账号仍有可用额度，且 Hub 地址与扫码登录时一致。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            } else {
+                cui_text(ui, "提示：请在命令模板中填入本机已安装的 agent 命令，或确认其已加入 PATH。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            }
+        } else if (st == 2 && a->ai_result[0]) {
+            if (ai_rewrite) {
+                cui_text(ui, "逐处 Diff（原文 → AI 结果），确认后才写入", .size = 12, .font = CUI_FONT_MEDIUM);
+                cui_diff_result dr = cui_diff_view(ui, "ai-diff", a->ai_orig, a->ai_result,
+                                                    .height = -1, .context = 3, .language = "tex");
+                (void)dr;
+            } else {
+                cui_text(ui, "AI 回复（不会改动正文）", .size = 12, .font = CUI_FONT_MEDIUM);
+                cui_textarea(ui, "ai-answer", a->ai_result, sizeof a->ai_result,
+                             .height = 180, .read_only = true);
+            }
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "关闭")) a->dlg_ai = false;
+                if (ai_rewrite) {
+                    if (cui_button(ui, "应用改写", .variant = CUI_BUTTON_PRIMARY)) {
+                        if (np_ai_apply(a)) {
+                            np_toast(a, "已应用", "AI 改写已写入文档（当前编辑器撤销为软支持）", CUI_TONE_INFO);
+                            a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                            a->dlg_ai = false;
+                        }
+                    }
+                } else {
+                    if (cui_button(ui, "完成", .variant = CUI_BUTTON_PRIMARY)) a->dlg_ai = false;
+                }
+            }
+        } else {
+            cui_text(ui, "选择上下文与任务，填写指令后点「Ask AI」。结果不会自动覆盖正文。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY)) a->dlg_ai = false;
+            }
+        }
+    }
+
+    /* maclaw official-service login: generate a device-authorization QR and
+     * receive a viewer_token tied to the authorizing maclaw account. */
+    cui_dialog(ui, "maclaw 官方服务", &a->dlg_maclaw,
+               .description = "扫码后使用关联 maclaw 用户的官方 LLM 服务；token 会保存在本机配置中",
+               .width = 520) {
+        long st = a->maclaw_done;
+        if (st != a->maclaw_last_state) {
+            a->maclaw_last_state = (int)st;
+            cui_request_redraw(ui);
+        }
+        if (st == 1 || st == 2) cui_request_redraw(ui); /* animate spinner / poll count */
+        cui_input(ui, "maclaw-hub", a->maclaw_hub, sizeof a->maclaw_hub,
+                  .label = "Hub 地址", .placeholder = "例如 https://hub.maclaw.top",
+                  .width = CUI_FILL);
+        cui_text(ui, "在手机 MaClawBot 中打开「设置 → 授权电脑端」扫码；授权不会切换手机端账号。",
+                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+
+        if (st == 1) {
+            cui_spinner(ui, 22);
+            cui_text(ui, "正在创建授权会话…", .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY)) a->dlg_maclaw = false;
+            }
+        } else if (st == 2 && a->maclaw_qr_ready) {
+            char status[160];
+            snprintf(status, sizeof status, "等待手机授权…（已轮询 %d 次，二维码 5 分钟内有效）",
+                     a->maclaw_polls);
+            cui_text(ui, status, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_canvas(ui, "maclaw-auth-qr", CUI_FILL,
+                       (cui_size){ CUI_SIZE_FIXED, 280 },
+                       np_maclaw_qr_paint, &a->maclaw_qr, sizeof a->maclaw_qr);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY)) a->dlg_maclaw = false;
+            }
+        } else if (st == 3) {
+            cui_text(ui, "授权成功", .size = 14, .font = CUI_FONT_MEDIUM,
+                     .color = CUI_COLOR_SUCCESS);
+            if (a->maclaw_email[0]) {
+                char who[320];
+                snprintf(who, sizeof who, "maclaw 账号：%s", a->maclaw_email);
+                cui_text(ui, who, .size = 12);
+            }
+            char saved[160];
+            snprintf(saved, sizeof saved, "已保存 viewer_token（%d 字符），AI 助手选择「maclaw 官方服务」即可使用。",
+                     (int)strlen(a->maclaw_token));
+            cui_text(ui, saved, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "重新授权", .variant = CUI_BUTTON_GHOST)) np_maclaw_login_start(a);
+                if (cui_button(ui, "完成", .variant = CUI_BUTTON_PRIMARY)) a->dlg_maclaw = false;
+            }
+        } else {
+            if (st == 4 && a->maclaw_err[0]) {
+                cui_text(ui, a->maclaw_err, .size = 12, .color = CUI_COLOR_DANGER);
+            } else {
+                cui_text(ui, "点击下方按钮生成二维码，然后用手机 MaClawBot 扫码授权。",
+                         .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            }
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "取消")) a->dlg_maclaw = false;
+                if (cui_button(ui, st == 4 ? "重新生成二维码" : "生成二维码",
+                               .variant = CUI_BUTTON_PRIMARY,
+                               .disabled = !a->maclaw_hub[0])) {
+                    np_maclaw_login_start(a);
+                }
+            }
+        }
+    }
+
+    /* Live math formula preview: type a TeX expression, see it rendered. */
+    cui_dialog(ui, "公式实时预览", &a->dlg_math_preview,
+               .description = "输入 LaTeX 公式（不含 $ 符号），所见即所得实时渲染",
+               .width = 560) {
+        cui_input(ui, "math-expr", a->math_expr, sizeof a->math_expr,
+                  .label = "公式", .placeholder = "\\frac{a}{b}+\\sqrt{x^2+y^2}",
+                  .autofocus = true, .width = CUI_FILL);
+        if (a->math_expr[0]) {
+            char cap[64];
+            snprintf(cap, sizeof cap, "渲染结果（%d 字符）", (int)strlen(a->math_expr));
+            cui_text(ui, cap, .size = 12, .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_TEXT_MUTED);
+            cui_math_render(ui, "math-live-preview", a->math_expr, -1, CUI_FILL,
+                            &(cui_math_opts){ .boxed = true });
+        } else {
+            cui_text(ui, "支持 \\frac、\\sqrt、上下标、矩阵、希腊字母、重音等（与 $$ 块公式同一引擎）。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "关闭")) a->dlg_math_preview = false;
+            if (cui_button(ui, "从光标提取", .variant = CUI_BUTTON_GHOST,
+                           .tooltip = "取当前光标所在的 $...$ 公式填入")) {
+                if (!np_math_expr_from_caret(a))
+                    np_toast(a, "未找到公式", "光标不在 $...$ 公式内", CUI_TONE_WARNING);
+            }
+            if (cui_button(ui, "插入 $...$", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->math_expr[0])) {
+                np_math_expr_insert(a);
+                np_toast(a, "已插入", "公式已作为 $...$ 插入光标处", CUI_TONE_INFO);
+                a->dlg_math_preview = false;
+            }
+        }
+    }
+
+    /* LaTeX fonts: enumerate installed fonts, write fontspec/xeCJK setup. */
+    if (a->dlg_latex_fonts && a->font_scan_state == 0) {
+        a->font_scan_state = 1;
+        a->font_count = np_font_scan_families(a->font_list, sizeof a->font_list, 128);
+        if (a->font_count < 0) a->font_count = 0;
+    }
+    cui_dialog(ui, "LaTeX 字体设置（XeLaTeX）", &a->dlg_latex_fonts,
+               .description = "选择本机字体，写入 fontspec / xeCJK 设置到导言区",
+               .width = 500) {
+        const char *names[512];
+        int nn = a->font_count;
+        if (nn > 512) nn = 512;
+        const char *p = a->font_list;
+        for (int i = 0; i < nn; i++) { names[i] = p; p += strlen(p) + 1; }
+        if (nn > 0) {
+            a->font_latin_pick = NP_MAX(0, NP_MIN(a->font_latin_pick, nn - 1));
+            a->font_cjk_pick = NP_MAX(0, NP_MIN(a->font_cjk_pick, nn - 1));
+            cui_row(ui, .width = CUI_FILL, .gap = 10) {
+                if (cui_select(ui, "font-latin", names, nn, &a->font_latin_pick,
+                               .label = "西文字体 (mainfont)", .searchable = true, .width = CUI_FILL))
+                    snprintf(a->font_latin_name, sizeof a->font_latin_name, "%s", names[a->font_latin_pick]);
+                if (cui_select(ui, "font-cjk", names, nn, &a->font_cjk_pick,
+                               .label = "中文字体 (CJKmainfont)", .searchable = true, .width = CUI_FILL))
+                    snprintf(a->font_cjk_name, sizeof a->font_cjk_name, "%s", names[a->font_cjk_pick]);
+            }
+        } else {
+            cui_text(ui, "未能枚举本机字体（此平台不支持），请手动输入字体名。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        }
+        cui_input(ui, "font-latin-manual", a->font_latin_name, sizeof a->font_latin_name,
+                  .label = "西文字体名", .placeholder = "例如 Times New Roman / Latin Modern Roman");
+        cui_input(ui, "font-cjk-manual", a->font_cjk_name, sizeof a->font_cjk_name,
+                  .label = "中文字体名", .placeholder = "例如 Noto Sans CJK SC / SimSun / Microsoft YaHei");
+        cui_text(ui, "字体名须与系统安装的名称一致；配置将写入导言区，编译时请用 XeLaTeX。",
+                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) a->dlg_latex_fonts = false;
+            if (cui_button(ui, "写入导言区", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->font_latin_name[0] && !a->font_cjk_name[0])) {
+                if (np_latex_fonts_apply(a)) a->dlg_latex_fonts = false;
+            }
+        }
+    }
+
+    /* LaTeX table wizard: paste CSV/TSV (or Excel cells) -> LaTeX table. */
+    cui_dialog(ui, "插入表格", &a->dlg_latex_table,
+               .description = "粘贴 Excel 单元格 / CSV / TSV，实时生成 LaTeX 三线表代码",
+               .width = 560) {
+        int ta = cui_textarea(ui, "ltable-src", a->ltable_src, sizeof a->ltable_src,
+                              .label = "表格数据（逗号 / 制表符 / 分号分隔，可用引号包裹含分隔符的单元格）",
+                              .placeholder = "姓名,成绩,备注\n张三,92,优秀\n李四,88,良好",
+                              .height = 110);
+        cui_row(ui, .width = CUI_FILL, .gap = 8) {
+            if (cui_button(ui, "从剪贴板粘贴", .icon = CUI_ICON_CLIPBOARD,
+                           .tooltip = "直接粘贴 Excel / WPS 复制的单元格或 CSV 文本")) {
+                const char *clip = cui_get_clipboard_text(ui);
+                if (clip && *clip) {
+                    snprintf(a->ltable_src, sizeof a->ltable_src, "%s", clip);
+                    ta = CUI_CHANGED;
+                } else {
+                    np_toast(a, "剪贴板为空", "请先复制表格内容", CUI_TONE_WARNING);
+                }
+            }
+            if (cui_button(ui, "清空")) { a->ltable_src[0] = 0; ta = CUI_CHANGED; }
+        }
+        const char *styles[] = { "三线表 (booktabs)", "横线表格 (hline)" };
+        cui_row(ui, .width = CUI_FILL, .gap = 10) {
+            cui_select(ui, "ltable-style", styles, 2, &a->ltable_style, .label = "样式", .width = 200);
+            cui_input(ui, "ltable-align", a->ltable_align, sizeof a->ltable_align,
+                      .label = "列对齐 (l/c/r)", .placeholder = "lcr", .width = 140);
+        }
+        cui_row(ui, .width = CUI_FILL, .gap = 10) {
+            cui_input(ui, "ltable-caption", a->ltable_caption, sizeof a->ltable_caption,
+                      .label = "标题", .placeholder = "可留空", .width = CUI_FILL);
+            cui_input(ui, "ltable-label", a->ltable_label, sizeof a->ltable_label,
+                      .label = "标签", .placeholder = "tab:xxx", .width = 140);
+        }
+        cui_row(ui, .width = CUI_FILL, .gap = 14) {
+            cui_checkbox(ui, "首行为表头", &a->ltable_header);
+            cui_checkbox(ui, "长表格 longtable", &a->ltable_longtable);
+            cui_checkbox(ui, "缩放适应页宽", &a->ltable_resize);
+        }
+        if (a->ltable_resize) {
+            double w = a->ltable_width;
+            if (cui_number(ui, "ltable-width", &w, 0.3, 1.0,
+                           .label = "宽度 (占行宽比例)", .decimals = 2, .width = 180))
+                a->ltable_width = (float)w;
+        }
+        /* Re-render whenever any source or option changes. */
+        if ((ta & CUI_CHANGED) || (ta & CUI_SUBMITTED))
+            np_latex_table_repreview(a);
+        if (a->ltable_preview[0]) {
+            char info[96];
+            snprintf(info, sizeof info, "预览 · %d 行 × %d 列", a->ltable_rows, a->ltable_cols);
+            cui_text(ui, info, .size = 12, .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_TEXT_MUTED);
+            cui_textarea(ui, "ltable-preview", a->ltable_preview, sizeof a->ltable_preview,
+                         .height = 120, .read_only = true);
+        } else if (a->ltable_err[0]) {
+            cui_text(ui, a->ltable_err, .size = 12, .color = CUI_COLOR_DANGER);
+        } else {
+            cui_text(ui, "粘贴数据后这里显示生成的 LaTeX 代码。", .size = 12,
+                     .color = CUI_COLOR_TEXT_MUTED);
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) a->dlg_latex_table = false;
+            if (cui_button(ui, "插入", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->ltable_preview[0])) {
+                if (np_latex_table_insert(a)) {
+                    np_toast(a, "表格已插入", "所需的 booktabs/longtable/graphicx 宏包已自动补齐", CUI_TONE_INFO);
+                    a->dlg_latex_table = false;
+                }
+            }
+        }
+    }
+
     /* LaTeX template picker ------------------------------------------- */
     cui_dialog(ui, "从模板新建 LaTeX 文档", &a->dlg_latex_tpl,
                .description = "选择一个自包含模板，编译预览会立即启用",
@@ -2187,6 +2837,67 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 np_doc *fresh = np_doc_from_latex_template(a, a->latex_tpl_pick);
                 if (fresh) np_activate(a, a->count - 1, true);
                 a->dlg_latex_tpl = false;
+            }
+        }
+    }
+
+    /* Binary template picker (010 Editor style) ----------------------- */
+    if (a->dlg_bt) {
+        int nb = 0;
+        while (np_bt_builtins[nb].name) nb++;
+        const char *names[64];
+        for (int i = 0; i < nb && i < 64; i++) names[i] = np_bt_builtins[i].label;
+        cui_dialog(ui, "二进制格式模板", &a->dlg_bt,
+                   .description = "选择格式模板解析当前十六进制文件，字段会在字节区高亮并可点击定位",
+                   .width = 480) {
+            np_doc *bd = np_cur(a);
+            if (nb > 0) {
+                a->bt_pick = NP_MAX(0, NP_MIN(a->bt_pick, nb - 1));
+                if (cui_select(ui, "bt-pick", names, nb, &a->bt_pick,
+                               .label = "内置格式", .width = CUI_FILL)) {
+                    np_bt_validate(np_bt_builtins[a->bt_pick].source,
+                                   a->bt_error, sizeof a->bt_error);
+                }
+                const np_bt_builtin *bt = &np_bt_builtins[a->bt_pick];
+                char hint[240];
+                hint[0] = 0;
+                const char *ln = strchr(bt->source, '\n');
+                if (ln) {
+                    size_t l = (size_t)(ln - bt->source);
+                    if (l > sizeof hint - 1) l = sizeof hint - 1;
+                    memcpy(hint, bt->source, l); hint[l] = 0;
+                }
+                if (hint[0]) cui_text(ui, hint, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            }
+            if (a->bt_error[0]) cui_text(ui, a->bt_error, .size = 11, .color = CUI_COLOR_DANGER);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "加载 .bt 文件…", .variant = CUI_BUTTON_GHOST,
+                               .tooltip = "加载 010 Editor 风格的自定义模板脚本")) {
+                    char path[NP_PATH_CAP];
+                    if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                            .kind = CUI_FILE_OPEN, .title = "打开二进制模板脚本",
+                            .filter_name = "二进制模板 (*.bt)", .filter = "*.bt" },
+                            path, sizeof path)) {
+                        char src[BT_SRC_CAP], name[128];
+                        if (np_bt_load_file(path, src, sizeof src, name, sizeof name)) {
+                            if (bd) np_bt_apply(a, bd, name, src);
+                            a->bt_error[0] = 0;
+                            a->dlg_bt = false;
+                        } else {
+                            snprintf(a->bt_error, sizeof a->bt_error, "无法读取模板文件");
+                        }
+                    }
+                }
+                if (bd && bd->bt_name[0] && cui_button(ui, "清除模板", .variant = CUI_BUTTON_GHOST)) {
+                    np_bt_clear(bd);
+                    a->dlg_bt = false;
+                }
+                if (cui_button(ui, "取消")) a->dlg_bt = false;
+                if (cui_button(ui, "应用", .variant = CUI_BUTTON_PRIMARY, .disabled = nb <= 0 || !bd)) {
+                    const np_bt_builtin *bt = &np_bt_builtins[a->bt_pick];
+                    np_bt_apply(a, bd, bt->label, bt->source);
+                    a->dlg_bt = false;
+                }
             }
         }
     }
@@ -2755,6 +3466,270 @@ static void np_tt_install_worker(void *arg) {
 #endif
 }
 
+/* AI worker: build the prompt file from the instruction + captured context,
+ * run the user's agent command, read back its answer. Touches only worker-
+ * owned paths and the shared volatile done flag; never CUI state. */
+static void np_ai_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    /* prompt = instruction + context, all in one file the agent reads. */
+    size_t need = strlen(a->ai_inst) + strlen(a->ai_orig) + 64;
+    char *prompt = (char *)malloc(need);
+    if (!prompt) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "内存不足"); goto done; }
+    snprintf(prompt, need, "%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
+             a->ai_inst[0] ? a->ai_inst : "请处理以下内容", a->ai_orig);
+    bool wrote = np_ai_write_context(a->ai_ctx_path, prompt);
+    free(prompt);
+    if (!wrote) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "无法写入临时提示文件"); goto done; }
+    if (!np_ai_exec(a->ai_cmd, a->ai_ctx_path, a->ai_out_path, NULL,
+                    a->ai_error, sizeof a->ai_error)) {
+        a->ai_done = 3;
+        goto done;
+    }
+    long n = np_ai_read_result(a->ai_out_path, a->ai_result, sizeof a->ai_result);
+    if (n < 0) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "无法读取 AI 输出"); goto done; }
+    a->ai_done = 2;
+done:
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+/* maclaw official LLM worker: use the viewer_token obtained by scanning the
+ * QR with MaClawBot. The Hub bills this request to the linked maclaw user. */
+static void np_ai_maclaw_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    if (!a->maclaw_token[0]) {
+        a->ai_done = 3;
+        snprintf(a->ai_error, sizeof a->ai_error,
+                 "请先在「maclaw 官方服务」中扫码登录");
+        goto done;
+    }
+    const char *inst = a->ai_inst[0] ? a->ai_inst : "请处理以下内容";
+    size_t prompt_cap = strlen(inst) + strlen(a->ai_orig) + 128;
+    char *prompt = (char *)malloc(prompt_cap);
+    if (!prompt) {
+        a->ai_done = 3;
+        snprintf(a->ai_error, sizeof a->ai_error, "内存不足");
+        goto done;
+    }
+    snprintf(prompt, prompt_cap, "%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
+             inst, a->ai_orig);
+    bool ok = np_maclaw_llm_chat(a->maclaw_hub, a->maclaw_token, prompt,
+                                 a->ai_result, sizeof a->ai_result,
+                                 a->ai_error, sizeof a->ai_error);
+    free(prompt);
+    a->ai_done = ok ? 2 : 3;
+done:
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+/* maclaw device-authorization worker: create a session, encode its QR, then
+ * poll until the phone authorizes (or timeout). Only touches worker-owned /
+ * volatile shared fields, never CUI state. */
+static void np_maclaw_login_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    np_maclaw_cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.hub_url, sizeof cfg.hub_url, "%s", a->maclaw_hub);
+    snprintf(cfg.client_name, sizeof cfg.client_name, "RapidEditor AI 助手");
+    snprintf(cfg.client_id, sizeof cfg.client_id, "rapideditor-ai-assistant");
+    cfg.timeout_sec = 20;
+
+    a->maclaw_done = 1; /* creating */
+    if (!np_maclaw_create_session(&cfg, &a->maclaw_sess)) {
+        snprintf(a->maclaw_err, sizeof a->maclaw_err, "%s",
+                 a->maclaw_sess.err[0] ? a->maclaw_sess.err : "创建授权会话失败");
+        a->maclaw_done = 4;
+        goto done;
+    }
+    if (!np_qr_encode(a->maclaw_sess.qr_payload, strlen(a->maclaw_sess.qr_payload),
+                      &a->maclaw_qr)) {
+        snprintf(a->maclaw_err, sizeof a->maclaw_err, "二维码编码失败（payload 过长）");
+        a->maclaw_done = 4;
+        goto done;
+    }
+    a->maclaw_qr_ready = true;
+    a->maclaw_done = 2; /* polling, QR ready */
+
+    for (int i = 0; i < 90; i++) { /* up to 3 minutes */
+#ifdef _WIN32
+        Sleep(2000);
+#else
+        usleep(2000000);
+#endif
+        char tok[512] = {0}, email[256] = {0}, err[256] = {0};
+        const char *st = np_maclaw_poll(&cfg, &a->maclaw_sess,
+                                        tok, sizeof tok, email, sizeof email,
+                                        err, sizeof err);
+        a->maclaw_polls = i + 1;
+        if (st && !strcmp(st, "authorized") && tok[0]) {
+            snprintf(a->maclaw_token, sizeof a->maclaw_token, "%s", tok);
+            snprintf(a->maclaw_email, sizeof a->maclaw_email, "%s", email);
+            a->maclaw_done = 3; /* ok */
+            goto done;
+        }
+        if (st && !strcmp(st, "expired")) {
+            snprintf(a->maclaw_err, sizeof a->maclaw_err, "二维码已过期，请重新生成");
+            a->maclaw_done = 4;
+            goto done;
+        }
+        if (!st) { /* transient error: keep polling a few times */
+            if (i > 3) {
+                snprintf(a->maclaw_err, sizeof a->maclaw_err, "%s",
+                         err[0] ? err : "轮询失败");
+                a->maclaw_done = 4;
+                goto done;
+            }
+        }
+    }
+    snprintf(a->maclaw_err, sizeof a->maclaw_err, "等待授权超时（3 分钟）");
+    a->maclaw_done = 4;
+done:
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+static void np_maclaw_login_start(notepad *a) {
+    np_maclaw_normalize_hub(a->maclaw_hub, a->maclaw_hub, sizeof a->maclaw_hub);
+    if (!a->maclaw_hub[0]) return;
+    a->maclaw_token[0] = 0; a->maclaw_email[0] = 0; a->maclaw_err[0] = 0;
+    a->maclaw_qr_ready = false; a->maclaw_polls = 0;
+    memset(&a->maclaw_sess, 0, sizeof a->maclaw_sess);
+    a->maclaw_done = 1;
+    NP_BEGIN_THREAD(np_maclaw_login_worker, a);
+}
+
+/* Find a CLI on PATH (no shell, no console window): scan PATH segments for an
+ * executable with the given name. Used to pick a default command template. */
+static bool np_ai_has_tool(const char *name) {
+    if (!name || !*name) return false;
+    const char *path = getenv("PATH");
+    if (!path) return false;
+    char seg[2048];
+    const char *p = path;
+    while (*p) {
+        const char *end = strchr(p, ';');
+        if (!end) end = strchr(p, ':');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n == 0 || n >= sizeof seg - 64) { p = end ? end + 1 : p + strlen(p); if (!end) break; continue; }
+        memcpy(seg, p, n); seg[n] = 0;
+#ifdef _WIN32
+        char exe[512];
+        snprintf(exe, sizeof exe, "%s\\%s.exe", seg, name);
+        if (np_file_exists(exe)) return true;
+        snprintf(exe, sizeof exe, "%s\\%s.cmd", seg, name);
+        if (np_file_exists(exe)) return true;
+#else
+        char exe[512];
+        snprintf(exe, sizeof exe, "%s/%s", seg, name);
+        if (np_file_exists(exe)) return true;
+#endif
+        if (!end) break;
+        p = end + 1;
+    }
+    return false;
+}
+
+/* Prepare and launch an AI request from the dialog state. */
+static void np_ai_start(notepad *a) {
+    if (a->ai_done == 1) return;                 /* already running */
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    int s0 = NP_MIN(d->caret, d->anchor), s1 = NP_MAX(d->caret, d->anchor);
+    s0 = NP_MAX(0, NP_MIN(s0, d->len)); s1 = NP_MAX(s0, NP_MIN(s1, d->len));
+    if (a->ai_ctx == 0 && s1 > s0) {
+        size_t n = (size_t)(s1 - s0);
+        if (n >= sizeof a->ai_orig) n = sizeof a->ai_orig - 1;
+        memcpy(a->ai_orig, d->text + s0, n); a->ai_orig[n] = 0;
+        a->ai_target_s = s0; a->ai_target_e = s1;
+    } else {
+        size_t n = (size_t)d->len;
+        if (n >= sizeof a->ai_orig) n = sizeof a->ai_orig - 1;
+        memcpy(a->ai_orig, d->text, n); a->ai_orig[n] = 0;
+        a->ai_target_s = 0; a->ai_target_e = d->len;
+    }
+    snprintf(a->ai_target_path, sizeof a->ai_target_path, "%s", d->path);
+
+    /* maclaw official service uses the Hub LLM proxy, not a local CLI. */
+    if (a->ai_backend == 4) {
+        if (!a->maclaw_token[0]) {
+            np_toast(a, "尚未登录 maclaw",
+                     "请先打开「maclaw 官方服务」用手机扫码授权", CUI_TONE_WARNING);
+            return;
+        }
+        a->ai_result[0] = 0; a->ai_error[0] = 0;
+        a->ai_done = 1;                          /* running */
+        NP_BEGIN_THREAD(np_ai_maclaw_worker, a);
+        return;
+    }
+
+    /* Pick a default command template when the field is empty or the backend
+     * selection changed. Users can edit it freely in the dialog. */
+    if (!a->ai_cmd[0] || (a->ai_backend != 3 && a->ai_backend != 4)) {
+        bool claude = np_ai_has_tool("claude");
+        bool codex = np_ai_has_tool("codex");
+        if (a->ai_backend == 1 || (a->ai_backend == 0 && claude))
+            snprintf(a->ai_cmd, sizeof a->ai_cmd,
+                     "claude -p \"Read {file} and follow its instructions. Output ONLY the result, no explanation.\" > {out}");
+        else if (a->ai_backend == 2 || (a->ai_backend == 0 && codex))
+            snprintf(a->ai_cmd, sizeof a->ai_cmd,
+                     "codex exec \"Read {file} and follow its instructions. Output ONLY the result, no explanation.\" > {out}");
+        else
+            snprintf(a->ai_cmd, sizeof a->ai_cmd, "claude -p \"Read {file} and follow its instructions.\" > {out}");
+    }
+
+    const char *dir = (a->side_dir[0]) ? a->side_dir : ".";
+#ifdef _WIN32
+    snprintf(a->ai_ctx_path, sizeof a->ai_ctx_path, "%s\\rapideditor-ai-ctx.txt", dir);
+    snprintf(a->ai_out_path, sizeof a->ai_out_path, "%s\\rapideditor-ai-out.txt", dir);
+#else
+    snprintf(a->ai_ctx_path, sizeof a->ai_ctx_path, "%s/rapideditor-ai-ctx.txt", dir);
+    snprintf(a->ai_out_path, sizeof a->ai_out_path, "%s/rapideditor-ai-out.txt", dir);
+#endif
+    a->ai_result[0] = 0; a->ai_error[0] = 0;
+    a->ai_done = 1;                              /* running */
+    NP_BEGIN_THREAD(np_ai_worker, a);
+}
+
+/* Apply the AI rewrite: replace the captured range in the target document
+ * with the agent's answer. Only allowed when the same document is still open
+ * and its length is unchanged (so the byte range is still valid). */
+static bool np_ai_apply(notepad *a) {
+    if (a->ai_done != 2 || !a->ai_result[0]) return false;
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return false;
+    if (strcmp(a->ai_target_path, d->path) != 0) {
+        np_toast(a, "文档已切换", "AI 结果对应的文档不再是当前标签，已取消写入", CUI_TONE_WARNING);
+        return false;
+    }
+    int s0 = NP_MAX(0, NP_MIN(a->ai_target_s, d->len));
+    int s1 = NP_MAX(s0, NP_MIN(a->ai_target_e, d->len));
+    size_t rl = strlen(a->ai_result);
+    int len = d->len;
+    int newlen = len - (s1 - s0) + (int)rl;
+    if (!np_ensure_cap(d, (size_t)newlen + 1)) {
+        np_toast(a, "文本已满", "无法写入 AI 结果", CUI_TONE_WARNING);
+        return false;
+    }
+    memmove(d->text + s0 + rl, d->text + s1, (size_t)(len - s1) + 1);
+    memcpy(d->text + s0, a->ai_result, rl);
+    d->len = newlen;
+    np_text_changed(a, d);
+    int caret = s0 + (int)rl;
+    if (caret > d->len) caret = d->len;
+    cui_code_editor_select(a->ui, d->editor_id, caret, caret);
+    return true;
+}
+
 static void np_start_template_download(notepad *a, const np_online_template *t) {
     if (a->tpl_dl_busy) return;
     char url[NP_PATH_CAP];
@@ -3284,6 +4259,16 @@ static void np_config_path(char *out, size_t cap) {
 #endif
 }
 
+/* Collapse CR/LF/TAB to spaces so a value stays on one config line. */
+static const char *np_cfg_one_line(const char *s, char *buf, size_t cap) {
+    size_t o = 0;
+    if (!s || !buf || cap == 0) return "";
+    for (; *s && o + 1 < cap; s++)
+        buf[o++] = (*s == '\n' || *s == '\r' || *s == '\t') ? ' ' : *s;
+    buf[o] = 0;
+    return buf;
+}
+
 static void np_config_load(notepad *a) {
     char path[NP_PATH_CAP];
     np_config_path(path, sizeof path);
@@ -3329,6 +4314,27 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "make_backup")) a->make_backup = atoi(val) != 0;
         else if (!strcmp(key, "session_restore")) a->session_restore = atoi(val) != 0;
         else if (!strcmp(key, "match_case")) a->match_case = atoi(val) != 0;
+        else if (!strcmp(key, "lt_align")) snprintf(a->ltable_align, sizeof a->ltable_align, "%s", val);
+        else if (!strcmp(key, "lt_style")) { int v = atoi(val); if (v >= 0 && v <= 1) a->ltable_style = v; }
+        else if (!strcmp(key, "lt_header")) a->ltable_header = atoi(val) != 0;
+        else if (!strcmp(key, "lt_long")) a->ltable_longtable = atoi(val) != 0;
+        else if (!strcmp(key, "lt_resize")) a->ltable_resize = atoi(val) != 0;
+        else if (!strcmp(key, "lt_width")) { float w = (float)atof(val); if (w >= 0.1f && w <= 1.0f) a->ltable_width = w; }
+        else if (!strcmp(key, "tidy_indent")) a->tidy_indent = atoi(val) != 0;
+        else if (!strcmp(key, "tidy_join")) a->tidy_join = atoi(val) != 0;
+        else if (!strcmp(key, "tidy_trim")) a->tidy_trim = atoi(val) != 0;
+        else if (!strcmp(key, "tidy_spaces")) { int v = atoi(val); if (v >= 2 && v <= 8) a->tidy_spaces = v; }
+        else if (!strcmp(key, "font_latin")) snprintf(a->font_latin_name, sizeof a->font_latin_name, "%s", val);
+        else if (!strcmp(key, "font_cjk")) snprintf(a->font_cjk_name, sizeof a->font_cjk_name, "%s", val);
+        else if (!strcmp(key, "ai_cmd")) snprintf(a->ai_cmd, sizeof a->ai_cmd, "%s", val);
+        else if (!strcmp(key, "ai_inst")) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", val);
+        else if (!strcmp(key, "ai_task")) { int v = atoi(val); if (v >= 0 && v <= 4) a->ai_task = v; }
+        else if (!strcmp(key, "ai_ctx")) { int v = atoi(val); if (v >= 0 && v <= 1) a->ai_ctx = v; }
+        else if (!strcmp(key, "ai_backend")) { int v = atoi(val); if (v >= 0 && v <= 4) a->ai_backend = v; }
+        else if (!strcmp(key, "ai_show_diff")) a->ai_show_diff = atoi(val) != 0;
+        else if (!strcmp(key, "maclaw_hub")) snprintf(a->maclaw_hub, sizeof a->maclaw_hub, "%s", val);
+        else if (!strcmp(key, "maclaw_token")) snprintf(a->maclaw_token, sizeof a->maclaw_token, "%s", val);
+        else if (!strcmp(key, "maclaw_email")) snprintf(a->maclaw_email, sizeof a->maclaw_email, "%s", val);
         else if (!strcmp(key, "find")) snprintf(a->find_query, sizeof a->find_query, "%s", val);
         else if (!strcmp(key, "replace")) snprintf(a->replace_with, sizeof a->replace_with, "%s", val);
         else if (!strcmp(key, "workdir")) np_dir_set(a, val);
@@ -3352,6 +4358,7 @@ static void np_config_load(notepad *a) {
 /* Called once when the app loop exits (any exit path: menu, window close). */
 static void np_config_save(notepad *a) {
     char path[NP_PATH_CAP];
+    char cfgline1[2048], cfgline2[2048], cfgline3[2048];
     np_config_path(path, sizeof path);
     FILE *f = np_fopen_utf8(path, "wb");
     if (!f) return;
@@ -3376,7 +4383,25 @@ static void np_config_save(notepad *a) {
     fprintf(f, "editor_font=%s\neditor_font_path=%s\n",
             a->font_ident[0] ? a->font_ident : "default", a->font_custom_path);
     fprintf(f, "find=%s\nreplace=%s\nworkdir=%s\n",
-            a->find_query, a->replace_with, a->side_dir);
+            np_cfg_one_line(a->find_query, cfgline1, sizeof cfgline1),
+            a->replace_with, a->side_dir);
+    /* LaTeX / AI settings added for the TeXora-inspired feature set. */
+    fprintf(f, "lt_align=%s\nlt_style=%d\nlt_header=%d\nlt_long=%d\nlt_resize=%d\nlt_width=%.4f\n",
+            a->ltable_align[0] ? a->ltable_align : "lcr", a->ltable_style,
+            a->ltable_header ? 1 : 0, a->ltable_longtable ? 1 : 0,
+            a->ltable_resize ? 1 : 0, a->ltable_width);
+    fprintf(f, "tidy_indent=%d\ntidy_join=%d\ntidy_trim=%d\ntidy_spaces=%d\n",
+            a->tidy_indent ? 1 : 0, a->tidy_join ? 1 : 0,
+            a->tidy_trim ? 1 : 0, a->tidy_spaces);
+    fprintf(f, "font_latin=%s\nfont_cjk=%s\n", a->font_latin_name, a->font_cjk_name);
+    fprintf(f, "ai_cmd=%s\nai_inst=%s\nai_task=%d\nai_ctx=%d\nai_backend=%d\nai_show_diff=%d\n",
+            np_cfg_one_line(a->ai_cmd, cfgline1, sizeof cfgline1),
+            np_cfg_one_line(a->ai_inst, cfgline2, sizeof cfgline2),
+            a->ai_task, a->ai_ctx, a->ai_backend, a->ai_show_diff ? 1 : 0);
+    fprintf(f, "maclaw_hub=%s\nmaclaw_token=%s\nmaclaw_email=%s\n",
+            np_cfg_one_line(a->maclaw_hub, cfgline1, sizeof cfgline1),
+            np_cfg_one_line(a->maclaw_token, cfgline2, sizeof cfgline2),
+            np_cfg_one_line(a->maclaw_email, cfgline3, sizeof cfgline3));
     for (int i = 0; i < a->recent_count; i++)
         fprintf(f, "recent%d=%s\n", i, a->recent[i]);
     for (int i = 0; i < a->session_count; i++)
@@ -3847,40 +4872,255 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     }
 }
 
+/* ---------------- Binary templates (010 Editor style) ---------------- */
+
+static void np_bt_reparse(notepad *a, np_doc *d);
+
+/* Read a .bt template file into a NUL-terminated buffer. Returns true on
+ * success. `name` receives a short display name derived from the filename. */
+static bool np_bt_load_file(const char *path, char *src, size_t src_cap,
+                            char *name, size_t name_cap) {
+    if (!path || !*path) return false;
+    FILE *f = np_fopen_utf8(path, "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long sz = ftell(f);
+    if (sz < 0 || (size_t)sz >= src_cap) { fclose(f); return false; }
+    fseek(f, 0, SEEK_SET);
+    size_t got = fread(src, 1, (size_t)sz, f);
+    fclose(f);
+    src[got] = 0;
+    const char *base = np_base(path);
+    snprintf(name, name_cap, "custom:%s", base);
+    return true;
+}
+
+/* Apply a template script to a hex document and parse it now. `name` is a
+ * display name (builtin id or "custom:file"). Keeps the script on the doc so
+ * edits can be re-parsed later. */
+static void np_bt_apply(notepad *a, np_doc *d, const char *name, const char *src) {
+    if (!d || !src) return;
+    np_bt_result_free(&d->bt_result);
+    memset(&d->bt_result, 0, sizeof d->bt_result);
+    snprintf(d->bt_name, sizeof d->bt_name, "%s", name);
+    snprintf(d->bt_source, sizeof d->bt_source, "%s", src);
+    d->bt_content_rev = 0;
+    d->bt_pick = 0;
+    d->bt_first = 0;
+    d->bt_show_tree = true;
+    np_bt_reparse(a, d);
+}
+
+/* Re-run the active template if the buffer changed since the last parse.
+ * Forward-declared because np_bt_apply is defined before it. */
+static void np_bt_reparse(notepad *a, np_doc *d) {
+    (void)a;
+    if (!d || !d->bt_name[0] || !d->bt_source[0]) return;
+    if (d->bt_content_rev == d->content_rev && d->bt_result.ok) return;
+    bool ok = np_bt_execute(d->bt_source, (const uint8_t *)d->text,
+                            (size_t)d->len, &d->bt_result);
+    d->bt_content_rev = d->content_rev;
+    if (!ok) {
+        snprintf(a->bt_error, sizeof a->bt_error, "%s", d->bt_result.error);
+    } else {
+        a->bt_error[0] = 0;
+    }
+    if (a->ui) cui_request_redraw(a->ui);
+}
+
+static void np_bt_clear(np_doc *d) {
+    if (!d) return;
+    np_bt_result_free(&d->bt_result);
+    memset(&d->bt_result, 0, sizeof d->bt_result);
+    d->bt_name[0] = 0;
+    d->bt_source[0] = 0;
+    d->bt_content_rev = 0;
+}
+
+/* Build cui_hex_range[] from the parsed fields. Only leaf fields with a
+ * nonzero size are marked; parent/struct nodes are skipped to avoid painting
+ * a solid block. Caller provides a buffer; returns the count actually used. */
+static int np_bt_ranges(np_doc *d, cui_hex_range *out, int cap) {
+    if (!d || !d->bt_result.ok) return 0;
+    int n = 0;
+    np_bt_result *r = &d->bt_result;
+    for (int i = 0; i < r->count && n < cap; i++) {
+        np_bt_field *f = &r->fields[i];
+        if (f->size == 0 || f->offset + f->size > (size_t)d->len) continue;
+        /* skip aggregate parents (their children carry the useful ranges) */
+        bool has_children = false;
+        for (int j = i + 1; j < r->count; j++)
+            if (r->fields[j].parent == i) { has_children = true; break; }
+        if (has_children) continue;
+        out[n].offset = f->offset;
+        out[n].length = f->size;
+        out[n].tone = (cui_tone)(f->color % 8);
+        out[n].label = f->name;
+        n++;
+    }
+    return n;
+}
+
+/* Hex field-tree canvas ------------------------------------------------ */
+#define NP_BT_ROWH 22
+
+static void np_maclaw_qr_paint(cui_ctx *ui, cui_rect r, void *user) {
+    const np_qr_code *q = (const np_qr_code *)user;
+    if (!q || q->size <= 0) return;
+    /* Use pure black/white, not theme tokens: QR scanners need a stable,
+     * high-contrast image even when the app uses a dark theme or a coloured
+     * accent. */
+    const cui_color qr_white = CUI_RGB(0xFFFFFF);
+    const cui_color qr_black = CUI_RGB(0x000000);
+    cui_draw_rect(ui, r, CUI_CORNERS(0), qr_white);
+    int total = q->size + 8; /* 4-module quiet zone on each side */
+    float side = r.w < r.h ? r.w : r.h;
+    float cell = side / (float)total;
+    if (cell < 0.5f) cell = 0.5f;
+    float used = cell * total;
+    float ox = r.x + (r.w - used) * 0.5f + cell * 4.0f;
+    float oy = r.y + (r.h - used) * 0.5f + cell * 4.0f;
+    for (int y = 0; y < q->size; y++) {
+        for (int x = 0; x < q->size; x++) {
+            if (!q->modules[y][x]) continue;
+            cui_draw_rect(ui, (cui_rect){ ox + x * cell, oy + y * cell, cell + 0.6f, cell + 0.6f },
+                          CUI_CORNERS(0), qr_black);
+        }
+    }
+}
+
+static void np_bt_tree_paint(cui_ctx *ui, cui_rect r, void *user) {
+    np_doc *d = (np_doc *)user;
+    if (!d || !d->bt_result.ok) return;
+    np_bt_result *res = &d->bt_result;
+    int n = res->count > 2000 ? 2000 : res->count;  /* guard runaway trees */
+    float fs = 13.0f;
+    for (int i = 0; i < n; i++) {
+        np_bt_field *f = &res->fields[i];
+        float y = r.y + (float)i * NP_BT_ROWH;
+        if (i == d->bt_pick) {
+            cui_draw_rect(ui, (cui_rect){ r.x, y, r.w, NP_BT_ROWH },
+                          CUI_CORNERS(3), CUI_COLOR_ACCENT_SUBTLE);
+        }
+        int indent = f->depth * 12;
+        char line[320];
+        snprintf(line, sizeof line, "%s  :  %s", f->name,
+                 f->value[0] ? f->value : f->type);
+        cui_draw_text(ui, CUI_FONT_MONO, fs,
+                      (cui_vec2){ r.x + 6 + (float)indent, y + 3 },
+                      i == d->bt_pick ? CUI_COLOR_ACCENT : CUI_COLOR_FOREGROUND,
+                      line, -1);
+        char off[32];
+        snprintf(off, sizeof off, "@%llX", (unsigned long long)f->offset);
+        cui_draw_text(ui, CUI_FONT_MONO, fs - 1,
+                      (cui_vec2){ r.x + r.w - 74, y + 3 },
+                      CUI_COLOR_TEXT_MUTED, off, -1);
+    }
+}
+
 /* 010 Editor style pane: offsets, hex bytes and ASCII, fully editable —
  * typing hex digits overwrites the byte under the cursor. cui_hex_view owns
  * all of the interaction (selection, arrows, copy, virtual scrolling); we
  * only feed it our buffer, track edits and wire the goto field. */
 static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
+    np_bt_reparse(a, d);               /* re-parse after byte edits, cached by rev */
+
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
         np_doc_breadcrumb(ui, a, d);
         cui_row(ui, .width = CUI_FILL, .gap = 6) {
             int flags = cui_input(ui, "hex-goto", a->hexgoto_buf, sizeof a->hexgoto_buf,
                                   .placeholder = "偏移（十六进制，如 1A2B）",
-                                  .width = 220);
+                                  .width = 200);
             if (flags & CUI_SUBMITTED) np_hex_do_goto(a);
             if (cui_button(ui, "跳转", .size = CUI_SIZE_SM)) np_hex_do_goto(a);
             cui_spacer(ui);
+            if (cui_button(ui, d->bt_name[0] ? "模板…" : "应用模板…",
+                           .size = CUI_SIZE_SM, .icon = CUI_ICON_CODE)) {
+                a->dlg_bt = true;
+                a->bt_pick = 0;
+            }
+            if (d->bt_name[0] && cui_button(ui, "清除模板", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST)) {
+                np_bt_clear(d);
+            }
             if (cui_button(ui, "转到文本编辑", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_FILE_TEXT))
                 np_hex_reopen(a, false);
-            char info[96];
-            snprintf(info, sizeof info, "%d 字节###hexsize", d->len);
-            cui_text(ui, info, .size = 12, .color = CUI_COLOR_TEXT_MUTED,
-                     .font = CUI_FONT_MONO);
         }
-        cui_text(ui, "点击/拖选字节 · 方向键移动 · 键入十六进制覆盖 · Ctrl C 复制 · Ctrl Home/End 首尾",
-                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
-        cui_hex_result r = cui_hex_view(ui, d->editor_id,
-                                        (const uint8_t *)d->text, (size_t)d->len,
-                                        &d->hexsel,
-                                        .edit = (uint8_t *)d->text,
-                                        .height = -1,
-                                        .size = (float)a->font_size - 2);
-        if (r.edited) {
-            d->dirty = true;
-            d->content_rev++;          /* file size never changes here */
-            np_update_title(a);
+        if (a->bt_error[0]) {
+            cui_text(ui, a->bt_error, .size = 11, .color = CUI_COLOR_DANGER);
+        } else if (d->bt_name[0]) {
+            char info[160];
+            snprintf(info, sizeof info, "模板 %s · %d 字段", d->bt_name, d->bt_result.count);
+            cui_text(ui, info, .size = 11, .color = CUI_COLOR_SUCCESS);
+        } else {
+            cui_text(ui, "点击/拖选字节 · 方向键移动 · 键入十六进制覆盖 · Ctrl C 复制 · Ctrl Home/End 首尾",
+                     .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        }
+
+        /* Build highlight ranges from the template fields (frame-stable). */
+        static cui_hex_range ranges[512];
+        int nr = np_bt_ranges(d, ranges, 512);
+
+        if (d->bt_show_tree && d->bt_name[0] && d->bt_result.ok) {
+            if (d->bt_ratio < 0.2f || d->bt_ratio > 0.85f) d->bt_ratio = 0.58f;
+            cui_split(ui, "hex-bt-split", &d->bt_ratio, .min_first = 0.25f, .min_second = 0.2f) {
+                /* left: hex view */
+                cui_hex_result r = cui_hex_view(ui, d->editor_id,
+                                    (const uint8_t *)d->text, (size_t)d->len,
+                                    &d->hexsel,
+                                    .edit = (uint8_t *)d->text,
+                                    .ranges = nr ? ranges : NULL, .range_count = nr,
+                                    .height = -1, .size = (float)a->font_size - 2);
+                if (r.edited) {
+                    d->dirty = true;
+                    d->content_rev++;
+                    np_update_title(a);
+                }
+                /* right: field tree */
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                           .bg = CUI_COLOR_SURFACE, .pad = 4, .gap = 2) {
+                    char th[96];
+                    snprintf(th, sizeof th, "字段结构 · %d###bttree", d->bt_result.count);
+                    cui_label(ui, th);
+                    int n = d->bt_result.count > 2000 ? 2000 : d->bt_result.count;
+                    if (n > 0) {
+                        float canvas_h = (float)n * NP_BT_ROWH;
+                        cui_scroll(ui, .id = "bt-tree-scroll", .width = CUI_FILL,
+                                   .height = CUI_FILL) {
+                            cui_canvas_result cr = cui_canvas(ui, "bt-tree-canvas",
+                                CUI_FILL, (cui_size){ CUI_SIZE_FIXED, canvas_h },
+                                np_bt_tree_paint, d, sizeof d);
+                            if (cr.clicked) {
+                                int row = (int)(cr.mouse.y / NP_BT_ROWH);
+                                if (row >= 0 && row < n) {
+                                    np_bt_field *f = &d->bt_result.fields[row];
+                                    d->bt_pick = row;
+                                    d->hexsel.cursor = f->offset;
+                                    d->hexsel.start = f->offset;
+                                    d->hexsel.length = f->size;
+                                    if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, f->offset);
+                                }
+                            }
+                        }
+                    } else {
+                        cui_text(ui, "模板未产生字段", .size = 12,
+                                 .color = CUI_COLOR_TEXT_MUTED);
+                    }
+                }
+            }
+        } else {
+            cui_hex_result r = cui_hex_view(ui, d->editor_id,
+                                (const uint8_t *)d->text, (size_t)d->len,
+                                &d->hexsel,
+                                .edit = (uint8_t *)d->text,
+                                .ranges = nr ? ranges : NULL, .range_count = nr,
+                                .height = -1, .size = (float)a->font_size - 2);
+            if (r.edited) {
+                d->dirty = true;
+                d->content_rev++;
+                np_update_title(a);
+            }
         }
         np_keep_editors(a, ui);        /* keep the sibling tabs' text editors alive */
     }
@@ -4461,6 +5701,18 @@ static void np_frame(cui_ctx *ui, void *user) {
         a->quiet = true;
         for (int i = 0; i < a->startup_count; i++)
             np_open_path(a, a->startup[i], false);
+        if (a->startup_bt[0]) {
+            np_doc *sd = np_cur(a);
+            if (sd && sd->is_hex) {
+                const np_bt_builtin *bt = NULL;
+                for (int i = 0; np_bt_builtins[i].name; i++)
+                    if (!strcmp(np_bt_builtins[i].name, a->startup_bt)) {
+                        bt = &np_bt_builtins[i]; break;
+                    }
+                if (bt) np_bt_apply(a, sd, bt->label, bt->source);
+            }
+            a->startup_bt[0] = 0;       /* apply once */
+        }
         a->quiet = false;
         a->last_active = a->active;
         np_logf(a, "就绪  ·  %d 个文档  ·  目录 %s", a->count, a->side_dir);
@@ -4553,6 +5805,25 @@ static void np_frame(cui_ctx *ui, void *user) {
                 np_apply_md_snip(a, np_md_snip_index("无序列表"));
             if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_9))
                 np_apply_md_snip(a, np_md_snip_index("有序列表"));
+        }
+
+        /* LaTeX table wizard (Ctrl+Alt+T), only while editing a TeX source. */
+        if (np_doc_is_latex(np_cur(a)) &&
+            cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_T)) {
+            a->dlg_latex_table = true;
+            if (!a->ltable_align[0]) snprintf(a->ltable_align, sizeof a->ltable_align, "lcr");
+            a->ltable_width = 0.9f;
+        }
+        /* Live formula preview (Ctrl+Alt+M). */
+        if (np_doc_is_latex(np_cur(a)) &&
+            cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_M)) {
+            a->dlg_math_preview = true;
+            np_math_expr_from_caret(a);
+        }
+        /* Controlled AI assistant (Ctrl+Alt+A). */
+        if (np_doc_is_latex(np_cur(a)) &&
+            cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_A)) {
+            a->dlg_ai = true;
         }
 
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
@@ -4670,6 +5941,17 @@ static void np_frame(cui_ctx *ui, void *user) {
                         d->hexsel.cursor = 0;
                     }
                     cui_menu_separator(ui);
+                    if (cui_menu_item(ui, d->bt_name[0] ? "更换二进制模板…" : "应用二进制模板…",
+                                      .icon = CUI_ICON_CODE))
+                        a->dlg_bt = true;
+                    if (d->bt_name[0]) {
+                        if (cui_menu_item(ui, "显示/隐藏字段树", .checked = d->bt_show_tree))
+                            d->bt_show_tree = !d->bt_show_tree;
+                        if (cui_menu_item(ui, "重新解析模板"))
+                            np_bt_reparse(a, d);
+                        if (cui_menu_item(ui, "清除模板", .icon = CUI_ICON_X))
+                            np_bt_clear(d);
+                    }
                     cui_menu_label(ui, "十六进制编辑：键入数字直接覆盖字节，不改变文件大小");
                 } else {
                 if (cui_menu_item(ui, "全选", .shortcut = "Ctrl A"))
@@ -4786,6 +6068,11 @@ static void np_frame(cui_ctx *ui, void *user) {
                                       .icon = CUI_ICON_DOWNLOAD))
                         a->dlg_tinytex = true;
                 }
+                cui_menu_separator(ui);
+                if (cui_menu_item(ui, "AI 助手…", .icon = CUI_ICON_SPARKLES))
+                    a->dlg_ai = true;
+                if (cui_menu_item(ui, "maclaw 官方服务登录…", .icon = CUI_ICON_SPARKLES))
+                    a->dlg_maclaw = true;
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "保存时创建 .bak 备份", .checked = a->make_backup))
                     a->make_backup = !a->make_backup;
@@ -4929,6 +6216,33 @@ static void np_frame(cui_ctx *ui, void *user) {
                     }
                     if (cui_menu_item(ui, "在线模板库…", .icon = CUI_ICON_DOWNLOAD))
                         a->dlg_tpl_online = true;
+                    cui_menu_separator(ui);
+                    if (cui_menu_item(ui, "插入表格（Excel/CSV）…", .icon = CUI_ICON_GRID_3X3,
+                                      .shortcut = "Ctrl Alt T")) {
+                        a->dlg_latex_table = true;
+                        if (!a->ltable_align[0]) snprintf(a->ltable_align, sizeof a->ltable_align, "lcr");
+                        a->ltable_width = 0.9f;
+                    }
+                    cui_menu_separator(ui);
+                    if (cui_menu_item(ui, "整理源码（缩进·换行·空白）…", .icon = CUI_ICON_SPARKLES)) {
+                        a->dlg_latex_tidy = true;
+                    }
+                    if (cui_menu_item(ui, "字体设置（XeLaTeX / xeCJK）…", .icon = CUI_ICON_TYPE)) {
+                        a->dlg_latex_fonts = true;
+                    }
+                    if (cui_menu_item(ui, "公式实时预览…", .icon = CUI_ICON_CODE,
+                                      .shortcut = "Ctrl Alt M")) {
+                        a->dlg_math_preview = true;
+                        np_math_expr_from_caret(a);
+                    }
+                    cui_menu_separator(ui);
+                    if (cui_menu_item(ui, "AI 助手…", .icon = CUI_ICON_SPARKLES,
+                                      .shortcut = "Ctrl Alt A")) {
+                        a->dlg_ai = true;
+                    }
+                    if (cui_menu_item(ui, "maclaw 官方服务登录…", .icon = CUI_ICON_SPARKLES)) {
+                        a->dlg_maclaw = true;
+                    }
                 }
             }
 
@@ -5306,6 +6620,9 @@ int main(int argc, char **argv) {
     g.last_active = -1;
     g.make_backup = true;
     g.session_restore = true;
+    g.tidy_indent = true; g.tidy_join = true; g.tidy_trim = true;
+    g.tidy_spaces = 4;
+    snprintf(g.maclaw_hub, sizeof g.maclaw_hub, "%s", "https://hub.maclaw.top");
 #ifdef _WIN32
     g.default_crlf = true;
 #endif
@@ -5319,14 +6636,24 @@ int main(int argc, char **argv) {
     int wargc = 0;
     LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     if (wargv) {
-        for (int i = 1; i < wargc && g.startup_count < NP_DOC_MAX; i++)
+        for (int i = 1; i < wargc && g.startup_count < NP_DOC_MAX; i++) {
+            char arg[NP_PATH_CAP];
             WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1,
-                                g.startup[g.startup_count++], NP_PATH_CAP, NULL, NULL);
+                                arg, NP_PATH_CAP, NULL, NULL);
+            if (!strncmp(arg, "--bt=", 5))
+                snprintf(g.startup_bt, sizeof g.startup_bt, "%s", arg + 5);
+            else
+                snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", arg);
+        }
         LocalFree(wargv);
     }
 #else
-    for (int i = 1; i < argc && g.startup_count < NP_DOC_MAX; i++)
-        snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", argv[i]);
+    for (int i = 1; i < argc && g.startup_count < NP_DOC_MAX; i++) {
+        if (!strncmp(argv[i], "--bt=", 5))
+            snprintf(g.startup_bt, sizeof g.startup_bt, "%s", argv[i] + 5);
+        else
+            snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", argv[i]);
+    }
 #endif
 
     /* No files on the command line: reopen the last session (unsaved and

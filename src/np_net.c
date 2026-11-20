@@ -220,3 +220,132 @@ char *np_net_fetch(const char *url, const np_net_opts *o) {
 }
 
 #endif
+
+/* ---- JSON POST (maclaw device-authorization flow) ---------------------- */
+
+#if defined(__ANDROID__)
+char *np_net_post_json(const char *url, const char *bearer, const char *body,
+                       const np_net_opts *o, int *status_out) {
+    (void)url; (void)bearer; (void)body; (void)o;
+    if (status_out) *status_out = 0;
+    net_err(o, "Android 不支持此操作");
+    return NULL;
+}
+
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <winhttp.h>
+static char *np_net_post_json_win(const char *url, const char *bearer,
+                                  const char *body, const np_net_opts *o,
+                                  int *status_out) {
+    char *result = NULL;
+    HINTERNET hs = NULL, hc = NULL, hr = NULL;
+    if (status_out) *status_out = 0;
+
+    const char *rest = url;
+    bool secure = true;
+    if (!strncmp(rest, "https://", 8)) rest += 8;
+    else if (!strncmp(rest, "http://", 7)) { rest += 7; secure = false; }
+    else { net_err(o, "仅支持 http/https URL"); return NULL; }
+    char host[512], path[8192];
+    INTERNET_PORT port = secure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
+    const char *slash = strchr(rest, '/');
+    size_t hl = slash ? (size_t)(slash - rest) : strlen(rest);
+    if (hl == 0 || hl >= sizeof host) { net_err(o, "URL 主机名无效"); return NULL; }
+    memcpy(host, rest, hl); host[hl] = 0;
+    char *colon = strrchr(host, ':');
+    if (colon && colon[1]) { port = (INTERNET_PORT)atoi(colon + 1); *colon = 0; }
+    snprintf(path, sizeof path, "%s", slash ? slash : "/");
+
+    hs = WinHttpOpen(L"RapidEditor/1.2 (maclaw auth)", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hs) { net_err(o, "无法初始化网络"); return NULL; }
+    {
+        WINHTTP_PROXY_INFO pi = {0};
+        if (WinHttpGetDefaultProxyConfiguration(&pi))
+            WinHttpSetOption(hs, WINHTTP_OPTION_PROXY, &pi, sizeof pi);
+    }
+    DWORD tmo = (DWORD)net_timeout(o) * 1000;
+    WinHttpSetTimeouts(hs, tmo, tmo, tmo, tmo);
+
+    WCHAR whost[512], wpath[8192];
+    MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, 512);
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 8192);
+    hc = WinHttpConnect(hs, whost, port, 0);
+    if (!hc) { net_err(o, "无法连接服务器"); goto done; }
+    hr = WinHttpOpenRequest(hc, L"POST", wpath, NULL, WINHTTP_NO_REFERER,
+                            WINHTTP_DEFAULT_ACCEPT_TYPES,
+                            secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!hr) { net_err(o, "无法创建请求"); goto done; }
+
+    WCHAR wheaders[4096];
+    {
+        const char *base = "Content-Type: application/json\r\nAccept: application/json";
+        MultiByteToWideChar(CP_UTF8, 0, base, -1, wheaders, 4096);
+        WinHttpAddRequestHeaders(hr, wheaders, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    }
+    if (bearer && *bearer) {
+        char h[1024]; WCHAR wh[1024];
+        snprintf(h, sizeof h, "Authorization: Bearer %s", bearer);
+        MultiByteToWideChar(CP_UTF8, 0, h, -1, wh, 1024);
+        WinHttpAddRequestHeaders(hr, wh, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    }
+
+    if (!WinHttpSendRequest(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            (LPVOID)body, (DWORD)strlen(body), (DWORD)strlen(body), 0) ||
+        !WinHttpReceiveResponse(hr, NULL)) {
+        net_err(o, "发送请求失败（检查网络/代理）"); goto done;
+    }
+
+    DWORD status = 0, sz = sizeof status;
+    WinHttpQueryHeaders(hr, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        NULL, &status, &sz, NULL);
+    if (status_out) *status_out = (int)status;
+    if (status < 200 || status >= 300) {
+        char m[96]; snprintf(m, sizeof m, "HTTP 状态 %lu", (unsigned long)status);
+        net_err(o, m); goto done;
+    }
+
+    size_t cap = 4096, used = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { net_err(o, "内存不足"); goto done; }
+    for (;;) {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(hr, &avail) || avail == 0) break;
+        if (used + avail + 1 > cap) {
+            while (used + avail + 1 > cap) cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) { free(buf); net_err(o, "内存不足"); goto done; }
+            buf = nb;
+        }
+        DWORD read = 0;
+        if (!WinHttpReadData(hr, buf + used, avail, &read) || !read) break;
+        used += read;
+    }
+    buf[used] = 0;
+    result = buf;
+    net_prog(o, 100);
+
+done:
+    if (hr) WinHttpCloseHandle(hr);
+    if (hc) WinHttpCloseHandle(hc);
+    if (hs) WinHttpCloseHandle(hs);
+    return result;
+}
+char *np_net_post_json(const char *url, const char *bearer, const char *body,
+                       const np_net_opts *o, int *status_out) {
+    return np_net_post_json_win(url, bearer, body, o, status_out);
+}
+
+#else
+char *np_net_post_json(const char *url, const char *bearer, const char *body,
+                       const np_net_opts *o, int *status_out) {
+    if (status_out) *status_out = 0;
+    if (!url || !body) { net_err(o, "参数缺失"); return NULL; }
+    net_err(o, "POSIX 平台请使用 curl CLI 版本");
+    (void)bearer;
+    return NULL;
+}
+#endif

@@ -1,0 +1,19 @@
+// ELF64 header (little endian)
+LittleEndian();
+struct Elf64_Ehdr {
+    ubyte  ident[16];      // magic + class + data + version
+    ushort e_type;
+    ushort e_machine;
+    uint32 e_version;
+    uint64 e_entry;
+    uint64 e_phoff;
+    uint64 e_shoff;
+    uint32 e_flags;
+    ushort e_ehsize;
+    ushort e_phentsize;
+    ushort e_phnum;
+    ushort e_shentsize;
+    ushort e_shnum;
+    ushort e_shstrndx;
+};
+Elf64_Ehdr elf;

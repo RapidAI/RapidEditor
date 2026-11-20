@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +40,8 @@ typedef struct {
     char work_dir[NP_PV_PATH_CAP];
     char pdf_path[NP_PV_PATH_CAP];
     char base[NP_PV_PATH_CAP];       /* page images: <base>-1.png, -2.png ... */
+    char cache_dir[NP_PV_PATH_CAP];  /* <work_dir>/.latex_cache (compile artifacts) */
+    bool cache_artifacts;            /* when true, .aux/.log/.synctex/.pdf go to cache_dir */
     char log[4096];
     int pages;                       /* number of rendered pages (0 until known) */
     float page_w, page_h;            /* PDF page size in points (for SyncTeX hits) */

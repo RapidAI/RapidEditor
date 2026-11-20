@@ -2067,6 +2067,42 @@ static float md_math_block(md_ctx *c, const md_box *b, const char *expr, int len
     return 0;
 }
 
+/* Public single-formula renderer (see cui.h). Uses the same IR/layout/paint
+ * as $$ blocks, with a wide fixed avail so the reported height is stable
+ * regardless of the container; the paint centers each line in its rect. */
+float cui_math_render(cui_ctx *ui, const char *id, const char *expr, int len,
+                      cui_size width, const cui_math_opts *opts) {
+    if (!ui) return 0;
+    cui_math_opts def; memset(&def, 0, sizeof def);
+    def.size = 0; def.boxed = true;
+    if (!opts) opts = &def;
+    if (!expr) return 0;
+    if (len < 0) len = (int)strlen(expr);
+    if (len <= 0) return 0;
+    md_mit *ir = md_math_ir(ui, expr, len);
+    if (!ir) return 0;
+    cui_theme *th = cui_theme_get(ui);
+    float fs = opts->size > 0 ? opts->size : (th ? th->text_body : 13);
+    md_mpaint mp;
+    memset(&mp, 0, sizeof mp);
+    mp.fs = fs;
+    mp.u = cui_dpi_scale(ui);
+    mp.lh = 0.22f * fs;
+    mp.fg = cui_color_of(ui, CUI_COLOR_FOREGROUND);
+    if (opts->boxed) {
+        mp.bg = cui_color_of(ui, CUI_COLOR_SURFACE_RAISED);
+        mp.border = cui_color_of(ui, CUI_COLOR_BORDER);
+    } else {
+        mp.bg = CUI_TRANSPARENT;
+        mp.border = CUI_TRANSPARENT;
+    }
+    md_m_layout(ui, ir, fs, 1600, &mp);
+    float h = mp.h + 26 * mp.u;
+    if (h < 24) h = 24;
+    cui_canvas(ui, id, width, CUI_PX(h), md_math_paint_cb, &mp, sizeof mp);
+    return h;
+}
+
 /* ---- Mermaid flowchart ------------------------------------------------ */
 /* Supported subset: graph/flowchart TD|LR, node declarations A[..], B(..),
  * C{..}, D((..)), and edges -->, ---, -.->, ==> with optional |label|.

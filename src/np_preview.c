@@ -14,6 +14,10 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -145,6 +149,17 @@ static void pv_quote(const char *s, char *out, size_t cap) {
     }
     if (j + 1 < cap) out[j++] = '"';
     out[j] = 0;
+}
+
+/* Create a directory if it does not exist. Returns 0 on success or if the
+ * directory already exists; -1 on failure. */
+static int pv_mkdir(const char *path) {
+    if (np__access(path, 0) == 0) return 0;
+#ifdef _WIN32
+    return _mkdir(path);
+#else
+    return mkdir(path, 0755);
+#endif
 }
 
 /* Run a command line synchronously; returns the process exit code.
@@ -313,7 +328,14 @@ static void pv_tex_worker(void *arg) {
 
     char log_path[NP_PV_PATH_CAP];
     char qlog[NP_PV_PATH_CAP * 2];
-    snprintf(log_path, sizeof log_path, "%s/rapideditor-tex.log", j->work_dir);
+    const char *log_home = (j->cache_artifacts && j->cache_dir[0]) ? j->cache_dir : j->work_dir;
+    snprintf(log_path, sizeof log_path, "%s%crapideditor-tex.log", log_home,
+#ifdef _WIN32
+             '\\'
+#else
+             '/'
+#endif
+    );
     pv_quote(log_path, qlog, sizeof qlog);
 
     int pages = 0;
@@ -367,20 +389,40 @@ static void pv_tex_worker(void *arg) {
 #else
             const char *cd = "cd";
 #endif
-            /* Two passes so cross-references and the TOC settle. Already cwd
-             * = work_dir, so the engine writes PDF/SyncTeX right next to the
-             * source; no -output-directory (which would need a path token the
-             * TeX command line cannot parse safely on Windows). */
+            /* Two passes so cross-references and the TOC settle. cwd is the
+             * project dir. When artifact archiving is on, use a RELATIVE
+             * -output-directory (no backslashes, so TeX's extended-mode
+             * command-line tokenizer is safe) to keep .aux/.log/.synctex and
+             * the PDF out of the user's source folder. Input lookups
+             * (\input, images, .bib) still resolve against cwd. */
+            const char *outdir = (j->cache_artifacts && j->cache_dir[0])
+                                 ? " -output-directory=.latex_cache" : "";
             snprintf(cmd, sizeof cmd,
-                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 %s > %s 2>&1",
-                     cd, qcwd, engine, qtex, qlog);
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1%s %s > %s 2>&1",
+                     cd, qcwd, engine, outdir, qtex, qlog);
             pv_run(cmd);
             snprintf(cmd, sizeof cmd,
-                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1 %s >> %s 2>&1",
-                     cd, qcwd, engine, qtex, qlog);
+                     "%s %s && %s -interaction=nonstopmode -halt-on-error -synctex=-1%s %s >> %s 2>&1",
+                     cd, qcwd, engine, outdir, qtex, qlog);
             pv_run(cmd);
 
-            snprintf(pdf, sizeof pdf, "%s.pdf", j->base);
+            /* The engine wrote the PDF into the output directory (or next to
+             * the source when archiving is off). Point the renderer there. */
+            if (j->cache_artifacts && j->cache_dir[0]) {
+                char stem[NP_PV_PATH_CAP];
+                snprintf(stem, sizeof stem, "%s", pv_base(j->tex_path));
+                char *dot = strrchr(stem, '.');
+                if (dot) *dot = 0;
+                snprintf(pdf, sizeof pdf, "%s%c%s.pdf", j->cache_dir,
+#ifdef _WIN32
+                         '\\'
+#else
+                         '/'
+#endif
+                         , stem);
+            } else {
+                snprintf(pdf, sizeof pdf, "%s.pdf", j->base);
+            }
             snprintf(j->pdf_path, sizeof j->pdf_path, "%s", pdf);
             if (np__access(pdf, 0) == 0)
                 pages = pv_render_pdf(j, pdf, j->base, qlog);
@@ -393,7 +435,21 @@ static void pv_tex_worker(void *arg) {
     if (pages > 0) {
         if (ctx->mode == 0) {
             char stx_path[NP_PV_PATH_CAP];
-            snprintf(stx_path, sizeof stx_path, "%s.synctex", j->base);
+            if (j->cache_artifacts && j->cache_dir[0]) {
+                char stem[NP_PV_PATH_CAP];
+                snprintf(stem, sizeof stem, "%s", pv_base(j->tex_path));
+                char *dot = strrchr(stem, '.');
+                if (dot) *dot = 0;
+                snprintf(stx_path, sizeof stx_path, "%s%c%s.synctex", j->cache_dir,
+#ifdef _WIN32
+                         '\\'
+#else
+                         '/'
+#endif
+                         , stem);
+            } else {
+                snprintf(stx_path, sizeof stx_path, "%s.synctex", j->base);
+            }
             j->synctex = np_synctex_load(stx_path);
         }
         j->pages = pages;
@@ -417,6 +473,7 @@ static void pv_tex_worker(void *arg) {
 void np_tex_job_init(np_tex_job *job) {
     memset(job, 0, sizeof *job);
     job->state = 0;
+    job->cache_artifacts = true;   /* keep the source folder clean by default */
 }
 
 int np_tex_state(const np_tex_job *job) { return job ? job->state : 0; }
@@ -456,6 +513,27 @@ int np_tex_compile(np_tex_job *job, const char *tex_path) {
     snprintf(job->tex_path, sizeof job->tex_path, "%s", tex_path);
     pv_work_dir(tex_path, job->work_dir, sizeof job->work_dir);
     pv_strip_ext(tex_path, job->base, sizeof job->base);
+    /* Compile artifacts (.aux/.log/.synctex/.pdf) live in a hidden subfolder
+     * so the user's source directory stays clean. The folder is created here
+     * on the UI thread; the worker only writes into it. */
+    if (job->cache_artifacts) {
+        snprintf(job->cache_dir, sizeof job->cache_dir, "%s%c.latex_cache",
+                 job->work_dir,
+#ifdef _WIN32
+                 '\\'
+#else
+                 '/'
+#endif
+        );
+        /* If the folder cannot be created (read-only source dir), fall back
+         * to writing next to the source rather than failing the compile. */
+        if (pv_mkdir(job->cache_dir) != 0) {
+            job->cache_dir[0] = 0;
+            job->cache_artifacts = false;
+        }
+    } else {
+        job->cache_dir[0] = 0;
+    }
     job->state = 1;                              /* set before spawning */
     return pv_tex_start(job, 0);
 }
