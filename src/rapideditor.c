@@ -31,6 +31,7 @@
 #include "np_bt_templates.h"
 #include "np_latex_table.h"
 #include "np_latex_tidy.h"
+#include "np_latex_html.h"
 #include "np_font_scan.h"
 #include "np_ai.h"
 #include "np_qr.h"
@@ -39,7 +40,7 @@
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.2.6"
+#define NP_APP_VERSION "1.2.7"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -445,6 +446,10 @@ typedef struct notepad {
     cui_texture preview_tex;       /* current PDF page texture */
     int  preview_tex_page;         /* page index currently loaded */
     char preview_owner[NP_PATH_CAP]; /* doc path the preview belongs to */
+
+    /* Android lightweight LaTeX preview (KaTeX in the WebView). */
+    uint64_t lite_rev;             /* content_rev rendered last */
+    unsigned lite_due;             /* SDL tick when a debounced regen fires */
 
     /* Immersive ("zen") edit mode: hides the menu bar, toolbar, side panes
      * and status bar so only the tab strip and editor remain.  Panel state
@@ -5145,14 +5150,140 @@ static void np_webview_boot(notepad *a) {
     np_webview_init(native, np_webview_event);
 }
 
+/* ---- Android lightweight LaTeX preview (KaTeX in the WebView) ------- */
+
+static void np_preview_stop_http(notepad *a);   /* defined below */
+
+/* True when LaTeX preview should render through the embedded WebView
+ * instead of compiling with a TeX engine: Android has no TeX toolchain,
+ * so the compile-based preview can never work there. */
+static bool np_tex_lite_active(void) {
+#ifdef __ANDROID__
+    return true;
+#else
+    return false;
+#endif
+}
+
+#ifdef __ANDROID__
+/* KaTeX files bundled into the APK (android/app/src/main/assets/katex). */
+static const char *const np_katex_assets[] = {
+    "katex/katex.min.js",
+    "katex/katex.min.css",
+    "katex/fonts/KaTeX_AMS-Regular.woff2",
+    "katex/fonts/KaTeX_Caligraphic-Bold.woff2",
+    "katex/fonts/KaTeX_Caligraphic-Regular.woff2",
+    "katex/fonts/KaTeX_Fraktur-Bold.woff2",
+    "katex/fonts/KaTeX_Fraktur-Regular.woff2",
+    "katex/fonts/KaTeX_Main-Bold.woff2",
+    "katex/fonts/KaTeX_Main-BoldItalic.woff2",
+    "katex/fonts/KaTeX_Main-Italic.woff2",
+    "katex/fonts/KaTeX_Main-Regular.woff2",
+    "katex/fonts/KaTeX_Math-BoldItalic.woff2",
+    "katex/fonts/KaTeX_Math-Italic.woff2",
+    "katex/fonts/KaTeX_SansSerif-Bold.woff2",
+    "katex/fonts/KaTeX_SansSerif-Italic.woff2",
+    "katex/fonts/KaTeX_SansSerif-Regular.woff2",
+    "katex/fonts/KaTeX_Script-Regular.woff2",
+    "katex/fonts/KaTeX_Size1-Regular.woff2",
+    "katex/fonts/KaTeX_Size2-Regular.woff2",
+    "katex/fonts/KaTeX_Size3-Regular.woff2",
+    "katex/fonts/KaTeX_Size4-Regular.woff2",
+    "katex/fonts/KaTeX_Typewriter-Regular.woff2",
+};
+
+/* Extract KaTeX assets from the APK into <base>/latex_lite on first use. */
+static bool np_tex_lite_extract_assets(const char *dir) {
+    bool js_ok = false;
+    char dst[NP_PATH_CAP];
+    for (size_t i = 0; i < sizeof np_katex_assets / sizeof *np_katex_assets; i++) {
+        const char *asset = np_katex_assets[i];
+        snprintf(dst, sizeof dst, "%s/%s", dir, asset);
+        struct stat st;
+        if (stat(dst, &st) == 0) {
+            js_ok |= strstr(asset, "katex.min.js") != NULL;
+            continue;
+        }
+        SDL_RWops *src = SDL_RWFromFile(asset, "rb");   /* APK asset */
+        if (!src) continue;
+        FILE *f = fopen(dst, "wb");
+        if (f) {
+            char buf[8192];
+            size_t n;
+            while ((n = SDL_RWread(src, buf, 1, sizeof buf)) > 0)
+                fwrite(buf, 1, n, f);
+            fclose(f);
+            js_ok |= strstr(asset, "katex.min.js") != NULL;
+        }
+        SDL_RWclose(src);
+    }
+    return js_ok;
+}
+
+/* Regenerate <dir>/index.html from the current buffer. */
+static void np_tex_lite_generate(notepad *a, np_doc *d, const char *dir) {
+    size_t n = 0;
+    char *html = np_latex_html(d->text, d->len, &n);
+    if (!html) return;
+    char tmp[NP_PATH_CAP], final[NP_PATH_CAP];
+    snprintf(tmp, sizeof tmp, "%s/index.tmp", dir);
+    snprintf(final, sizeof final, "%s/index.html", dir);
+    FILE *f = fopen(tmp, "wb");
+    if (f) {
+        fwrite(html, 1, n, f);
+        fclose(f);
+        rename(tmp, final);                      /* atomic-ish swap */
+    }
+    free(html);
+    a->lite_rev = d->content_rev;
+}
+
+/* Drive the lightweight preview: start the server on first open, then
+ * regenerate with a short debounce when the buffer changes (reload is
+ * issued by the pane via the WebView). */
+static void np_tex_lite_sync(notepad *a, np_doc *d, bool owner_changed) {
+    const char *base = SDL_AndroidGetInternalStoragePath();
+    if (!base || !base[0]) return;
+    char dir[NP_PATH_CAP];
+    snprintf(dir, sizeof dir, "%s/latex_lite", base);
+
+    if (owner_changed || !np_http_running(&a->web_server)) {
+        np_preview_stop_http(a);
+        char sub[NP_PATH_CAP];
+        snprintf(sub, sizeof sub, "%s/latex_lite", base);
+        mkdir(sub, 0755);
+        snprintf(sub, sizeof sub, "%s/latex_lite/katex", base);
+        mkdir(sub, 0755);
+        snprintf(sub, sizeof sub, "%s/latex_lite/katex/fonts", base);
+        mkdir(sub, 0755);
+        np_tex_lite_extract_assets(dir);
+        np_tex_lite_generate(a, d, dir);
+        np_http_start(&a->web_server, dir);
+        snprintf(a->preview_owner, sizeof a->preview_owner, "%s", d->path);
+        a->wv_url[0] = 0;                        /* force a fresh navigate */
+        a->lite_due = 0;
+        return;
+    }
+    if (d->content_rev != a->lite_rev && a->lite_due == 0)
+        a->lite_due = SDL_GetTicks() + 1500;     /* debounce while typing */
+    if (a->lite_due && SDL_GetTicks() >= a->lite_due) {
+        np_tex_lite_generate(a, d, dir);
+        a->lite_due = 0;
+        if (a->wv_url[0]) np_webview_reload();
+    }
+}
+#endif /* __ANDROID__ */
+
 /* Every frame: place the native WebView view exactly over the reserved host
- * box when an HTML document is being previewed, otherwise hide it. CUI reports
+ * box when an HTML (or lightweight LaTeX) document is being previewed,
+ * otherwise hide it. CUI reports
  * rectangles in logical points; the bridge expects physical pixels with the
  * origin at the top-left (each backend flips its own coordinate system). */
 static void np_sync_webview(notepad *a, cui_ctx *ui) {
     if (!a->wv_init_done) return;
-    bool want = a->show_preview && a->preview_kind == NP_PREVIEW_HTML &&
-                np_webview_ready();
+    bool lite = a->preview_kind == NP_PREVIEW_LATEX && np_tex_lite_active();
+    bool want = a->show_preview && np_webview_ready() &&
+                (a->preview_kind == NP_PREVIEW_HTML || lite);
     cui_id host = cui_make_id(ui, "wv-host");
     cui_rect r = cui_get_rect(ui, host);
     if (!want || r.w <= 0 || r.h <= 0) {
@@ -5214,6 +5345,11 @@ static void np_preview_sync(notepad *a, np_doc *d) {
     bool owner_changed = strcmp(a->preview_owner, d->path) != 0;
 
     if (k == NP_PREVIEW_LATEX && d->path[0]) {
+#ifdef __ANDROID__
+        /* No TeX toolchain on Android: render a KaTeX-based lightweight
+         * HTML preview through the embedded WebView instead of compiling. */
+        np_tex_lite_sync(a, d, owner_changed);
+#else
         /* Multi-file projects: compile the project's main .tex, not the
          * chapter/style file currently on screen. */
         np_tex_detect_root(a, d);
@@ -5229,6 +5365,7 @@ static void np_preview_sync(notepad *a, np_doc *d) {
             a->tex_job.content_seen = d->content_rev;
             snprintf(a->preview_owner, sizeof a->preview_owner, "%s", compile_path);
         }
+#endif /* __ANDROID__ */
     } else if (k == NP_PREVIEW_PDF && d->path[0]) {
         if (owner_changed || a->tex_job.state == 0) {
             np_preview_release_tex_image(a);
@@ -5366,11 +5503,69 @@ static void np_preview_image_paint(cui_ctx *ui, cui_rect r, void *user) {
     cui_draw_image(ui, tex, r, uv, CUI_CORNERS(0), (cui_color){ 255, 255, 255, 255 });
 }
 
-/* Right-hand pane. Renders the three preview kinds into the same slot. */
+/* Right-hand pane. Renders the preview kinds into the same slot. */
+
+/* Shared WebView pane body: URL row + reserved host box. Used for HTML
+ * files and for the Android lightweight LaTeX preview (lite=true: the
+ * refresh button regenerates the HTML first). */
+static void np_web_preview_pane(cui_ctx *ui, notepad *a, const char *file_name,
+                                bool lite) {
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 6, .pad = 6) {
+        if (np_http_running(&a->web_server)) {
+            char url[512];
+            snprintf(url, sizeof url, "http://127.0.0.1:%d/%s",
+                     a->web_server.port, file_name);
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_input(ui, "web-preview-url", url, sizeof url, .read_only = true,
+                          .width = CUI_FILL);
+                if (cui_button(ui, "刷新", .size = CUI_SIZE_SM,
+                               .tooltip = lite ? "重新生成轻量预览" : "重新载入 Web 预览")) {
+                    if (lite) a->lite_due = 1;           /* regen next frame */
+                    else np_webview_reload();
+                }
+                if (cui_button(ui, "浏览器打开", .size = CUI_SIZE_SM,
+                               .icon = CUI_ICON_EXTERNAL_LINK,
+                               .tooltip = "在系统默认浏览器中打开"))
+                    np_open_url(url);
+            }
+            if (a->wv_available) {
+                /* Push the URL once per URL change. The native view is
+                 * positioned over this box every frame by
+                 * np_sync_webview() at the end of np_frame(). */
+                if (strcmp(a->wv_url, url) != 0) {
+                    np_webview_navigate(url);
+                    snprintf(a->wv_url, sizeof a->wv_url, "%s", url);
+                }
+                /* Reserved host rectangle; the native WebView paints
+                 * on top of it. */
+                cui_box(ui, .id = "wv-host", .width = CUI_FILL,
+                        .height = CUI_FILL, .bg = CUI_COLOR_SURFACE);
+            } else {
+                cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+                           .align = CUI_ALIGN_CENTER,
+                           .justify = CUI_JUSTIFY_CENTER, .gap = 8) {
+                    cui_text(ui, "内嵌 Web 预览不可用", .size = 13,
+                             .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_WARNING);
+                    cui_text(ui, "未检测到系统 Web 引擎。Windows 需 Edge WebView2 运行时；"
+                                 "macOS / Linux 需系统 WebKit。也可在下方用系统浏览器打开。",
+                             .size = 11, .color = CUI_COLOR_TEXT_MUTED,
+                             .nowrap = false);
+                    if (cui_button(ui, "在系统浏览器打开", .variant = CUI_BUTTON_PRIMARY))
+                        np_open_url(url);
+                }
+            }
+        } else {
+            cui_text(ui, "无法启动本地 HTTP 服务器。", .size = 12,
+                     .color = CUI_COLOR_DANGER);
+        }
+    }
+}
+
 static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     np_preview_sync(a, d);
 
-    if (a->preview_kind == NP_PREVIEW_HTML) {
+    if (a->preview_kind == NP_PREVIEW_HTML ||
+        (a->preview_kind == NP_PREVIEW_LATEX && np_tex_lite_active())) {
         char clicked[512];
         if (np_http_take_click(&a->web_server, clicked, sizeof clicked)) {
             int span = 0;
@@ -5382,7 +5577,10 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6,
                .bg = CUI_COLOR_SURFACE) {
         char head[160];
-        snprintf(head, sizeof head, "预览 · %s", np_preview_kind_name(a->preview_kind));
+        snprintf(head, sizeof head, "预览 · %s%s",
+                 np_preview_kind_name(a->preview_kind),
+                 (a->preview_kind == NP_PREVIEW_LATEX && np_tex_lite_active())
+                     ? "（轻量）" : "");
         cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
             cui_text(ui, head, .size = 12, .font = CUI_FONT_MEDIUM);
             cui_spacer(ui);
@@ -5414,6 +5612,12 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                 np_select_span(a, d, mr.source_offset, mr.source_end - mr.source_offset);
             }
         } else if (k == NP_PREVIEW_LATEX) {
+#ifdef __ANDROID__
+            if (np_tex_lite_active()) {
+                np_web_preview_pane(ui, a, "index.html", true);
+            } else
+#endif
+            {
             int st = a->tex_job.state;
             if (st == 1) {
                 cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
@@ -5493,6 +5697,7 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                                  .font = CUI_FONT_MONO, .color = CUI_COLOR_TEXT_MUTED);
                 }
             }
+            }
         } else if (k == NP_PREVIEW_PDF) {
             int st = a->tex_job.state;
             if (st == 1) {
@@ -5533,55 +5738,8 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                          .size = 11, .color = CUI_COLOR_TEXT_MUTED, .font = CUI_FONT_MONO);
             }
         } else if (k == NP_PREVIEW_HTML) {
-            cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 6, .pad = 6) {
-                if (np_http_running(&a->web_server)) {
-                    char url[512], base[128];
-                    const char *name = d->path[0] ? np_base(d->path) : "index.html";
-                    snprintf(base, sizeof base, "%s", name);
-                    snprintf(url, sizeof url, "http://127.0.0.1:%d/%s",
-                             a->web_server.port, base);
-                    cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
-                        cui_input(ui, "web-preview-url", url, sizeof url, .read_only = true,
-                                  .width = CUI_FILL);
-                        if (cui_button(ui, "刷新", .size = CUI_SIZE_SM,
-                                       .tooltip = "重新载入 Web 预览"))
-                            np_webview_reload();
-                        if (cui_button(ui, "浏览器打开", .size = CUI_SIZE_SM,
-                                       .icon = CUI_ICON_EXTERNAL_LINK,
-                                       .tooltip = "在系统默认浏览器中打开"))
-                            np_open_url(url);
-                    }
-                    if (a->wv_available) {
-                        /* Push the URL once per URL change. The native view is
-                         * positioned over this box every frame by
-                         * np_sync_webview() at the end of np_frame(). */
-                        if (strcmp(a->wv_url, url) != 0) {
-                            np_webview_navigate(url);
-                            snprintf(a->wv_url, sizeof a->wv_url, "%s", url);
-                        }
-                        /* Reserved host rectangle; the native WebView paints
-                         * on top of it. */
-                        cui_box(ui, .id = "wv-host", .width = CUI_FILL,
-                                .height = CUI_FILL, .bg = CUI_COLOR_SURFACE);
-                    } else {
-                        cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
-                                   .align = CUI_ALIGN_CENTER,
-                                   .justify = CUI_JUSTIFY_CENTER, .gap = 8) {
-                            cui_text(ui, "内嵌 Web 预览不可用", .size = 13,
-                                     .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_WARNING);
-                            cui_text(ui, "未检测到系统 Web 引擎。Windows 需 Edge WebView2 运行时；"
-                                         "macOS / Linux 需系统 WebKit。也可在下方用系统浏览器打开。",
-                                     .size = 11, .color = CUI_COLOR_TEXT_MUTED,
-                                     .nowrap = false);
-                            if (cui_button(ui, "在系统浏览器打开", .variant = CUI_BUTTON_PRIMARY))
-                                np_open_url(url);
-                        }
-                    }
-                } else {
-                    cui_text(ui, "无法启动本地 HTTP 服务器。", .size = 12,
-                             .color = CUI_COLOR_DANGER);
-                }
-            }
+            np_web_preview_pane(ui, a,
+                                d->path[0] ? np_base(d->path) : "index.html", false);
         }
     }
 }
