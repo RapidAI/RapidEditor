@@ -558,6 +558,7 @@ static bool np_ai_apply(notepad *a);
 static void np_llm_models_start(notepad *a, int prov_idx);
 static void np_llm_test_start(notepad *a, int prov_idx);
 static void np_ai_quick(notepad *a, int task);
+static void np_config_save(notepad *a);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
@@ -2523,6 +2524,16 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         long st = a->maclaw_done;
         if (st != a->maclaw_last_state) {
             a->maclaw_last_state = (int)st;
+            /* 授权成功即自动切到 maclaw 后端，省去用户手动选择；同时清掉
+             * 之前走本地 CLI 失败留下的错误，避免面板一直显示旧错误。 */
+            if (st == 3 && a->maclaw_token[0]) {
+                a->ai_backend = 4;
+                a->ai_cmd[0] = 0;
+                a->ai_error[0] = 0;
+                a->ai_result[0] = 0;
+                a->ai_done = 0;
+                np_config_save(a);   /* 立即持久化，重启后仍走 maclaw */
+            }
             cui_request_redraw(ui);
         }
         if (st == 1 || st == 2) cui_request_redraw(ui); /* animate spinner / poll count */
@@ -2555,7 +2566,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 cui_text(ui, who, .size = 12);
             }
             char saved[160];
-            snprintf(saved, sizeof saved, "已保存 viewer_token（%d 字符），AI 助手选择「maclaw 官方服务」即可使用。",
+            snprintf(saved, sizeof saved, "已保存 viewer_token（%d 字符），已自动切换到 MaClaw官方，直接点 Ask AI 即可使用。",
                      (int)strlen(a->maclaw_token));
             cui_text(ui, saved, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
             cui_dialog_footer(ui) {
@@ -4612,6 +4623,9 @@ static void np_config_load(notepad *a) {
         }
     }
     fclose(f);
+    /* 迁移：已保存 maclaw token 但后端仍是「自动检测」的旧配置，自动切到
+     * MaClaw官方——否则会走本机并不存在的 claude/codex CLI 而失败。 */
+    if (a->maclaw_token[0] && a->ai_backend == 0) a->ai_backend = 4;
 }
 
 /* Called once when the app loop exits (any exit path: menu, window close). */
@@ -6203,7 +6217,7 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
     const char *ctxs[] = { "当前选区", "整个文件" };
     const char *tasks[] = { "润色改写", "翻译", "检查错误", "解释说明",
                             "补全续写", "生成模板", "自定义指令" };
-    const char *backs_static[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "maclaw 官方服务" };
+    const char *backs_static[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "MaClaw官方" };
     const char *backs[5 + 8];
     int back_count = 0;
     for (int i = 0; i < 5; i++) backs[back_count++] = backs_static[i];
@@ -6221,6 +6235,16 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
         cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
             cui_text(ui, "AI 助手", .size = 13, .font = CUI_FONT_MEDIUM);
             cui_spacer(ui);
+            /* 显示当前激活的服务商，扫码授权后这里直接显示 MaClaw官方。 */
+            {
+                const char *label = NULL;
+                if (a->ai_backend == 4)
+                    label = a->maclaw_token[0] ? "MaClaw官方" : "MaClaw官方(未登录)";
+                else if (a->ai_backend >= 5 && a->ai_backend - 5 < a->llm_prov_count)
+                    label = a->llm_prov[a->ai_backend - 5].name;
+                if (label && label[0])
+                    cui_text(ui, label, .size = 11, .color = CUI_COLOR_ACCENT);
+            }
             if (cui_button(ui, "LLM 服务…", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST))
                 a->dlg_llm_prov = true;
