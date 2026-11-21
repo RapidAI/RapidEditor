@@ -400,6 +400,8 @@ typedef struct notepad {
     /* AI native panel (local agents + OpenAI-compatible providers) ----- */
     char ai_cmd[512];                   /* user-editable command template */
     char ai_inst[512];                  /* instruction / task */
+    char ai_prev[8192];                 /* previous Q&A for follow-up prompts */
+    bool ai_followup;                   /* multi-turn: carry previous Q&A */
     int  ai_task;                       /* 0 polish 1 translate 2 check 3 explain 4 custom 5 complete 6 template */
     int  ai_ctx;                        /* 0 selection 1 whole file */
     int  ai_backend;                    /* 0 auto 1 claude 2 codex 3 custom */
@@ -555,6 +557,7 @@ static void np_maclaw_qr_paint(cui_ctx *ui, cui_rect r, void *user);
 static bool np_ai_apply(notepad *a);
 static void np_llm_models_start(notepad *a, int prov_idx);
 static void np_llm_test_start(notepad *a, int prov_idx);
+static void np_ai_quick(notepad *a, int task);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
@@ -3538,11 +3541,15 @@ static void np_tt_install_worker(void *arg) {
 static void np_ai_worker(void *arg) {
     notepad *a = (notepad *)arg;
     /* prompt = instruction + context, all in one file the agent reads. */
-    size_t need = strlen(a->ai_inst) + strlen(a->ai_orig) + 64;
+    size_t need = strlen(a->ai_prev) + strlen(a->ai_inst) + strlen(a->ai_orig) + 96;
     char *prompt = (char *)malloc(need);
     if (!prompt) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "内存不足"); goto done; }
-    snprintf(prompt, need, "%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
-             a->ai_inst[0] ? a->ai_inst : "请处理以下内容", a->ai_orig);
+    {
+        const char *prev = a->ai_prev[0] ? a->ai_prev : "";
+        snprintf(prompt, need, "%s%s%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
+                 prev, prev[0] ? "\n" : "",
+                 a->ai_inst[0] ? a->ai_inst : "请处理以下内容", a->ai_orig);
+    }
     bool wrote = np_ai_write_context(a->ai_ctx_path, prompt);
     free(prompt);
     if (!wrote) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "无法写入临时提示文件"); goto done; }
@@ -3573,15 +3580,16 @@ static void np_ai_maclaw_worker(void *arg) {
         goto done;
     }
     const char *inst = a->ai_inst[0] ? a->ai_inst : "请处理以下内容";
-    size_t prompt_cap = strlen(inst) + strlen(a->ai_orig) + 128;
+    const char *prev = a->ai_prev[0] ? a->ai_prev : "";
+    size_t prompt_cap = strlen(prev) + strlen(inst) + strlen(a->ai_orig) + 160;
     char *prompt = (char *)malloc(prompt_cap);
     if (!prompt) {
         a->ai_done = 3;
         snprintf(a->ai_error, sizeof a->ai_error, "内存不足");
         goto done;
     }
-    snprintf(prompt, prompt_cap, "%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
-             inst, a->ai_orig);
+    snprintf(prompt, prompt_cap, "%s%s%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
+             prev, prev[0] ? "\n" : "", inst, a->ai_orig);
     bool ok = np_maclaw_llm_chat(a->maclaw_hub, a->maclaw_token, prompt,
                                  a->ai_result, sizeof a->ai_result,
                                  a->ai_error, sizeof a->ai_error);
@@ -3728,15 +3736,16 @@ static void np_ai_openai_worker(void *arg) {
     }
     const np_llm_provider *p = &a->llm_prov[idx];
     const char *inst = a->ai_inst[0] ? a->ai_inst : "请处理以下内容";
-    size_t prompt_cap = strlen(inst) + strlen(a->ai_orig) + 128;
+    const char *prev = a->ai_prev[0] ? a->ai_prev : "";
+    size_t prompt_cap = strlen(prev) + strlen(inst) + strlen(a->ai_orig) + 160;
     char *prompt = (char *)malloc(prompt_cap);
     if (!prompt) {
         snprintf(a->ai_error, sizeof a->ai_error, "内存不足");
         a->ai_done = 3;
         goto done;
     }
-    snprintf(prompt, prompt_cap, "%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
-             inst, a->ai_orig);
+    snprintf(prompt, prompt_cap, "%s%s%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
+             prev, prev[0] ? "\n" : "", inst, a->ai_orig);
     bool ok = np_openai_chat(p->url, p->api_key, p->model, prompt,
                              a->ai_result, sizeof a->ai_result,
                              a->ai_error, sizeof a->ai_error);
@@ -3857,6 +3866,17 @@ static void np_ai_start(notepad *a) {
         a->ai_target_s = 0; a->ai_target_e = d->len;
     }
     snprintf(a->ai_target_path, sizeof a->ai_target_path, "%s", d->path);
+
+    /* Multi-turn: carry the previous Q&A into this prompt when enabled. */
+    if (a->ai_followup && a->ai_result[0]) {
+        char q[512], prev_a[6000];
+        snprintf(q, sizeof q, "%s", a->ai_inst[0] ? a->ai_inst : "（无）");
+        snprintf(prev_a, sizeof prev_a, "%s", a->ai_result);
+        snprintf(a->ai_prev, sizeof a->ai_prev,
+                 "--- 上一轮指令 ---\n%s\n--- 上一轮回答 ---\n%s", q, prev_a);
+    } else {
+        a->ai_prev[0] = 0;
+    }
 
     /* maclaw official service uses the Hub LLM proxy, not a local CLI. */
     if (a->ai_backend == 4) {
@@ -5094,6 +5114,32 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             .no_line_numbers = !a->line_numbers,
             .placeholder = "在这里输入文字…  Ctrl+N 新建标签，Ctrl+O 打开文件，Ctrl+S 保存",
             .read_only = false);
+
+        /* Native AI actions on right click over the editor. */
+        cui_context_menu(ui, "editor-ai-ctx") {
+            bool has_sel = d->caret != d->anchor;
+            cui_menu_label(ui, "AI 助手");
+            if (cui_menu_item(ui, "润色选区", .icon = CUI_ICON_SPARKLES,
+                              .disabled = !has_sel))
+                np_ai_quick(a, 0);
+            if (cui_menu_item(ui, "翻译选区", .icon = CUI_ICON_SPARKLES,
+                              .disabled = !has_sel))
+                np_ai_quick(a, 1);
+            if (cui_menu_item(ui, "检查错误", .icon = CUI_ICON_SPARKLES,
+                              .disabled = !has_sel))
+                np_ai_quick(a, 2);
+            if (cui_menu_item(ui, "解释选区", .icon = CUI_ICON_SPARKLES,
+                              .disabled = !has_sel))
+                np_ai_quick(a, 3);
+            if (cui_menu_item(ui, "生成模板…", .icon = CUI_ICON_SPARKLES))
+                np_ai_quick(a, 6);
+            if (cui_menu_item(ui, "续写（光标处）", .icon = CUI_ICON_SPARKLES))
+                np_ai_quick(a, 5);
+            cui_menu_separator(ui);
+            if (cui_menu_item(ui, "打开 AI 面板", .icon = CUI_ICON_SPARKLES))
+                a->show_ai = true;
+        }
+
         if (r.changed) {
             d->dirty = true;
             d->len = r.length;
@@ -6114,6 +6160,17 @@ static const char *np_ai_default_inst(int task) {
     }
 }
 
+/* One-click AI action from the editor context menu: sets the task, fills
+ * the default instruction, opens the panel and fires the request. */
+static void np_ai_quick(notepad *a, int task) {
+    a->ai_task = task;
+    const char *def = np_ai_default_inst(task);
+    if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
+    a->ai_ctx = 0;                       /* act on the selection / caret */
+    a->show_ai = true;
+    np_ai_start(a);
+}
+
 /* Put the AI result into a brand-new document (template generation). */
 static bool np_ai_new_doc_from_result(notepad *a) {
     if (a->ai_done != 2 || !a->ai_result[0]) return false;
@@ -6205,6 +6262,10 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                   .label = "指令", .placeholder = "告诉 AI 要做什么（任务切换时自动填入默认指令）",
                   .width = CUI_FILL);
 
+        cui_row(ui, .width = CUI_FILL, .gap = 12, .align = CUI_ALIGN_CENTER) {
+            cui_checkbox(ui, "带上下文追问（多轮）", &a->ai_followup);
+            cui_spacer(ui);
+        }
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
             if (cui_button(ui, st == 1 ? "处理中…" : "Ask AI",
                            .variant = CUI_BUTTON_PRIMARY,
@@ -6212,10 +6273,10 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                                        (a->ai_task == 6 && !a->ai_inst[0]))) {
                 np_ai_start(a);
             }
-            if (cui_button(ui, "清空结果", .variant = CUI_BUTTON_GHOST,
+            if (cui_button(ui, "清空对话", .variant = CUI_BUTTON_GHOST,
                            .disabled = st == 1)) {
                 a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
-                a->ai_show_diff = false;
+                a->ai_prev[0] = 0; a->ai_show_diff = false;
             }
         }
 
@@ -6443,6 +6504,11 @@ static void np_frame(cui_ctx *ui, void *user) {
         /* Native AI panel (Ctrl+Alt+A): docked, persistent, not a dialog. */
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_A)) {
             a->show_ai = !a->show_ai;
+        }
+        /* Quick AI completion from the caret (Ctrl+Alt+C). */
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_C)) {
+            np_doc *cd = np_cur(a);
+            if (cd && !cd->is_hex) np_ai_quick(a, 5);
         }
 
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
