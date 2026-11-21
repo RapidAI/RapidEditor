@@ -41,7 +41,7 @@
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.2.9"
+#define NP_APP_VERSION "1.2.10"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -5574,7 +5574,12 @@ static void np_tex_lite_sync(notepad *a, np_doc *d, bool owner_changed) {
 static void np_sync_webview(notepad *a, cui_ctx *ui) {
     if (!a->wv_init_done) return;
     bool lite = a->preview_kind == NP_PREVIEW_LATEX && np_tex_lite_active();
+    /* The WebView is a native child window: the OS composites it above this
+     * window's CUI-drawn client area, so any modal dialog / menu / popover
+     * would be painted over by the page. Hide it while an overlay is open so
+     * the drawn dialog stays on top; it reappears on the next frame. */
     bool want = a->show_preview && np_webview_ready() &&
+                !cui_overlay_open(ui) &&
                 (a->preview_kind == NP_PREVIEW_HTML || lite);
     cui_id host = cui_make_id(ui, "wv-host");
     cui_rect r = cui_get_rect(ui, host);
