@@ -343,8 +343,11 @@ typedef struct notepad {
 
     /* EditPlus-style workspace ---------------------------------------- */
     bool show_sidebar, show_output, follow_active;
+    bool show_ai;                   /* AI assistant docked as a side panel */
+    bool zen_prev_ai;
     int  last_active;               /* to make the directory pane follow tab switches */
     float side_ratio, out_ratio;    /* first pane's share of each split */
+    float ai_ratio;                 /* workspace share when the AI panel is docked */
     int  side_tab, out_tab;         /* 目录/文档/最近 · 查找结果/消息 */
     char side_dir[NP_PATH_CAP];
     bool side_reload;
@@ -394,11 +397,10 @@ typedef struct notepad {
     bool dlg_math_preview;
     char math_expr[1024];               /* formula being previewed (no $ delims) */
 
-    /* Controlled AI assistant (local agent) --------------------------- */
-    bool dlg_ai;
+    /* AI native panel (local agents + OpenAI-compatible providers) ----- */
     char ai_cmd[512];                   /* user-editable command template */
     char ai_inst[512];                  /* instruction / task */
-    int  ai_task;                       /* 0 polish 1 translate 2 check 3 explain 4 custom */
+    int  ai_task;                       /* 0 polish 1 translate 2 check 3 explain 4 custom 5 complete 6 template */
     int  ai_ctx;                        /* 0 selection 1 whole file */
     int  ai_backend;                    /* 0 auto 1 claude 2 codex 3 custom */
     char ai_ctx_path[NP_PATH_CAP];
@@ -516,11 +518,14 @@ static void np_zen_set(notepad *a, bool on) {
         a->zen_prev_sidebar = a->show_sidebar;
         a->zen_prev_output  = a->show_output;
         a->zen_prev_preview = a->show_preview;
+        a->zen_prev_ai      = a->show_ai;
         a->show_sidebar = a->show_output = a->show_preview = false;
+        a->show_ai = false;
     } else {
         a->show_sidebar = a->zen_prev_sidebar;
         a->show_output  = a->zen_prev_output;
         a->show_preview = a->zen_prev_preview;
+        a->show_ai      = a->zen_prev_ai;
     }
 }
 
@@ -556,7 +561,7 @@ static bool np_any_dialog(const notepad *a) {
            a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
-           a->dlg_math_preview || a->dlg_ai || a->dlg_maclaw ||
+           a->dlg_math_preview || a->dlg_maclaw ||
            a->dlg_llm_prov;
 }
 
@@ -2506,124 +2511,6 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
-    /* Controlled AI assistant: local agent with explicit context + Diff apply. */
-    cui_dialog(ui, "AI 助手", &a->dlg_ai,
-               .description = "本机 Codex / Claude Code，或关联 maclaw 用户的官方服务；先审阅 Diff，确认后才写入正文",
-               .width = 680) {
-        /* Poll the worker state; request a redraw on transitions. */
-        long st = a->ai_done;
-        bool ai_rewrite = (a->ai_task == 0 || a->ai_task == 1 || a->ai_task == 4);
-        if (st != a->ai_last_state) { a->ai_last_state = st; cui_request_redraw(ui); }
-
-        const char *ctxs[] = { "当前选区", "整个文件" };
-        const char *tasks[] = { "润色改写", "翻译", "检查错误", "解释说明", "自定义指令" };
-        const char *backs_static[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "maclaw 官方服务" };
-        const char *backs[5 + 8];
-        int back_count = 0;
-        for (int i = 0; i < 5; i++) backs[back_count++] = backs_static[i];
-        for (int i = 0; i < a->llm_prov_count && back_count < (int)(sizeof backs / sizeof backs[0]); i++)
-            backs[back_count++] = a->llm_prov[i].name;
-        if (a->ai_backend >= back_count) a->ai_backend = 0;
-        cui_row(ui, .width = CUI_FILL, .gap = 10) {
-            if (cui_select(ui, "ai-ctx", ctxs, 2, &a->ai_ctx, .label = "上下文", .width = 160)) { /* changed */ }
-            if (cui_select(ui, "ai-task", tasks, 5, &a->ai_task, .label = "任务", .width = 160)) {
-                const char *def = NULL;
-                switch (a->ai_task) {
-                    case 0: def = "请润色这段 LaTeX：改进措辞与表达，保持所有命令、公式和结构与原意不变。只输出润色后的完整源码。"; break;
-                    case 1: def = "请把这段 LaTeX 翻译成中文，保持所有 LaTeX 命令、公式和环境不变。只输出翻译后的完整源码。"; break;
-                    case 2: def = "请检查这段 LaTeX 的错误与问题（语法、宏包、引用、公式），逐条列出问题与建议。不要修改原文。"; break;
-                    case 3: def = "请解释这段 LaTeX 的作用与结构。不要修改原文。"; break;
-                    default: def = NULL; break;
-                }
-                if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
-            }
-            if (cui_select(ui, "ai-back", backs, back_count, &a->ai_backend, .label = "后端", .width = 170)) {
-                a->ai_cmd[0] = 0;   /* regenerate default template on next ask */
-            }
-        }
-        cui_input(ui, "ai-inst", a->ai_inst, sizeof a->ai_inst,
-                  .label = "指令", .placeholder = "告诉 AI 要做什么", .width = CUI_FILL);
-        if (a->ai_backend == 4) {
-            cui_text(ui, a->maclaw_token[0]
-                     ? "maclaw 官方服务已授权；请求将以该 maclaw 用户的额度计费。"
-                     : "尚未授权 maclaw：请先在「LLM 服务」中扫码登录，再使用此后端。",
-                     .size = 12,
-                     .color = a->maclaw_token[0] ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
-        } else if (a->ai_backend >= 5) {
-            const np_llm_provider *p = &a->llm_prov[a->ai_backend - 5];
-            char hint[640];
-            snprintf(hint, sizeof hint, "服务：%s    模型：%s",
-                     p->url[0] ? p->url : "（未填写服务地址）",
-                     p->model[0] ? p->model : "（未选择模型）");
-            cui_text(ui, hint, .size = 12,
-                     .color = (p->url[0] && p->model[0])
-                                  ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
-        } else {
-            cui_textarea(ui, "ai-cmd", a->ai_cmd, sizeof a->ai_cmd,
-                         .label = "命令模板（{file}=上下文文件, {out}=结果文件；可改为任意本机 agent 命令）",
-                         .height = 56);
-        }
-
-        cui_row(ui, .width = CUI_FILL, .gap = 8) {
-            if (cui_button(ui, st == 1 ? "处理中…" : "Ask AI", .variant = CUI_BUTTON_PRIMARY,
-                           .disabled = st == 1 || !a->ai_inst[0])) {
-                np_ai_start(a);
-            }
-            if (cui_button(ui, "LLM 服务…", .variant = CUI_BUTTON_GHOST)) a->dlg_llm_prov = true;
-            if (cui_button(ui, "清空结果", .variant = CUI_BUTTON_GHOST, .disabled = st == 1)) {
-                a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0; a->ai_show_diff = false;
-            }
-        }
-
-        if (st == 1) {
-            cui_text(ui, "AI 正在处理，请稍候…", .size = 12, .color = CUI_COLOR_TEXT_MUTED);
-        } else if (st == 3) {
-            cui_text(ui, "AI 调用失败", .size = 13, .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_DANGER);
-            cui_text(ui, a->ai_error[0] ? a->ai_error : "未知错误", .size = 12);
-            if (a->ai_backend == 4) {
-                cui_text(ui, "提示：请确认 maclaw 账号仍有可用额度；服务地址由扫码授权自动获取。",
-                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
-            } else if (a->ai_backend >= 5) {
-                cui_text(ui, "提示：请检查服务地址、API Key 与模型是否正确，以及账户余额。",
-                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
-            } else {
-                cui_text(ui, "提示：请在命令模板中填入本机已安装的 agent 命令，或确认其已加入 PATH。",
-                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
-            }
-        } else if (st == 2 && a->ai_result[0]) {
-            if (ai_rewrite) {
-                cui_text(ui, "逐处 Diff（原文 → AI 结果），确认后才写入", .size = 12, .font = CUI_FONT_MEDIUM);
-                cui_diff_result dr = cui_diff_view(ui, "ai-diff", a->ai_orig, a->ai_result,
-                                                    .height = -1, .context = 3, .language = "tex");
-                (void)dr;
-            } else {
-                cui_text(ui, "AI 回复（不会改动正文）", .size = 12, .font = CUI_FONT_MEDIUM);
-                cui_textarea(ui, "ai-answer", a->ai_result, sizeof a->ai_result,
-                             .height = 180, .read_only = true);
-            }
-            cui_dialog_footer(ui) {
-                if (cui_button(ui, "关闭")) a->dlg_ai = false;
-                if (ai_rewrite) {
-                    if (cui_button(ui, "应用改写", .variant = CUI_BUTTON_PRIMARY)) {
-                        if (np_ai_apply(a)) {
-                            np_toast(a, "已应用", "AI 改写已写入文档（当前编辑器撤销为软支持）", CUI_TONE_INFO);
-                            a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
-                            a->dlg_ai = false;
-                        }
-                    }
-                } else {
-                    if (cui_button(ui, "完成", .variant = CUI_BUTTON_PRIMARY)) a->dlg_ai = false;
-                }
-            }
-        } else {
-            cui_text(ui, "选择上下文与任务，填写指令后点「Ask AI」。结果不会自动覆盖正文。",
-                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
-            cui_dialog_footer(ui) {
-                if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY)) a->dlg_ai = false;
-            }
-        }
-    }
-
     /* maclaw official-service login: the QR is generated automatically when
      * the dialog opens — no button click needed. */
     cui_dialog(ui, "maclaw 官方服务", &a->dlg_maclaw,
@@ -3947,7 +3834,18 @@ static void np_ai_start(notepad *a) {
     if (!d || d->is_hex) return;
     int s0 = NP_MIN(d->caret, d->anchor), s1 = NP_MAX(d->caret, d->anchor);
     s0 = NP_MAX(0, NP_MIN(s0, d->len)); s1 = NP_MAX(s0, NP_MIN(s1, d->len));
-    if (a->ai_ctx == 0 && s1 > s0) {
+    if (a->ai_task == 5) {
+        /* Completion: feed the text around the caret; the result is
+         * inserted at the caret (empty target range in np_ai_apply). */
+        int before = 3000, after = 1000;
+        int from = s0 > before ? s0 - before : 0;
+        int to = s1 + after < d->len ? s1 + after : d->len;
+        if (to < s1) to = s1;
+        size_t n = (size_t)(to - from);
+        if (n >= sizeof a->ai_orig) n = sizeof a->ai_orig - 1;
+        memcpy(a->ai_orig, d->text + from, n); a->ai_orig[n] = 0;
+        a->ai_target_s = s0; a->ai_target_e = s0;
+    } else if (a->ai_ctx == 0 && s1 > s0) {
         size_t n = (size_t)(s1 - s0);
         if (n >= sizeof a->ai_orig) n = sizeof a->ai_orig - 1;
         memcpy(a->ai_orig, d->text + s0, n); a->ai_orig[n] = 0;
@@ -4624,10 +4522,15 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "show_status")) a->show_status = atoi(val) != 0;
         else if (!strcmp(key, "show_sidebar")) a->show_sidebar = atoi(val) != 0;
         else if (!strcmp(key, "show_output")) a->show_output = atoi(val) != 0;
+        else if (!strcmp(key, "show_ai")) a->show_ai = atoi(val) != 0;
         else if (!strcmp(key, "show_preview")) a->show_preview = atoi(val) != 0;
         else if (!strcmp(key, "preview_ratio")) {
             float r = (float)atof(val);
             if (r >= 0.2f && r <= 0.85f) a->preview_ratio = r;
+        }
+        else if (!strcmp(key, "ai_ratio")) {
+            float r = (float)atof(val);
+            if (r >= 0.4f && r <= 0.92f) a->ai_ratio = r;
         }
         else if (!strcmp(key, "follow_active")) a->follow_active = atoi(val) != 0;
         else if (!strcmp(key, "default_crlf")) a->default_crlf = atoi(val) != 0;
@@ -4707,10 +4610,11 @@ static void np_config_save(notepad *a) {
     fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\n",
             a->dark ? 1 : 0, a->accent, a->font_size, a->density);
     fprintf(f, "line_numbers=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n"
-               "show_preview=%d\npreview_ratio=%.4f\n",
+               "show_preview=%d\npreview_ratio=%.4f\nshow_ai=%d\nai_ratio=%.4f\n",
             a->line_numbers ? 1 : 0, a->show_status ? 1 : 0,
             a->show_sidebar ? 1 : 0, a->show_output ? 1 : 0,
-            a->show_preview ? 1 : 0, a->preview_ratio);
+            a->show_preview ? 1 : 0, a->preview_ratio,
+            a->show_ai ? 1 : 0, a->ai_ratio);
     fprintf(f, "follow_active=%d\ndefault_crlf=%d\nmake_backup=%d\n"
                "session_restore=%d\nmatch_case=%d\nsystem_theme=%d\n",
             a->follow_active ? 1 : 0, a->default_crlf ? 1 : 0,
@@ -6179,6 +6083,222 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
 /* Frame                                                               */
 /* ------------------------------------------------------------------ */
 
+/* ---- AI native panel ---------------------------------------------------- */
+
+/* What happens to a finished AI result, per task. */
+enum {                      /* ai_task values:                    */
+    NP_AI_DISP_DIFF = 0,    /* 0 polish 1 translate 4 custom      */
+    NP_AI_DISP_ANSWER = 1,  /* 2 check 3 explain                  */
+    NP_AI_DISP_INSERT = 2,  /* 5 completion (insert at caret)     */
+    NP_AI_DISP_TEMPLATE = 3,/* 6 template (new doc or insert)     */
+};
+static int np_ai_disp(int task) {
+    switch (task) {
+        case 0: case 1: case 4: return NP_AI_DISP_DIFF;
+        case 5: return NP_AI_DISP_INSERT;
+        case 6: return NP_AI_DISP_TEMPLATE;
+        default: return NP_AI_DISP_ANSWER;
+    }
+}
+
+/* Default instruction per task, or NULL when the user must type one. */
+static const char *np_ai_default_inst(int task) {
+    switch (task) {
+        case 0: return "请润色这段 LaTeX：改进措辞与表达，保持所有命令、公式和结构与原意不变。只输出润色后的完整源码。";
+        case 1: return "请把这段 LaTeX 翻译成中文，保持所有 LaTeX 命令、公式和环境不变。只输出翻译后的完整源码。";
+        case 2: return "请检查这段 LaTeX 的错误与问题（语法、宏包、引用、公式），逐条列出问题与建议。不要修改原文。";
+        case 3: return "请解释这段 LaTeX 的作用与结构。不要修改原文。";
+        case 5: return "请续写下面的 LaTeX 文档。只输出紧接在文末之后的续写内容，不要重复已有文本，不要任何解释或代码块标记。";
+        case 6: return "请生成一个可直接编译的 LaTeX 模板（从 \\documentclass 到 \\end{document} 的完整文档）。只输出完整源码，不要解释。需求：";
+        default: return NULL;
+    }
+}
+
+/* Put the AI result into a brand-new document (template generation). */
+static bool np_ai_new_doc_from_result(notepad *a) {
+    if (a->ai_done != 2 || !a->ai_result[0]) return false;
+    np_doc *nd = np_doc_new(a);
+    if (!nd) return false;
+    size_t n = strlen(a->ai_result);
+    if (!np_ensure_cap(nd, n + 1)) {
+        np_close_doc(a, a->count - 1);
+        np_toast(a, "内存不足", "无法载入 AI 模板", CUI_TONE_DANGER);
+        return false;
+    }
+    memcpy(nd->text, a->ai_result, n + 1);
+    nd->len = (int)n;
+    np_text_changed(a, nd);
+    return true;
+}
+
+static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
+    (void)d;
+    long st = a->ai_done;
+    int disp = np_ai_disp(a->ai_task);
+    if (st != a->ai_last_state) { a->ai_last_state = st; cui_request_redraw(ui); }
+    if (st == 1) cui_request_redraw(ui);        /* keep the spinner animating */
+
+    const char *ctxs[] = { "当前选区", "整个文件" };
+    const char *tasks[] = { "润色改写", "翻译", "检查错误", "解释说明",
+                            "补全续写", "生成模板", "自定义指令" };
+    const char *backs_static[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "maclaw 官方服务" };
+    const char *backs[5 + 8];
+    int back_count = 0;
+    for (int i = 0; i < 5; i++) backs[back_count++] = backs_static[i];
+    for (int i = 0; i < a->llm_prov_count && back_count < (int)(sizeof backs / sizeof backs[0]); i++)
+        backs[back_count++] = a->llm_prov[i].name;
+    if (a->ai_backend >= back_count) a->ai_backend = 0;
+    if (!a->ai_inst[0]) {
+        const char *def = np_ai_default_inst(a->ai_task);
+        if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
+    }
+
+    cui_column(ui, .id = "ai-panel", .width = CUI_FILL, .height = CUI_FILL,
+               .gap = 8, .pad = 10) {
+        /* Header -------------------------------------------------------- */
+        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+            cui_text(ui, "AI 助手", .size = 13, .font = CUI_FONT_MEDIUM);
+            cui_spacer(ui);
+            if (cui_button(ui, "LLM 服务…", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST))
+                a->dlg_llm_prov = true;
+            if (cui_button(ui, "✕", .size = CUI_SIZE_SM, .variant = CUI_BUTTON_GHOST))
+                a->show_ai = false;
+        }
+
+        /* Request builder ------------------------------------------------ */
+        cui_row(ui, .width = CUI_FILL, .gap = 8) {
+            if (cui_select(ui, "ai-task", tasks, 7, &a->ai_task,
+                           .label = "任务", .width = CUI_FILL)) {
+                const char *def = np_ai_default_inst(a->ai_task);
+                if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
+            }
+            if (cui_select(ui, "ai-ctx", ctxs, 2, &a->ai_ctx,
+                           .label = "上下文", .width = CUI_FILL,
+                           .disabled = a->ai_task == 5)) { /* caret-based */ }
+        }
+        if (cui_select(ui, "ai-back", backs, back_count, &a->ai_backend,
+                       .label = "后端", .width = CUI_FILL)) {
+            a->ai_cmd[0] = 0;   /* regenerate default template on next ask */
+        }
+        if (a->ai_backend == 4) {
+            cui_text(ui, a->maclaw_token[0]
+                     ? "maclaw 官方服务已授权；请求将以该 maclaw 用户的额度计费。"
+                     : "尚未授权 maclaw：请先在「LLM 服务」中扫码登录。",
+                     .size = 11,
+                     .color = a->maclaw_token[0] ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
+        } else if (a->ai_backend >= 5) {
+            const np_llm_provider *p = &a->llm_prov[a->ai_backend - 5];
+            char hint[640];
+            snprintf(hint, sizeof hint, "服务：%s    模型：%s",
+                     p->url[0] ? p->url : "（未填写服务地址）",
+                     p->model[0] ? p->model : "（未选择模型）");
+            cui_text(ui, hint, .size = 11,
+                     .color = (p->url[0] && p->model[0])
+                                  ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
+        } else if (a->ai_backend == 3) {
+            cui_textarea(ui, "ai-cmd", a->ai_cmd, sizeof a->ai_cmd,
+                         .label = "命令模板（{file}=上下文文件, {out}=结果文件）",
+                         .height = 56);
+        }
+        cui_input(ui, "ai-inst", a->ai_inst, sizeof a->ai_inst,
+                  .label = "指令", .placeholder = "告诉 AI 要做什么（任务切换时自动填入默认指令）",
+                  .width = CUI_FILL);
+
+        cui_row(ui, .width = CUI_FILL, .gap = 8) {
+            if (cui_button(ui, st == 1 ? "处理中…" : "Ask AI",
+                           .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = st == 1 ||
+                                       (a->ai_task == 6 && !a->ai_inst[0]))) {
+                np_ai_start(a);
+            }
+            if (cui_button(ui, "清空结果", .variant = CUI_BUTTON_GHOST,
+                           .disabled = st == 1)) {
+                a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                a->ai_show_diff = false;
+            }
+        }
+
+        /* Result area: takes the rest of the panel ----------------------- */
+        if (st == 1) {
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                cui_spinner(ui, 16);
+                cui_text(ui, "AI 正在处理，请稍候…", .size = 12,
+                         .color = CUI_COLOR_TEXT_MUTED);
+            }
+        } else if (st == 3) {
+            cui_text(ui, "AI 调用失败", .size = 13, .font = CUI_FONT_MEDIUM,
+                     .color = CUI_COLOR_DANGER);
+            cui_text(ui, a->ai_error[0] ? a->ai_error : "未知错误", .size = 12,
+                     .nowrap = false);
+        } else if (st == 2 && a->ai_result[0]) {
+            if (disp == NP_AI_DISP_DIFF) {
+                cui_text(ui, "逐处 Diff（原文 → AI 结果），确认后才写入",
+                         .size = 12, .font = CUI_FONT_MEDIUM);
+                cui_diff_result dr = cui_diff_view(ui, "ai-diff", a->ai_orig,
+                                                    a->ai_result, .height = -1,
+                                                    .context = 3, .language = "tex");
+                (void)dr;
+                if (cui_button(ui, "应用改写", .variant = CUI_BUTTON_PRIMARY)) {
+                    if (np_ai_apply(a)) {
+                        np_toast(a, "已应用", "AI 改写已写入文档", CUI_TONE_INFO);
+                        a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                    }
+                }
+            } else if (disp == NP_AI_DISP_INSERT) {
+                cui_text(ui, "续写结果（插入到光标处，不重复已有文本）",
+                         .size = 12, .font = CUI_FONT_MEDIUM);
+                cui_textarea(ui, "ai-answer", a->ai_result, sizeof a->ai_result,
+                             .height = -1, .read_only = true);
+                cui_row(ui, .width = CUI_FILL, .gap = 8) {
+                    if (cui_button(ui, "插入到光标处", .variant = CUI_BUTTON_PRIMARY)) {
+                        if (np_ai_apply(a)) {          /* empty range = insert */
+                            np_toast(a, "已插入", "AI 续写已写入光标处", CUI_TONE_INFO);
+                            a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                        }
+                    }
+                }
+            } else if (disp == NP_AI_DISP_TEMPLATE) {
+                cui_text(ui, "生成的模板", .size = 12, .font = CUI_FONT_MEDIUM);
+                cui_textarea(ui, "ai-answer", a->ai_result, sizeof a->ai_result,
+                             .height = -1, .read_only = true);
+                cui_row(ui, .width = CUI_FILL, .gap = 8) {
+                    if (cui_button(ui, "新建文档", .variant = CUI_BUTTON_PRIMARY)) {
+                        if (np_ai_new_doc_from_result(a)) {
+                            np_toast(a, "已创建", "模板已在新标签中打开", CUI_TONE_INFO);
+                            a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                        }
+                    }
+                    if (cui_button(ui, "插入到当前文档")) {
+                        if (np_ai_apply(a)) {
+                            np_toast(a, "已插入", "模板已写入光标处", CUI_TONE_INFO);
+                            a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                        }
+                    }
+                }
+            } else {
+                cui_text(ui, "AI 回复（不会改动正文）", .size = 12,
+                         .font = CUI_FONT_MEDIUM);
+                cui_textarea(ui, "ai-answer", a->ai_result, sizeof a->ai_result,
+                             .height = -1, .read_only = true);
+            }
+        } else {
+            cui_column(ui, .width = CUI_FILL, .gap = 6) {
+                cui_text(ui, "Ask AI 会根据任务自动取上下文：", .size = 12,
+                         .color = CUI_COLOR_TEXT_MUTED);
+                cui_text(ui, "· 润色 / 翻译 / 自定义 → 选区或全文，Diff 确认后写入", .size = 11,
+                         .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+                cui_text(ui, "· 补全续写 → 光标前后文，结果插入光标处", .size = 11,
+                         .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+                cui_text(ui, "· 生成模板 → 按指令生成完整文档，可新建标签或插入", .size = 11,
+                         .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+                cui_text(ui, "· 检查 / 解释 → 只回答，不改动正文", .size = 11,
+                         .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+            }
+        }
+    }
+}
+
 static void np_frame(cui_ctx *ui, void *user) {
     notepad *a = (notepad *)user;
     a->ui = ui;
@@ -6320,10 +6440,9 @@ static void np_frame(cui_ctx *ui, void *user) {
             a->dlg_math_preview = true;
             np_math_expr_from_caret(a);
         }
-        /* Controlled AI assistant (Ctrl+Alt+A). */
-        if (np_doc_is_latex(np_cur(a)) &&
-            cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_A)) {
-            a->dlg_ai = true;
+        /* Native AI panel (Ctrl+Alt+A): docked, persistent, not a dialog. */
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_A)) {
+            a->show_ai = !a->show_ai;
         }
 
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
@@ -6569,8 +6688,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                         a->dlg_tinytex = true;
                 }
                 cui_menu_separator(ui);
-                if (cui_menu_item(ui, "AI 助手…", .icon = CUI_ICON_SPARKLES))
-                    a->dlg_ai = true;
+                if (cui_menu_item(ui, "AI 助手", .icon = CUI_ICON_SPARKLES,
+                                  .checked = a->show_ai))
+                    a->show_ai = !a->show_ai;
                 if (cui_menu_item(ui, "maclaw 官方服务登录…", .icon = CUI_ICON_SPARKLES))
                     a->dlg_maclaw = true;
                 cui_menu_separator(ui);
@@ -6736,9 +6856,10 @@ static void np_frame(cui_ctx *ui, void *user) {
                         np_math_expr_from_caret(a);
                     }
                     cui_menu_separator(ui);
-                    if (cui_menu_item(ui, "AI 助手…", .icon = CUI_ICON_SPARKLES,
-                                      .shortcut = "Ctrl Alt A")) {
-                        a->dlg_ai = true;
+                    if (cui_menu_item(ui, "AI 助手", .icon = CUI_ICON_SPARKLES,
+                                      .shortcut = "Ctrl Alt A",
+                                      .checked = a->show_ai)) {
+                        a->show_ai = !a->show_ai;
                     }
                     if (cui_menu_item(ui, "maclaw 官方服务登录…", .icon = CUI_ICON_SPARKLES)) {
                         a->dlg_maclaw = true;
@@ -6927,9 +7048,26 @@ static void np_frame(cui_ctx *ui, void *user) {
         }   /* top chrome surface */
         }   /* !zen: menu bar + toolbar hidden in immersive edit mode */
 
-        /* Main workspace: directory pane | (tabs + editor + output pane).
-         * Both dividers are draggable; the ratios live in the app state. */
-        if (a->show_sidebar) {
+        /* Main workspace: directory pane | (tabs + editor + output pane),
+         * with the AI assistant docked on the far right when open (it sits
+         * outside the sidebar/preview splits so pane toggles never move it). */
+        if (a->show_ai) {
+            cui_split(ui, "np_ai_split", &a->ai_ratio,
+                      .min_first = 400, .min_second = 300) {
+                if (a->show_sidebar) {
+                    cui_split(ui, "np_main_split", &a->side_ratio,
+                              .min_first = 175, .min_second = 400) {
+                        np_sidebar(ui, a);
+                        cui_split_next(ui);
+                        d = np_workspace(ui, a, busy);
+                    }
+                } else {
+                    d = np_workspace(ui, a, busy);
+                }
+                cui_split_next(ui);
+                np_ai_panel(ui, a, d);
+            }
+        } else if (a->show_sidebar) {
             cui_split(ui, "np_main_split", &a->side_ratio,
                       .min_first = 175, .min_second = 400) {
                 np_sidebar(ui, a);
@@ -6958,18 +7096,20 @@ static void np_frame(cui_ctx *ui, void *user) {
                 char tabcnt[48];
                 snprintf(tabcnt, sizeof tabcnt, "· %d/%d 标签###tabs", a->active + 1, a->count);
                 cui_status_bar_text(ui, tabcnt, .tone = CUI_TONE_INFO);
-                char panes[80];
-                snprintf(panes, sizeof panes, "%s%s%s%s%s%s###panes",
+                char panes[96];
+                snprintf(panes, sizeof panes, "%s%s%s%s%s%s%s%s###panes",
                          a->show_sidebar ? "侧栏" : "",
                          (a->show_sidebar && (a->show_output || a->show_preview)) ? " · " : "",
                          a->show_output ? "输出" : "",
                          (a->show_preview && a->show_output) ? " · " : "",
                          a->show_preview ? "预览" : "",
+                         (a->show_ai && (a->show_sidebar || a->show_output || a->show_preview)) ? " · " : "",
+                         a->show_ai ? "AI" : "",
                          "");
-                if (!a->show_sidebar && !a->show_output && !a->show_preview)
+                if (!a->show_sidebar && !a->show_output && !a->show_preview && !a->show_ai)
                     snprintf(panes, sizeof panes, "单栏###panes");
-                if (cui_status_bar_item(ui, panes, .tooltip = "点击：切换侧栏；Ctrl+B 侧栏 / F7 输出 / Ctrl Shift P 预览"))
-                    a->show_sidebar = !a->show_sidebar;
+                if (cui_status_bar_item(ui, panes, .tooltip = "点击：切换侧栏；Ctrl+B 侧栏 / F7 输出 / Ctrl Shift P 预览 / Ctrl Alt A AI"))
+                    a->show_ai = !a->show_ai;
                 cui_status_bar_spacer(ui);
                 if (d->is_hex) {
                     char hx[96];
@@ -7114,6 +7254,7 @@ int main(int argc, char **argv) {
     np_tex_job_init(&g.tex_job);
     np_http_init(&g.web_server);
     g.side_ratio = 0.22f;
+    g.ai_ratio = 0.72f;
     g.out_ratio = 0.76f;
     g.side_tab = 0;
     g.out_tab = 1;           /* start on the message log */
