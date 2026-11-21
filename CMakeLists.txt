@@ -64,7 +64,7 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                src/np_net.c src/np_tinytex.c src/np_templates_online.c
                src/np_synctex.c src/np_bt.c src/np_bt_templates.c
                src/np_latex_table.c src/np_latex_tidy.c src/np_font_scan.c
-               src/np_ai.c src/np_qr.c src/np_maclaw.c
+               src/np_ai.c src/np_qr.c src/np_maclaw.c src/np_openai.c
                src/np_latex_html.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.

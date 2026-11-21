@@ -28,6 +28,16 @@ char *np_net_post_json(const char *url, const char *bearer, const char *body,
     return copy;
 }
 
+char *np_net_get_json(const char *url, const char *bearer,
+                      const np_net_opts *o, int *status_out) {
+    (void)o; (void)bearer;
+    snprintf(g_url, sizeof g_url, "%s", url ? url : "");
+    if (status_out) *status_out = g_status;
+    /* Test hook: hosts with "down" always fail their probe. */
+    if (url && strstr(url, "down")) return NULL;
+    return strdup("ok");
+}
+
 int main(void) {
     char out[2048];
 
@@ -66,6 +76,80 @@ int main(void) {
     CHECK(!strcmp(out, "https://hub.example.com"), "add https scheme");
     np_maclaw_normalize_hub("http://localhost:8080/", out, sizeof out);
     CHECK(!strcmp(out, "http://localhost:8080"), "preserve http + port");
+
+    /* HubCenter HA probing: first healthy entry wins. */
+    {
+        char picked[512] = {0}, perr[256] = {0};
+        CHECK(np_maclaw_pick_center("https://a.example.com, https://b.example.com",
+                                    picked, sizeof picked, perr, sizeof perr) &&
+              !strcmp(picked, "https://a.example.com"),
+              "pick center first healthy");
+        CHECK(strstr(g_url, "https://a.example.com/healthz") != NULL,
+              "probe hits healthz");
+        /* First node down -> falls through to the second. */
+        CHECK(np_maclaw_pick_center("https://down.example.com,https://b.example.com,https://c.example.com",
+                                    picked, sizeof picked, perr, sizeof perr) &&
+              !strcmp(picked, "https://b.example.com"),
+              "pick center skips down node");
+        CHECK(strstr(g_url, "https://b.example.com/healthz") != NULL,
+              "second node probed after failure");
+        /* All nodes down -> best-effort fallback to the first entry. */
+        CHECK(!np_maclaw_pick_center("https://down1.example.com,https://down2.example.com",
+                                     picked, sizeof picked, perr, sizeof perr) &&
+              !strcmp(picked, "https://down1.example.com"),
+              "pick center falls back to first");
+    }
+
+    /* Create session: posts to the HubCenter relay endpoint. */
+    np_maclaw_cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.center_url, sizeof cfg.center_url, "%s", "hubs.mypapers.top/");
+    np_maclaw_normalize_hub(cfg.center_url, cfg.center_url, sizeof cfg.center_url);
+    snprintf(cfg.client_id, sizeof cfg.client_id, "%s", "rapideditor-ai-assistant");
+    snprintf(cfg.client_name, sizeof cfg.client_name, "%s", "RapidEditor AI");
+    cfg.timeout_sec = 10;
+    np_maclaw_session sess;
+    memset(&sess, 0, sizeof sess);
+    g_status = 201;
+    g_response = "{\"status\":\"pending\",\"session_id\":\"tpr_s1\","
+                 "\"poll_token\":\"pt1\","
+                 "\"qr_payload\":\"{\\\"type\\\":\\\"maclaw_third_party_authorization\\\",\\\"session_id\\\":\\\"tpr_s1\\\",\\\"center_url\\\":\\\"https://hubs.mypapers.top\\\"}\","
+                 "\"expires_at\":\"2026-11-21T00:00:00Z\"}";
+    CHECK(np_maclaw_create_session(&cfg, &sess), "create relay session");
+    CHECK(strstr(g_url, "https://hubs.mypapers.top/api/third-party/sessions") != NULL,
+          "create posts to hubcenter relay endpoint");
+    CHECK(strstr(g_body, "\"client_id\":\"rapideditor-ai-assistant\"") != NULL,
+          "create body carries client_id");
+    CHECK(!strcmp(sess.session_id, "tpr_s1") && !strcmp(sess.poll_token, "pt1"),
+          "create parses session id and poll token");
+    CHECK(strstr(sess.qr_payload, "\"center_url\":\"https://hubs.mypapers.top\"") != NULL,
+          "qr payload carries center_url");
+    CHECK(strstr(sess.qr_payload, "hub_url") == NULL,
+          "qr payload must not carry a hub_url");
+
+    /* Poll: pending then authorized with the relayed hub_url. */
+    g_status = 200;
+    g_response = "{\"status\":\"pending\"}";
+    char tok[512] = {0}, hub[512] = {0}, email[256] = {0}, perr[256] = {0};
+    CHECK(np_maclaw_poll(&cfg, &sess, tok, sizeof tok, hub, sizeof hub,
+                         email, sizeof email, perr, sizeof perr) &&
+          !strcmp(np_maclaw_poll(&cfg, &sess, tok, sizeof tok, hub, sizeof hub,
+                                 email, sizeof email, perr, sizeof perr),
+                  "pending"),
+          "poll pending");
+    CHECK(strstr(g_url, "https://hubs.mypapers.top/api/third-party/sessions/token") != NULL,
+          "poll posts to hubcenter token endpoint");
+    CHECK(strstr(g_body, "\"poll_token\":\"pt1\"") != NULL, "poll sends poll_token");
+
+    g_response = "{\"status\":\"authorized\",\"access_token\":\"vtok_9\","
+                 "\"hub_url\":\"https://hub.maclaw.top\",\"email\":\"u@x.com\"}";
+    tok[0] = hub[0] = email[0] = 0;
+    const char *pst = np_maclaw_poll(&cfg, &sess, tok, sizeof tok, hub, sizeof hub,
+                                     email, sizeof email, perr, sizeof perr);
+    CHECK(pst && !strcmp(pst, "authorized"), "poll authorized");
+    CHECK(!strcmp(tok, "vtok_9"), "poll parses access_token");
+    CHECK(!strcmp(hub, "https://hub.maclaw.top"), "poll parses relayed hub_url");
+    CHECK(!strcmp(email, "u@x.com"), "poll parses email");
 
     /* Official LLM proxy: URL, bearer, request body and response content. */
     g_status = 200;

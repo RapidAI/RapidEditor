@@ -232,14 +232,22 @@ char *np_net_post_json(const char *url, const char *bearer, const char *body,
     return NULL;
 }
 
+char *np_net_get_json(const char *url, const char *bearer,
+                      const np_net_opts *o, int *status_out) {
+    (void)url; (void)bearer; (void)o;
+    if (status_out) *status_out = 0;
+    net_err(o, "Android 不支持此操作");
+    return NULL;
+}
+
 #elif defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <winhttp.h>
-static char *np_net_post_json_win(const char *url, const char *bearer,
-                                  const char *body, const np_net_opts *o,
-                                  int *status_out) {
+static char *np_net_request_win(const char *url, const char *bearer,
+                                const char *method, const char *body,
+                                const np_net_opts *o, int *status_out) {
     char *result = NULL;
     HINTERNET hs = NULL, hc = NULL, hr = NULL;
     if (status_out) *status_out = 0;
@@ -275,13 +283,15 @@ static char *np_net_post_json_win(const char *url, const char *bearer,
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 8192);
     hc = WinHttpConnect(hs, whost, port, 0);
     if (!hc) { net_err(o, "无法连接服务器"); goto done; }
-    hr = WinHttpOpenRequest(hc, L"POST", wpath, NULL, WINHTTP_NO_REFERER,
+    WCHAR wmethod[16];
+    MultiByteToWideChar(CP_UTF8, 0, method, -1, wmethod, 16);
+    hr = WinHttpOpenRequest(hc, wmethod, wpath, NULL, WINHTTP_NO_REFERER,
                             WINHTTP_DEFAULT_ACCEPT_TYPES,
                             secure ? WINHTTP_FLAG_SECURE : 0);
     if (!hr) { net_err(o, "无法创建请求"); goto done; }
 
-    WCHAR wheaders[4096];
-    {
+    if (body) {
+        WCHAR wheaders[4096];
         const char *base = "Content-Type: application/json\r\nAccept: application/json";
         MultiByteToWideChar(CP_UTF8, 0, base, -1, wheaders, 4096);
         WinHttpAddRequestHeaders(hr, wheaders, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
@@ -293,8 +303,10 @@ static char *np_net_post_json_win(const char *url, const char *bearer,
         WinHttpAddRequestHeaders(hr, wh, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
     }
 
+    DWORD body_len = body ? (DWORD)strlen(body) : 0;
     if (!WinHttpSendRequest(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                            (LPVOID)body, (DWORD)strlen(body), (DWORD)strlen(body), 0) ||
+                            body ? (LPVOID)body : WINHTTP_NO_REQUEST_DATA,
+                            body_len, body_len, 0) ||
         !WinHttpReceiveResponse(hr, NULL)) {
         net_err(o, "发送请求失败（检查网络/代理）"); goto done;
     }
@@ -336,7 +348,11 @@ done:
 }
 char *np_net_post_json(const char *url, const char *bearer, const char *body,
                        const np_net_opts *o, int *status_out) {
-    return np_net_post_json_win(url, bearer, body, o, status_out);
+    return np_net_request_win(url, bearer, "POST", body, o, status_out);
+}
+char *np_net_get_json(const char *url, const char *bearer,
+                      const np_net_opts *o, int *status_out) {
+    return np_net_request_win(url, bearer, "GET", NULL, o, status_out);
 }
 
 #else
@@ -344,6 +360,14 @@ char *np_net_post_json(const char *url, const char *bearer, const char *body,
                        const np_net_opts *o, int *status_out) {
     if (status_out) *status_out = 0;
     if (!url || !body) { net_err(o, "参数缺失"); return NULL; }
+    net_err(o, "POSIX 平台请使用 curl CLI 版本");
+    (void)bearer;
+    return NULL;
+}
+char *np_net_get_json(const char *url, const char *bearer,
+                      const np_net_opts *o, int *status_out) {
+    if (status_out) *status_out = 0;
+    if (!url) { net_err(o, "参数缺失"); return NULL; }
     net_err(o, "POSIX 平台请使用 curl CLI 版本");
     (void)bearer;
     return NULL;

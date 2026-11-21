@@ -7,20 +7,27 @@
 #include <string.h>
 
 void np_maclaw_normalize_hub(const char *in, char *out, size_t cap) {
+    char src[1024];
     if (!out || cap == 0) return;
+    /* Copy the input up front so in-place calls (in == out) are safe. */
+    if (in) {
+        size_t in_len = strlen(in);
+        if (in_len >= sizeof src) in_len = sizeof src - 1;
+        memcpy(src, in, in_len);
+        src[in_len] = 0;
+    } else {
+        src[0] = 0;
+    }
     out[0] = 0;
-    if (!in) return;
-    const char *p = in;
+    const char *p = src;
     while (*p && isspace((unsigned char)*p)) p++;
     size_t n = strlen(p);
     while (n > 0 && isspace((unsigned char)p[n - 1])) n--;
     while (n > 0 && p[n - 1] == '/') n--;
     if (n == 0 || n >= cap) return;
     if (!strncmp(p, "http://", 7) || !strncmp(p, "https://", 8)) {
-        if (n >= cap) return;
-        memcpy(out, p, n); out[n] = 0;
+        snprintf(out, cap, "%.*s", (int)n, p);
     } else {
-        if (n + 8 >= cap) return;
         snprintf(out, cap, "https://%.*s", (int)n, p);
     }
 }
@@ -109,8 +116,51 @@ static void json_escape(const char *s, char *out, size_t cap) {
     out[o] = 0;
 }
 
+bool np_maclaw_pick_center(const char *centers_csv, char *out, size_t cap,
+                           char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = 0;
+    if (out && cap) out[0] = 0;
+    if (!centers_csv || !centers_csv[0] || !out || cap == 0) {
+        if (err && err_cap) snprintf(err, err_cap, "未配置 hubcenter 地址");
+        return false;
+    }
+    char first[512] = {0};
+    const char *p = centers_csv;
+    while (*p) {
+        while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ',' && *p != ';') p++;
+        size_t n = (size_t)(p - start);
+        while (n > 0 && (start[n - 1] == ' ' || start[n - 1] == '\t')) n--;
+        if (n == 0 || n >= sizeof first) continue;
+        char item[512], norm[512];
+        memcpy(item, start, n); item[n] = 0;
+        np_maclaw_normalize_hub(item, norm, sizeof norm);
+        if (!norm[0]) continue;
+        if (!first[0]) snprintf(first, sizeof first, "%s", norm);
+        /* Cheap reachability probe: the center's health endpoint. */
+        char url[1024];
+        snprintf(url, sizeof url, "%s/healthz", norm);
+        np_net_opts opts;
+        memset(&opts, 0, sizeof opts);
+        if (err) { opts.err = err; opts.err_cap = err_cap; }
+        opts.timeout_sec = 5;
+        int status = 0;
+        char *resp = np_net_get_json(url, NULL, &opts, &status);
+        if (resp) {
+            free(resp);
+            snprintf(out, cap, "%s", norm);
+            return true;
+        }
+    }
+    /* All probes failed: fall back to the first entry and let the caller
+     * surface the real error from the create-session attempt. */
+    snprintf(out, cap, "%s", first);
+    return false;
+}
+
 bool np_maclaw_create_session(const np_maclaw_cfg *cfg, np_maclaw_session *s) {
-    if (!cfg || !s || !cfg->hub_url[0]) return false;
+    if (!cfg || !s || !cfg->center_url[0]) return false;
     s->err[0] = 0;
     char cid[256], cname[256];
     json_escape(cfg->client_id, cid, sizeof cid);
@@ -119,7 +169,7 @@ bool np_maclaw_create_session(const np_maclaw_cfg *cfg, np_maclaw_session *s) {
     snprintf(body, sizeof body,
              "{\"client_id\":\"%s\",\"name\":\"%s\"}", cid, cname);
     char url[1024];
-    snprintf(url, sizeof url, "%s/api/mobile/auth/third-party-qr-sessions", cfg->hub_url);
+    snprintf(url, sizeof url, "%s/api/third-party/sessions", cfg->center_url);
 
     np_net_opts opts;
     memset(&opts, 0, sizeof opts);
@@ -145,12 +195,14 @@ bool np_maclaw_create_session(const np_maclaw_cfg *cfg, np_maclaw_session *s) {
 
 const char *np_maclaw_poll(const np_maclaw_cfg *cfg, const np_maclaw_session *s,
                            char *token, size_t token_cap,
+                           char *hub_url, size_t hub_url_cap,
                            char *email, size_t email_cap,
                            char *err, size_t err_cap) {
     if (err && err_cap) err[0] = 0;
     if (token && token_cap) token[0] = 0;
+    if (hub_url && hub_url_cap) hub_url[0] = 0;
     if (email && email_cap) email[0] = 0;
-    if (!cfg || !s || !cfg->hub_url[0] || !s->session_id[0]) {
+    if (!cfg || !s || !cfg->center_url[0] || !s->session_id[0]) {
         if (err && err_cap) snprintf(err, err_cap, "参数缺失");
         return NULL;
     }
@@ -160,7 +212,7 @@ const char *np_maclaw_poll(const np_maclaw_cfg *cfg, const np_maclaw_session *s,
     char body[1024];
     snprintf(body, sizeof body, "{\"session_id\":\"%s\",\"poll_token\":\"%s\"}", sid, pt);
     char url[1024];
-    snprintf(url, sizeof url, "%s/api/mobile/auth/third-party-qr-sessions/token", cfg->hub_url);
+    snprintf(url, sizeof url, "%s/api/third-party/sessions/token", cfg->center_url);
 
     np_net_opts opts;
     memset(&opts, 0, sizeof opts);
@@ -176,6 +228,8 @@ const char *np_maclaw_poll(const np_maclaw_cfg *cfg, const np_maclaw_session *s,
     if (!strcmp(st, "authorized")) {
         if (token && token_cap)
             np_json_get_string(resp, "access_token", token, token_cap);
+        if (hub_url && hub_url_cap)
+            np_json_get_string(resp, "hub_url", hub_url, hub_url_cap);
         if (email && email_cap)
             np_json_get_string(resp, "email", email, email_cap);
         free(resp);

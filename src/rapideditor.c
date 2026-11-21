@@ -36,6 +36,7 @@
 #include "np_ai.h"
 #include "np_qr.h"
 #include "np_maclaw.h"
+#include "np_openai.h"
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -413,7 +414,9 @@ typedef struct notepad {
 
     /* maclaw official-service login (scan QR with phone) --------------- */
     bool dlg_maclaw;
-    char maclaw_hub[512];               /* Hub base URL (persisted) */
+    char maclaw_center[512];            /* active HubCenter base URL */
+    char maclaw_centers[1024];          /* HA candidates, CSV (persisted) */
+    char maclaw_hub[512];               /* Hub base URL, resolved at login (persisted, hidden) */
     char maclaw_token[512];             /* viewer_token (persisted) */
     char maclaw_email[256];
     char maclaw_err[256];
@@ -423,6 +426,15 @@ typedef struct notepad {
     volatile long maclaw_done;          /* 0 idle 1 creating 2 polling 3 ok 4 error */
     int  maclaw_polls;
     int  maclaw_last_state;
+
+    /* Custom OpenAI-compatible LLM providers (user-managed) ------------ */
+    np_llm_provider llm_prov[8];
+    int  llm_prov_count;
+    bool dlg_llm_prov;
+    int  llm_prov_edit;                 /* index being edited, -1 = adding */
+    char llm_prov_err[256];
+    volatile long llm_models_done;      /* 0 idle 1 fetching 2 ok 3 fail */
+    int  llm_models_prov;               /* provider the fetch targets */
 
     /* EditPlus-style find in files ------------------------------------ */
     bool dlg_find_files;
@@ -532,13 +544,15 @@ static void np_ai_start(notepad *a);
 static void np_maclaw_login_start(notepad *a);
 static void np_maclaw_qr_paint(cui_ctx *ui, cui_rect r, void *user);
 static bool np_ai_apply(notepad *a);
+static void np_llm_models_start(notepad *a, int prov_idx);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
            a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
-           a->dlg_math_preview || a->dlg_ai || a->dlg_maclaw;
+           a->dlg_math_preview || a->dlg_ai || a->dlg_maclaw ||
+           a->dlg_llm_prov;
 }
 
 /* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
@@ -2498,7 +2512,13 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
 
         const char *ctxs[] = { "当前选区", "整个文件" };
         const char *tasks[] = { "润色改写", "翻译", "检查错误", "解释说明", "自定义指令" };
-        const char *backs[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "maclaw 官方服务" };
+        const char *backs_static[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "maclaw 官方服务" };
+        const char *backs[5 + 8];
+        int back_count = 0;
+        for (int i = 0; i < 5; i++) backs[back_count++] = backs_static[i];
+        for (int i = 0; i < a->llm_prov_count && back_count < (int)(sizeof backs / sizeof backs[0]); i++)
+            backs[back_count++] = a->llm_prov[i].name;
+        if (a->ai_backend >= back_count) a->ai_backend = 0;
         cui_row(ui, .width = CUI_FILL, .gap = 10) {
             if (cui_select(ui, "ai-ctx", ctxs, 2, &a->ai_ctx, .label = "上下文", .width = 160)) { /* changed */ }
             if (cui_select(ui, "ai-task", tasks, 5, &a->ai_task, .label = "任务", .width = 160)) {
@@ -2512,7 +2532,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 }
                 if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
             }
-            if (cui_select(ui, "ai-back", backs, 5, &a->ai_backend, .label = "后端", .width = 160)) {
+            if (cui_select(ui, "ai-back", backs, back_count, &a->ai_backend, .label = "后端", .width = 170)) {
                 a->ai_cmd[0] = 0;   /* regenerate default template on next ask */
             }
         }
@@ -2521,9 +2541,18 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         if (a->ai_backend == 4) {
             cui_text(ui, a->maclaw_token[0]
                      ? "maclaw 官方服务已授权；请求将以该 maclaw 用户的额度计费。"
-                     : "尚未授权 maclaw：请先扫码登录，再使用此后端。",
+                     : "尚未授权 maclaw：请先在「LLM 服务」中扫码登录，再使用此后端。",
                      .size = 12,
                      .color = a->maclaw_token[0] ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
+        } else if (a->ai_backend >= 5) {
+            const np_llm_provider *p = &a->llm_prov[a->ai_backend - 5];
+            char hint[640];
+            snprintf(hint, sizeof hint, "服务：%s    模型：%s",
+                     p->url[0] ? p->url : "（未填写服务地址）",
+                     p->model[0] ? p->model : "（未选择模型）");
+            cui_text(ui, hint, .size = 12,
+                     .color = (p->url[0] && p->model[0])
+                                  ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
         } else {
             cui_textarea(ui, "ai-cmd", a->ai_cmd, sizeof a->ai_cmd,
                          .label = "命令模板（{file}=上下文文件, {out}=结果文件；可改为任意本机 agent 命令）",
@@ -2535,7 +2564,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                            .disabled = st == 1 || !a->ai_inst[0])) {
                 np_ai_start(a);
             }
-            if (cui_button(ui, "maclaw 登录…", .variant = CUI_BUTTON_GHOST)) a->dlg_maclaw = true;
+            if (cui_button(ui, "LLM 服务…", .variant = CUI_BUTTON_GHOST)) a->dlg_llm_prov = true;
             if (cui_button(ui, "清空结果", .variant = CUI_BUTTON_GHOST, .disabled = st == 1)) {
                 a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0; a->ai_show_diff = false;
             }
@@ -2547,7 +2576,10 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             cui_text(ui, "AI 调用失败", .size = 13, .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_DANGER);
             cui_text(ui, a->ai_error[0] ? a->ai_error : "未知错误", .size = 12);
             if (a->ai_backend == 4) {
-                cui_text(ui, "提示：请确认 maclaw 账号仍有可用额度，且 Hub 地址与扫码登录时一致。",
+                cui_text(ui, "提示：请确认 maclaw 账号仍有可用额度；服务地址由扫码授权自动获取。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            } else if (a->ai_backend >= 5) {
+                cui_text(ui, "提示：请检查服务地址、API Key 与模型是否正确，以及账户余额。",
                          .size = 11, .color = CUI_COLOR_TEXT_MUTED);
             } else {
                 cui_text(ui, "提示：请在命令模板中填入本机已安装的 agent 命令，或确认其已加入 PATH。",
@@ -2587,26 +2619,24 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
-    /* maclaw official-service login: generate a device-authorization QR and
-     * receive a viewer_token tied to the authorizing maclaw account. */
+    /* maclaw official-service login: the QR is generated automatically when
+     * the dialog opens — no button click needed. */
     cui_dialog(ui, "maclaw 官方服务", &a->dlg_maclaw,
                .description = "扫码后使用关联 maclaw 用户的官方 LLM 服务；token 会保存在本机配置中",
                .width = 520) {
+        if (a->maclaw_done == 0) np_maclaw_login_start(a); /* auto-generate */
         long st = a->maclaw_done;
         if (st != a->maclaw_last_state) {
             a->maclaw_last_state = (int)st;
             cui_request_redraw(ui);
         }
         if (st == 1 || st == 2) cui_request_redraw(ui); /* animate spinner / poll count */
-        cui_input(ui, "maclaw-hub", a->maclaw_hub, sizeof a->maclaw_hub,
-                  .label = "Hub 地址", .placeholder = "例如 https://hub.maclaw.top",
-                  .width = CUI_FILL);
-        cui_text(ui, "在手机 MaClawBot 中打开「设置 → 授权电脑端」扫码；授权不会切换手机端账号。",
+        cui_text(ui, "在手机 MaClawBot 中打开「我的 → 右上角扫码」授权；服务地址由 maclaw hubcenter 自动路由，无需填写。",
                  .size = 11, .color = CUI_COLOR_TEXT_MUTED);
 
         if (st == 1) {
             cui_spinner(ui, 22);
-            cui_text(ui, "正在创建授权会话…", .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_text(ui, "正在生成授权二维码…", .size = 12, .color = CUI_COLOR_TEXT_MUTED);
             cui_dialog_footer(ui) {
                 if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY)) a->dlg_maclaw = false;
             }
@@ -2640,18 +2670,142 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         } else {
             if (st == 4 && a->maclaw_err[0]) {
                 cui_text(ui, a->maclaw_err, .size = 12, .color = CUI_COLOR_DANGER);
-            } else {
-                cui_text(ui, "点击下方按钮生成二维码，然后用手机 MaClawBot 扫码授权。",
-                         .size = 12, .color = CUI_COLOR_TEXT_MUTED);
             }
             cui_dialog_footer(ui) {
-                if (cui_button(ui, "取消")) a->dlg_maclaw = false;
-                if (cui_button(ui, st == 4 ? "重新生成二维码" : "生成二维码",
-                               .variant = CUI_BUTTON_PRIMARY,
-                               .disabled = !a->maclaw_hub[0])) {
+                if (cui_button(ui, "关闭")) a->dlg_maclaw = false;
+                if (cui_button(ui, "重新生成二维码", .variant = CUI_BUTTON_PRIMARY)) {
                     np_maclaw_login_start(a);
                 }
             }
+        }
+    }
+
+    /* LLM 服务管理: maclaw official service + user-configured
+     * OpenAI-compatible providers; the AI dialog's backend select switches
+     * between them. */
+    cui_dialog(ui, "LLM 服务", &a->dlg_llm_prov,
+               .description = "管理 maclaw 官方服务与自定义 LLM 服务商；在 AI 助手的「后端」下拉中切换",
+               .width = 660) {
+        /* --- maclaw official service --- */
+        cui_text(ui, "maclaw 官方服务", .size = 13, .font = CUI_FONT_MEDIUM);
+        if (a->maclaw_token[0]) {
+            char who[400];
+            snprintf(who, sizeof who, "已授权：%s",
+                     a->maclaw_email[0] ? a->maclaw_email : "（未知账号）");
+            cui_text(ui, who, .size = 12, .color = CUI_COLOR_SUCCESS);
+            if (cui_button(ui, "重新扫码授权", .variant = CUI_BUTTON_GHOST)) {
+                a->maclaw_done = 0;
+                a->maclaw_qr_ready = false;
+                a->dlg_maclaw = true;
+            }
+        } else {
+            cui_text(ui, "未授权。扫码后可使用官方 LLM，按 maclaw 用户额度计费。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            if (cui_button(ui, "扫码授权…", .variant = CUI_BUTTON_PRIMARY)) {
+                a->maclaw_done = 0;
+                a->maclaw_qr_ready = false;
+                a->dlg_maclaw = true;
+            }
+        }
+        cui_separator(ui);
+
+        /* --- custom OpenAI-compatible providers --- */
+        cui_text(ui, "自定义 LLM 服务商（OpenAI 兼容）", .size = 13, .font = CUI_FONT_MEDIUM);
+        for (int i = 0; i < a->llm_prov_count; i++) {
+            const np_llm_provider *p = &a->llm_prov[i];
+            char line[640];
+            snprintf(line, sizeof line, "%s — %s · %s",
+                     p->name[0] ? p->name : "（未命名）",
+                     p->url[0] ? p->url : "（未填写地址）",
+                     p->model[0] ? p->model : "未选模型");
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                cui_text(ui, line, .size = 12);
+                if (cui_button(ui, "编辑")) a->llm_prov_edit = i;
+                if (cui_button(ui, "删除")) {
+                    for (int j = i; j < a->llm_prov_count - 1; j++)
+                        a->llm_prov[j] = a->llm_prov[j + 1];
+                    a->llm_prov_count--;
+                    memset(&a->llm_prov[a->llm_prov_count], 0, sizeof(np_llm_provider));
+                    if (a->llm_prov_edit == i) a->llm_prov_edit = -1;
+                }
+            }
+        }
+        if (a->llm_prov_count == 0 && a->llm_prov_edit < 0)
+            cui_text(ui, "还没有自定义服务商。填写服务地址与 API Key 即可使用。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        if (a->llm_prov_count < 8 && a->llm_prov_edit < 0) {
+            if (cui_button(ui, "添加服务商")) {
+                int idx = a->llm_prov_count;
+                memset(&a->llm_prov[idx], 0, sizeof(np_llm_provider));
+                a->llm_prov_edit = idx;
+            }
+        }
+
+        /* --- add / edit form --- */
+        if (a->llm_prov_edit >= 0 && a->llm_prov_edit < 8) {
+            int idx = a->llm_prov_edit;
+            np_llm_provider *p = &a->llm_prov[idx];
+            bool is_new = (idx == a->llm_prov_count);
+            cui_text(ui, is_new ? "添加服务商" : "编辑服务商",
+                     .size = 12, .font = CUI_FONT_MEDIUM);
+            cui_input(ui, "llm-pname", p->name, sizeof p->name,
+                      .label = "名称", .placeholder = "例如 DeepSeek", .width = CUI_FILL);
+            cui_input(ui, "llm-purl", p->url, sizeof p->url,
+                      .label = "服务地址", .placeholder = "例如 https://api.deepseek.com",
+                      .width = CUI_FILL);
+            cui_input(ui, "llm-pkey", p->api_key, sizeof p->api_key,
+                      .label = "API Key", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 8) {
+                cui_input(ui, "llm-pmodel", p->model, sizeof p->model,
+                          .label = "模型", .placeholder = "例如 deepseek-chat",
+                          .width = CUI_FILL);
+                if (cui_button(ui, a->llm_models_done == 1 ? "获取中…" : "获取模型列表",
+                               .disabled = a->llm_models_done == 1 || !p->url[0])) {
+                    np_llm_models_start(a, idx);
+                }
+            }
+            if (a->llm_models_done == 1) {
+                cui_spinner(ui, 16);
+            } else if (a->llm_models_done == 3 && a->llm_prov_err[0]) {
+                cui_text(ui, a->llm_prov_err, .size = 11, .color = CUI_COLOR_DANGER);
+            }
+            if (p->models[0]) {
+                char buf[NP_LLM_PROV_MODELS_CAP];
+                const char *mopts[32];
+                int mcount = 0;
+                snprintf(buf, sizeof buf, "%s", p->models);
+                char *q = buf;
+                while (*q && mcount < 32) {
+                    mopts[mcount++] = q;
+                    char *comma = strchr(q, ',');
+                    if (!comma) break;
+                    *comma = 0;
+                    q = comma + 1;
+                }
+                int msel = 0;
+                for (int k = 0; k < mcount; k++)
+                    if (!strcmp(mopts[k], p->model)) msel = k;
+                if (mcount > 0 &&
+                    cui_select(ui, "llm-model-pick", mopts, mcount, &msel,
+                               .label = "从模型列表选择", .width = CUI_FILL) &&
+                    msel >= 0 && msel < mcount) {
+                    snprintf(p->model, sizeof p->model, "%s", mopts[msel]);
+                }
+            }
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "取消")) a->llm_prov_edit = -1;
+                if (cui_button(ui, "保存", .variant = CUI_BUTTON_PRIMARY,
+                               .disabled = !p->url[0] || !p->model[0])) {
+                    if (!p->name[0])
+                        snprintf(p->name, sizeof p->name, "服务商 %d", idx + 1);
+                    if (is_new) a->llm_prov_count++;
+                    a->llm_prov_edit = -1;
+                    a->llm_models_done = 0;
+                }
+            }
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY)) a->dlg_llm_prov = false;
         }
     }
 
@@ -3541,7 +3695,7 @@ static void np_maclaw_login_worker(void *arg) {
     notepad *a = (notepad *)arg;
     np_maclaw_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
-    snprintf(cfg.hub_url, sizeof cfg.hub_url, "%s", a->maclaw_hub);
+    snprintf(cfg.center_url, sizeof cfg.center_url, "%s", a->maclaw_center);
     snprintf(cfg.client_name, sizeof cfg.client_name, "RapidEditor AI 助手");
     snprintf(cfg.client_id, sizeof cfg.client_id, "rapideditor-ai-assistant");
     cfg.timeout_sec = 20;
@@ -3568,14 +3722,20 @@ static void np_maclaw_login_worker(void *arg) {
 #else
         usleep(2000000);
 #endif
-        char tok[512] = {0}, email[256] = {0}, err[256] = {0};
+        char tok[512] = {0}, email[256] = {0}, hub[512] = {0}, err[256] = {0};
         const char *st = np_maclaw_poll(&cfg, &a->maclaw_sess,
-                                        tok, sizeof tok, email, sizeof email,
+                                        tok, sizeof tok, hub, sizeof hub,
+                                        email, sizeof email,
                                         err, sizeof err);
         a->maclaw_polls = i + 1;
         if (st && !strcmp(st, "authorized") && tok[0]) {
             snprintf(a->maclaw_token, sizeof a->maclaw_token, "%s", tok);
             snprintf(a->maclaw_email, sizeof a->maclaw_email, "%s", email);
+            /* The relay resolved which Hub the account lives on; keep it for
+             * the official LLM endpoint. The user never has to enter it. */
+            if (hub[0]) {
+                np_maclaw_normalize_hub(hub, a->maclaw_hub, sizeof a->maclaw_hub);
+            }
             a->maclaw_done = 3; /* ok */
             goto done;
         }
@@ -3604,8 +3764,13 @@ done:
 }
 
 static void np_maclaw_login_start(notepad *a) {
-    np_maclaw_normalize_hub(a->maclaw_hub, a->maclaw_hub, sizeof a->maclaw_hub);
-    if (!a->maclaw_hub[0]) return;
+    /* HA: probe the candidate HubCenters, use the first healthy one. */
+    char picked[512], perr[256] = {0};
+    np_maclaw_pick_center(a->maclaw_centers, picked, sizeof picked,
+                          perr, sizeof perr);
+    snprintf(a->maclaw_center, sizeof a->maclaw_center, "%s", picked);
+    np_maclaw_normalize_hub(a->maclaw_center, a->maclaw_center, sizeof a->maclaw_center);
+    if (!a->maclaw_center[0]) return;
     a->maclaw_token[0] = 0; a->maclaw_email[0] = 0; a->maclaw_err[0] = 0;
     a->maclaw_qr_ready = false; a->maclaw_polls = 0;
     memset(&a->maclaw_sess, 0, sizeof a->maclaw_sess);
@@ -3644,6 +3809,73 @@ static bool np_ai_has_tool(const char *name) {
     return false;
 }
 
+/* Custom OpenAI-compatible provider chat worker: used when the AI backend
+ * selects one of the user-configured providers (ai_backend >= 5). */
+static void np_ai_openai_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    int idx = a->ai_backend - 5;
+    if (idx < 0 || idx >= a->llm_prov_count) {
+        snprintf(a->ai_error, sizeof a->ai_error, "LLM 服务商不存在");
+        a->ai_done = 3;
+        goto done;
+    }
+    const np_llm_provider *p = &a->llm_prov[idx];
+    const char *inst = a->ai_inst[0] ? a->ai_inst : "请处理以下内容";
+    size_t prompt_cap = strlen(inst) + strlen(a->ai_orig) + 128;
+    char *prompt = (char *)malloc(prompt_cap);
+    if (!prompt) {
+        snprintf(a->ai_error, sizeof a->ai_error, "内存不足");
+        a->ai_done = 3;
+        goto done;
+    }
+    snprintf(prompt, prompt_cap, "%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
+             inst, a->ai_orig);
+    bool ok = np_openai_chat(p->url, p->api_key, p->model, prompt,
+                             a->ai_result, sizeof a->ai_result,
+                             a->ai_error, sizeof a->ai_error);
+    free(prompt);
+    a->ai_done = ok ? 2 : 3;
+done:
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+/* Fetch the model list for one user-configured provider in the background
+ * and cache the comma-separated ids on the provider entry. */
+static void np_llm_models_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    int idx = a->llm_models_prov;
+    char csv[NP_LLM_PROV_MODELS_CAP] = {0}, err[256] = {0};
+    int n = -1;
+    /* idx == count is the "being added right now" entry; the slot exists. */
+    if (idx >= 0 && idx < 8) {
+        n = np_openai_list_models(a->llm_prov[idx].url, a->llm_prov[idx].api_key,
+                                  csv, sizeof csv, err, sizeof err);
+    }
+    if (n > 0 && idx >= 0 && idx < 8)
+        snprintf(a->llm_prov[idx].models, sizeof a->llm_prov[idx].models, "%s", csv);
+    if (n < 0 && err[0])
+        snprintf(a->llm_prov_err, sizeof a->llm_prov_err, "%s", err);
+    a->llm_models_done = (n > 0) ? 2 : 3;
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+static void np_llm_models_start(notepad *a, int prov_idx) {
+    if (a->llm_models_done == 1) return;
+    if (prov_idx < 0 || prov_idx >= 8) return;
+    a->llm_models_prov = prov_idx;
+    a->llm_prov_err[0] = 0;
+    a->llm_models_done = 1;
+    NP_BEGIN_THREAD(np_llm_models_worker, a);
+}
+
 /* Prepare and launch an AI request from the dialog state. */
 static void np_ai_start(notepad *a) {
     if (a->ai_done == 1) return;                 /* already running */
@@ -3668,7 +3900,7 @@ static void np_ai_start(notepad *a) {
     if (a->ai_backend == 4) {
         if (!a->maclaw_token[0]) {
             np_toast(a, "尚未登录 maclaw",
-                     "请先打开「maclaw 官方服务」用手机扫码授权", CUI_TONE_WARNING);
+                     "请先打开「LLM 服务」用手机扫码授权", CUI_TONE_WARNING);
             return;
         }
         a->ai_result[0] = 0; a->ai_error[0] = 0;
@@ -3677,9 +3909,28 @@ static void np_ai_start(notepad *a) {
         return;
     }
 
+    /* User-configured OpenAI-compatible providers (backend >= 5). */
+    if (a->ai_backend >= 5) {
+        int idx = a->ai_backend - 5;
+        if (idx >= a->llm_prov_count) {
+            np_toast(a, "服务商不存在", "请在「LLM 服务」中重新选择", CUI_TONE_WARNING);
+            return;
+        }
+        const np_llm_provider *p = &a->llm_prov[idx];
+        if (!p->url[0] || !p->model[0]) {
+            np_toast(a, "服务商未配置完整",
+                     "请在「LLM 服务」中填写服务地址并选择模型", CUI_TONE_WARNING);
+            return;
+        }
+        a->ai_result[0] = 0; a->ai_error[0] = 0;
+        a->ai_done = 1;
+        NP_BEGIN_THREAD(np_ai_openai_worker, a);
+        return;
+    }
+
     /* Pick a default command template when the field is empty or the backend
      * selection changed. Users can edit it freely in the dialog. */
-    if (!a->ai_cmd[0] || (a->ai_backend != 3 && a->ai_backend != 4)) {
+    if (!a->ai_cmd[0] || a->ai_backend < 3 || a->ai_backend > 4) {
         bool claude = np_ai_has_tool("claude");
         bool codex = np_ai_has_tool("codex");
         if (a->ai_backend == 1 || (a->ai_backend == 0 && claude))
@@ -4335,8 +4586,24 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "ai_inst")) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", val);
         else if (!strcmp(key, "ai_task")) { int v = atoi(val); if (v >= 0 && v <= 4) a->ai_task = v; }
         else if (!strcmp(key, "ai_ctx")) { int v = atoi(val); if (v >= 0 && v <= 1) a->ai_ctx = v; }
-        else if (!strcmp(key, "ai_backend")) { int v = atoi(val); if (v >= 0 && v <= 4) a->ai_backend = v; }
+        else if (!strcmp(key, "ai_backend")) { int v = atoi(val); if (v >= 0 && v <= 12) a->ai_backend = v; }
         else if (!strcmp(key, "ai_show_diff")) a->ai_show_diff = atoi(val) != 0;
+        else if (!strcmp(key, "maclaw_centers")) snprintf(a->maclaw_centers, sizeof a->maclaw_centers, "%s", val);
+        else if (!strcmp(key, "maclaw_center")) snprintf(a->maclaw_center, sizeof a->maclaw_center, "%s", val);
+        else if (!strncmp(key, "llm_p", 5) && strchr(key + 5, '_')) {
+            /* llm_p<N>_<field>=value lines hold the custom LLM providers. */
+            int idx = atoi(key + 5);
+            const char *field = strchr(key + 5, '_') + 1;
+            if (idx >= 0 && idx < 8) {
+                np_llm_provider *p = &a->llm_prov[idx];
+                if (!strcmp(field, "name")) snprintf(p->name, sizeof p->name, "%s", val);
+                else if (!strcmp(field, "url")) snprintf(p->url, sizeof p->url, "%s", val);
+                else if (!strcmp(field, "key")) snprintf(p->api_key, sizeof p->api_key, "%s", val);
+                else if (!strcmp(field, "model")) snprintf(p->model, sizeof p->model, "%s", val);
+                else if (!strcmp(field, "models")) snprintf(p->models, sizeof p->models, "%s", val);
+                if (idx + 1 > a->llm_prov_count) a->llm_prov_count = idx + 1;
+            }
+        }
         else if (!strcmp(key, "maclaw_hub")) snprintf(a->maclaw_hub, sizeof a->maclaw_hub, "%s", val);
         else if (!strcmp(key, "maclaw_token")) snprintf(a->maclaw_token, sizeof a->maclaw_token, "%s", val);
         else if (!strcmp(key, "maclaw_email")) snprintf(a->maclaw_email, sizeof a->maclaw_email, "%s", val);
@@ -4403,10 +4670,21 @@ static void np_config_save(notepad *a) {
             np_cfg_one_line(a->ai_cmd, cfgline1, sizeof cfgline1),
             np_cfg_one_line(a->ai_inst, cfgline2, sizeof cfgline2),
             a->ai_task, a->ai_ctx, a->ai_backend, a->ai_show_diff ? 1 : 0);
-    fprintf(f, "maclaw_hub=%s\nmaclaw_token=%s\nmaclaw_email=%s\n",
-            np_cfg_one_line(a->maclaw_hub, cfgline1, sizeof cfgline1),
-            np_cfg_one_line(a->maclaw_token, cfgline2, sizeof cfgline2),
-            np_cfg_one_line(a->maclaw_email, cfgline3, sizeof cfgline3));
+    fprintf(f, "maclaw_centers=%s\nmaclaw_center=%s\nmaclaw_hub=%s\nmaclaw_token=%s\nmaclaw_email=%s\n",
+            np_cfg_one_line(a->maclaw_centers, cfgline1, sizeof cfgline1),
+            np_cfg_one_line(a->maclaw_center, cfgline2, sizeof cfgline2),
+            np_cfg_one_line(a->maclaw_hub, cfgline3, sizeof cfgline3),
+            np_cfg_one_line(a->maclaw_token, cfgline1, sizeof cfgline1),
+            np_cfg_one_line(a->maclaw_email, cfgline2, sizeof cfgline2));
+    for (int i = 0; i < a->llm_prov_count && i < 8; i++) {
+        const np_llm_provider *p = &a->llm_prov[i];
+        fprintf(f, "llm_p%d_name=%s\nllm_p%d_url=%s\nllm_p%d_key=%s\nllm_p%d_model=%s\nllm_p%d_models=%s\n",
+                i, np_cfg_one_line(p->name, cfgline1, sizeof cfgline1),
+                i, np_cfg_one_line(p->url, cfgline2, sizeof cfgline2),
+                i, np_cfg_one_line(p->api_key, cfgline3, sizeof cfgline3),
+                i, np_cfg_one_line(p->model, cfgline1, sizeof cfgline1),
+                i, np_cfg_one_line(p->models, cfgline2, sizeof cfgline2));
+    }
     for (int i = 0; i < a->recent_count; i++)
         fprintf(f, "recent%d=%s\n", i, a->recent[i]);
     for (int i = 0; i < a->session_count; i++)
@@ -6780,7 +7058,11 @@ int main(int argc, char **argv) {
     g.session_restore = true;
     g.tidy_indent = true; g.tidy_join = true; g.tidy_trim = true;
     g.tidy_spaces = 4;
-    snprintf(g.maclaw_hub, sizeof g.maclaw_hub, "%s", "https://hub.maclaw.top");
+    /* maclaw HubCenter HA candidates — probe and use the first healthy one.
+     * The actual Hub is resolved by the relay at login and kept in maclaw_hub. */
+    snprintf(g.maclaw_centers, sizeof g.maclaw_centers, "%s",
+             "https://hubs.mypapers.top,https://hubs.maclaw.top,https://hubs2.maclaw.top");
+    g.llm_prov_edit = -1;
 #ifdef _WIN32
     g.default_crlf = true;
 #endif

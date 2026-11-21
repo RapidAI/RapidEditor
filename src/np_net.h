@@ -39,6 +39,11 @@ char *np_net_fetch(const char *url, const np_net_opts *opts);
 char *np_net_post_json(const char *url, const char *bearer, const char *json_body,
                        const np_net_opts *opts, int *status_out);
 
+/* GET with an optional Bearer token. Same response semantics as
+ * np_net_post_json: heap buffer (caller frees) or NULL on error / non-2xx. */
+char *np_net_get_json(const char *url, const char *bearer,
+                      const np_net_opts *opts, int *status_out);
+
 #ifdef __cplusplus
 }
 #endif
