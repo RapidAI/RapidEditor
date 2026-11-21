@@ -769,6 +769,13 @@ CUI_API void cui_popover_open(cui_ctx *ui, const char *id);
 CUI_API void cui_popover_close(cui_ctx *ui, const char *id);
 CUI_API void cui_popover_toggle(cui_ctx *ui, const char *id);
 CUI_API bool cui_popover_is_open(cui_ctx *ui, const char *id);
+/* True when any floating layer is currently open: modal dialog/sheet,
+ * dropdown/context menu, select/combobox, popover, date/color picker.
+ * Hosts embedding native child views should hide them while this is true,
+ * because a native child window is composited above the host's drawn area
+ * and would otherwise paint on top of these overlays. Tooltips/toasts are
+ * intentionally excluded (they are small and transient). */
+CUI_API bool cui_overlay_open(cui_ctx *ui);
 
 /* Dropdown menu: a button that opens a menu. Items return true when chosen. */
 typedef struct cui_menu_opts {

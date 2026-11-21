@@ -72,6 +72,17 @@ bool cui_popover_is_open(cui_ctx *ui, const char *id) {
     return p && p->open;
 }
 
+bool cui_overlay_open(cui_ctx *ui) {
+    if (!ui) return false;
+    /* Modal dialogs / sheets raise modal_layer while they are drawn this frame. */
+    if (ui->modal_layer) return true;
+    /* Menus, dropdowns, select/combobox, pickers and popovers all register
+     * as popups. Ignore ones that have finished their close animation. */
+    for (int i = 0; i < ui->popup_count; i++)
+        if (ui->popups[i].open) return true;
+    return false;
+}
+
 static void cui__panel_style(cui_ctx *ui, cui_node *n, float pad) {
     n->bg = CUI_C(ui, SURFACE_RAISED);
     n->border = 1;
