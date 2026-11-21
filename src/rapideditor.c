@@ -435,6 +435,10 @@ typedef struct notepad {
     char llm_prov_err[256];
     volatile long llm_models_done;      /* 0 idle 1 fetching 2 ok 3 fail */
     int  llm_models_prov;               /* provider the fetch targets */
+    volatile long llm_test_done;        /* 0 idle 1 testing 2 ok 3 fail */
+    int  llm_test_prov;                 /* provider the test targets */
+    char llm_test_result[192];          /* success summary: latency + reply */
+    char llm_test_err[256];
 
     /* EditPlus-style find in files ------------------------------------ */
     bool dlg_find_files;
@@ -545,6 +549,7 @@ static void np_maclaw_login_start(notepad *a);
 static void np_maclaw_qr_paint(cui_ctx *ui, cui_rect r, void *user);
 static bool np_ai_apply(notepad *a);
 static void np_llm_models_start(notepad *a, int prov_idx);
+static void np_llm_test_start(notepad *a, int prov_idx);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
@@ -2720,7 +2725,12 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                      p->model[0] ? p->model : "未选模型");
             cui_row(ui, .width = CUI_FILL, .gap = 6) {
                 cui_text(ui, line, .size = 12);
-                if (cui_button(ui, "编辑")) a->llm_prov_edit = i;
+                if (cui_button(ui, "编辑")) {
+                    a->llm_prov_edit = i;
+                    a->llm_test_done = 0;
+                    a->llm_test_result[0] = 0;
+                    a->llm_test_err[0] = 0;
+                }
                 if (cui_button(ui, "删除")) {
                     for (int j = i; j < a->llm_prov_count - 1; j++)
                         a->llm_prov[j] = a->llm_prov[j + 1];
@@ -2738,6 +2748,10 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 int idx = a->llm_prov_count;
                 memset(&a->llm_prov[idx], 0, sizeof(np_llm_provider));
                 a->llm_prov_edit = idx;
+                a->llm_models_done = 0;
+                a->llm_test_done = 0;
+                a->llm_test_result[0] = 0;
+                a->llm_test_err[0] = 0;
             }
         }
 
@@ -2755,9 +2769,9 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                       .width = CUI_FILL);
             cui_input(ui, "llm-pkey", p->api_key, sizeof p->api_key,
                       .label = "API Key", .width = CUI_FILL);
-            cui_row(ui, .width = CUI_FILL, .gap = 8) {
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
                 cui_input(ui, "llm-pmodel", p->model, sizeof p->model,
-                          .label = "模型", .placeholder = "例如 deepseek-chat",
+                          .label = "模型", .placeholder = "例如 deepseek-chat（可手动输入，或在下方点选）",
                           .width = CUI_FILL);
                 if (cui_button(ui, a->llm_models_done == 1 ? "获取中…" : "获取模型列表",
                                .disabled = a->llm_models_done == 1 || !p->url[0])) {
@@ -2769,29 +2783,35 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             } else if (a->llm_models_done == 3 && a->llm_prov_err[0]) {
                 cui_text(ui, a->llm_prov_err, .size = 11, .color = CUI_COLOR_DANGER);
             }
-            if (p->models[0]) {
+            if (p->models[0] && a->llm_models_done != 1) {
                 char buf[NP_LLM_PROV_MODELS_CAP];
-                const char *mopts[32];
-                int mcount = 0;
                 snprintf(buf, sizeof buf, "%s", p->models);
-                char *q = buf;
-                while (*q && mcount < 32) {
-                    mopts[mcount++] = q;
-                    char *comma = strchr(q, ',');
-                    if (!comma) break;
-                    *comma = 0;
-                    q = comma + 1;
-                }
-                int msel = 0;
-                for (int k = 0; k < mcount; k++)
-                    if (!strcmp(mopts[k], p->model)) msel = k;
-                if (mcount > 0 &&
-                    cui_select(ui, "llm-model-pick", mopts, mcount, &msel,
-                               .label = "从模型列表选择", .width = CUI_FILL) &&
-                    msel >= 0 && msel < mcount) {
-                    snprintf(p->model, sizeof p->model, "%s", mopts[msel]);
+                int mtotal = 0;
+                for (char *t = strtok(buf, ","); t && *t; t = strtok(NULL, ",")) mtotal++;
+                char cap[64];
+                snprintf(cap, sizeof cap, "共 %d 个模型，点击填入：", mtotal);
+                cui_text(ui, cap, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+                snprintf(buf, sizeof buf, "%s", p->models);
+                cui_row(ui, .width = CUI_FILL, .gap = 6, .wrap = true) {
+                    int shown = 0;
+                    for (char *tok = strtok(buf, ","); tok && *tok && shown < 24;
+                         tok = strtok(NULL, ",")) {
+                        if (cui_button(ui, tok, .size = CUI_SIZE_SM))
+                            snprintf(p->model, sizeof p->model, "%s", tok);
+                        shown++;
+                    }
                 }
             }
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                if (cui_button(ui, a->llm_test_done == 1 ? "测试中…" : "测试连接",
+                               .disabled = a->llm_test_done == 1 || !p->url[0] || !p->model[0]))
+                    np_llm_test_start(a, idx);
+                if (a->llm_test_done == 1) cui_spinner(ui, 16);
+                if (a->llm_test_done == 2 && a->llm_test_result[0])
+                    cui_text(ui, a->llm_test_result, .size = 11, .color = CUI_COLOR_SUCCESS);
+            }
+            if (a->llm_test_done == 3 && a->llm_test_err[0])
+                cui_text(ui, a->llm_test_err, .size = 11, .color = CUI_COLOR_DANGER);
             cui_dialog_footer(ui) {
                 if (cui_button(ui, "取消")) a->llm_prov_edit = -1;
                 if (cui_button(ui, "保存", .variant = CUI_BUTTON_PRIMARY,
@@ -3874,6 +3894,50 @@ static void np_llm_models_start(notepad *a, int prov_idx) {
     a->llm_prov_err[0] = 0;
     a->llm_models_done = 1;
     NP_BEGIN_THREAD(np_llm_models_worker, a);
+}
+
+/* Send one short chat completion to the provider being edited, to verify
+ * url + key + model actually work before saving. */
+static void np_llm_test_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    int idx = a->llm_test_prov;
+    char reply[96] = {0}, err[256] = {0};
+    bool ok = false;
+    if (idx >= 0 && idx < 8) {
+        np_llm_provider *p = &a->llm_prov[idx];
+        if (p->url[0] && p->model[0]) {
+            clock_t t0 = clock();
+            ok = np_openai_chat(p->url, p->api_key, p->model,
+                                "请只回复两个字：正常",
+                                reply, sizeof reply, err, sizeof err);
+            double sec = (double)(clock() - t0) / CLOCKS_PER_SEC;
+            if (ok)
+                snprintf(a->llm_test_result, sizeof a->llm_test_result,
+                         "连接正常 · %.1fs · 回复：%.60s", sec, reply);
+            else if (!err[0])
+                snprintf(err, sizeof err, "请求失败");
+        } else {
+            snprintf(err, sizeof err, "请先填写服务地址与模型");
+        }
+    }
+    if (ok) a->llm_test_err[0] = 0;
+    else snprintf(a->llm_test_err, sizeof a->llm_test_err, "%s", err);
+    a->llm_test_done = ok ? 2 : 3;
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+static void np_llm_test_start(notepad *a, int prov_idx) {
+    if (a->llm_test_done == 1) return;
+    if (prov_idx < 0 || prov_idx >= 8) return;
+    a->llm_test_prov = prov_idx;
+    a->llm_test_result[0] = 0;
+    a->llm_test_err[0] = 0;
+    a->llm_test_done = 1;
+    NP_BEGIN_THREAD(np_llm_test_worker, a);
 }
 
 /* Prepare and launch an AI request from the dialog state. */
