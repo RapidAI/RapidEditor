@@ -68,7 +68,7 @@ VIAddVersionKey /LANG=2052 "FileVersion"     "${PRODUCT_VERSION}"
 !define MUI_ICON                    "${RE_ASSETS}\rapideditor.ico"
 !define MUI_UNICON                  "${RE_ASSETS}\rapideditor.ico"
 !define MUI_WELCOMEPAGE_TITLE       "欢迎安装 ${PRODUCT_NAME}"
-!define MUI_WELCOMEPAGE_TEXT        "本向导将引导你完成 ${PRODUCT_NAME} ${PRODUCT_VERSION} 的安装。$\r$\n$\r$\n它会根据本机架构自动安装匹配的版本，并添加「用 RapidEditor 打开」右键菜单。$\r$\n$\r$\n点击「下一步」继续。"
+!define MUI_WELCOMEPAGE_TEXT        "本向导将引导你完成 ${PRODUCT_NAME} ${PRODUCT_VERSION} 的安装。$\r$\n$\r$\n它会根据本机架构自动安装匹配的版本，创建开始菜单程序组和桌面图标，并添加「用 RapidEditor 打开」右键菜单。$\r$\n$\r$\n点击「下一步」继续。"
 !define MUI_LICENSEPAGE_TEXT_TOP    "请仔细阅读以下许可协议（MIT License）："
 !define MUI_COMPONENTSPAGE_TEXT_TOP "选择要安装的组件，然后点击「下一步」。"
 !define MUI_COMPONENTSPAGE_TEXT_COMPLIST "组件："
@@ -188,6 +188,11 @@ Function .onInit
     MessageBox MB_OK|MB_ICONSTOP "RapidEditor 需要 64 位 Windows（x64 或 ARM64）。"
     Abort
   ${EndIf}
+
+  ; Per-machine install (HKLM, admin): write shortcuts into the ALL USERS
+  ; desktop / start menu so every account sees them, and so the uninstaller
+  ; finds them even when run from a different account.
+  SetShellVarContext all
 FunctionEnd
 
 Section "RapidEditor 主程序 (必需)" SEC_MAIN
@@ -251,6 +256,17 @@ Section "RapidEditor 主程序 (必需)" SEC_MAIN
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" \
                    "URLInfoAbout"    "${PRODUCT_WEB_SITE}"
 
+  ; Start-menu program group. ALWAYS created with the main program:
+  ; CreateShortCut does NOT create intermediate directories, so the group
+  ; directory must be made explicitly or the .lnk writes fail silently.
+  CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" \
+                 "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
+  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\卸载 ${PRODUCT_NAME}.lnk" \
+                 "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
+  WriteINIStr "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} 主页.url" \
+              "InternetShortcut" "URL" "${PRODUCT_WEB_SITE}"
+
   ; Right-click: any file, the text-file class, and all common text/code types.
   !insertmacro ADD_CONTEXT_MENU "*"
   !insertmacro ADD_CONTEXT_MENU "txtfile"
@@ -268,25 +284,29 @@ Section "创建桌面快捷方式" SEC_DESKTOP
                  "" "$INSTDIR\${APP_EXE}" 0
 SectionEnd
 
-Section "创建开始菜单快捷方式" SEC_STARTMENU
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${APP_EXE}" \
-                 "" "$INSTDIR\${APP_EXE}" 0
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\卸载 ${PRODUCT_NAME}.lnk" \
-                 "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
-SectionEnd
-
 Section "Uninstall"
   SetRegView 64
+  SetShellVarContext all
+
   !insertmacro DEL_CONTEXT_MENU "*"
   !insertmacro DEL_CONTEXT_MENU "txtfile"
   StrCpy $RE_ExtOp "del"
   Call un.RE_TextExtAssoc
   DeleteRegKey HKCR "Applications\${APP_EXE}"
 
+  ; Remove shortcuts from both machine-wide and current-user folders, so a
+  ; leftover from an older per-user install is cleaned up too.
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\卸载 ${PRODUCT_NAME}.lnk"
-  RMDir  "$SMPROGRAMS\${PRODUCT_NAME}"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} 主页.url"
+  RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
+  SetShellVarContext current
+  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\卸载 ${PRODUCT_NAME}.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} 主页.url"
+  RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\WebView2Loader.dll"
