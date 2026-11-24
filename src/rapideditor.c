@@ -342,6 +342,7 @@ typedef struct notepad {
     char confirm_desc[NP_PATH_CAP + 128];
     char startup[NP_DOC_MAX][NP_PATH_CAP];
     int  startup_count;
+    int  startup_cur[NP_DOC_MAX];       /* session caret per startup path, -1 = none */
     char startup_bt[64];                /* --bt=<builtin> applied to opened hex docs */
     char recent[NP_RECENT_MAX][NP_PATH_CAP];
     int  recent_count;
@@ -532,6 +533,8 @@ typedef struct notepad {
     bool dlg_llm_prov;
     int  llm_prov_edit;                 /* index being edited, -1 = adding */
     int  llm_prov_gen;                  /* bumped whenever the list/form changes */
+    char llm_temp_buf[16];              /* temperature input buffer (form) */
+    char llm_tok_buf[16];               /* max_tokens input buffer (form) */
     bool secret_load_failed;            /* dpapi: value could not be decrypted */
     char llm_prov_err[256];
     volatile long llm_models_done;      /* 0 idle 1 fetching 2 ok 3 fail */
@@ -573,6 +576,8 @@ typedef struct notepad {
     char sem_paths[NP_FF_FILE_MAX][NP_PATH_CAP];
     int  sem_count;
     char sem_result[16384];             /* worker-owned: "id | source line" */
+    char sem_answer[16384];             /* QA mode: answer body without hit lines */
+    int  sem_mode;                      /* 0 locate files, 1 workspace Q&A */
     char sem_error[512];
     volatile long sem_done;             /* 0 idle 1 running 2 ok 3 fail */
     volatile bool sem_cancel;
@@ -610,6 +615,7 @@ typedef struct notepad {
     /* Persisted between runs (config file) ----------------------------- */
     char session[NP_SESSION_MAX][NP_PATH_CAP];
     int  session_count;
+    int  session_cur[NP_SESSION_MAX];   /* caret offset per session file */
     bool make_backup;               /* keep a .bak copy when saving */
     bool session_restore;           /* reopen last session at startup */
     bool dark_valid;                /* dark came from the config file */
@@ -985,7 +991,11 @@ static unsigned char *np_ansi_to_utf8(const unsigned char *src, size_t n, size_t
     return out;
 }
 
-static unsigned char *np_utf8_to_ansi(const char *src, size_t n, size_t *out_n) {
+/* lossy (optional) is set when some characters have no representation in
+ * the system ANSI code page and were replaced by the default ('?'). */
+static unsigned char *np_utf8_to_ansi(const char *src, size_t n, size_t *out_n,
+                                      bool *lossy) {
+    if (lossy) *lossy = false;
     int wl = MultiByteToWideChar(CP_UTF8, 0, src, (int)n, NULL, 0);
     if (wl <= 0) return NULL;
     wchar_t *w = (wchar_t *)malloc((size_t)(wl + 1) * sizeof(wchar_t));
@@ -994,7 +1004,10 @@ static unsigned char *np_utf8_to_ansi(const char *src, size_t n, size_t *out_n) 
     int al = WideCharToMultiByte(CP_ACP, 0, w, wl, NULL, 0, NULL, NULL);
     unsigned char *out = (unsigned char *)malloc((size_t)al + 1);
     if (out) {
-        WideCharToMultiByte(CP_ACP, 0, w, wl, (char *)out, al, NULL, NULL);
+        BOOL used_default = FALSE;
+        WideCharToMultiByte(CP_ACP, 0, w, wl, (char *)out, al, NULL,
+                            &used_default);
+        if (lossy) *lossy = used_default != FALSE;
         out[al] = 0;
         *out_n = (size_t)al;
     }
@@ -1124,6 +1137,9 @@ static bool np_load_into(notepad *a, np_doc *d, const char *path) {
             src = owned;
         }
         enc = ENC_UTF8_BOM;
+        np_toast(a, "编码已转换",
+                 "文件为 UTF-16，已转为 UTF-8（BOM）显示；保存时将写为 UTF-8",
+                 CUI_TONE_INFO);
     } else if (!np_utf8_valid(raw, len)) {
 #ifdef _WIN32
         size_t ul = 0;
@@ -1312,8 +1328,14 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
             size_t out_n = m;
 #ifdef _WIN32
             size_t an = 0;
-            converted = np_utf8_to_ansi((const char *)staged, m, &an);
+            bool lossy = false;
+            converted = np_utf8_to_ansi((const char *)staged, m, &an, &lossy);
             if (converted) { out = converted; out_n = an; }
+            if (lossy)
+                np_toast(a, "部分字符无法保存",
+                         "当前编码为 ANSI，超出系统代码页的字符（如 emoji）"
+                         "已被替换为 ?；建议「另存为」UTF-8",
+                         CUI_TONE_WARNING);
 #endif
             if (out_n && fwrite(out, 1, out_n, f) != out_n) ok = false;
             free(converted);
@@ -1584,6 +1606,11 @@ static int np_replace_all(notepad *a) {
     return count;
 }
 
+/* Programmatic replace: defined later, declared here so every insert /
+ * transform helper writes through the editor's undo history. */
+static void np_splice(notepad *a, np_doc *d, int s, int e,
+                      const char *ins, size_t n);
+
 static void np_insert_at_caret(notepad *a, const char *ins) {
     np_doc *d = np_cur(a);
     if (!d) return;
@@ -1596,10 +1623,7 @@ static void np_insert_at_caret(notepad *a, const char *ins) {
         np_toast(a, "文本已满", "已达到 256 MB 上限", CUI_TONE_WARNING);
         return;
     }
-    memmove(d->text + s0 + ilen, d->text + s1, (size_t)(len - s1) + 1);
-    memcpy(d->text + s0, ins, ilen);
-    np_text_changed(a, d);
-    cui_code_editor_select(a->ui, d->editor_id, s0 + (int)ilen, s0 + (int)ilen);
+    np_splice(a, d, s0, s1, ins, ilen);
 }
 
 /* LaTeX paragraph menu: wrap the current selection (or insert a template) with
@@ -1631,9 +1655,7 @@ static void np_latex_wrap(notepad *a, const char *fmt) {
     if (!np_ensure_cap(d, (size_t)(len - sel_len) + ilen + 1)) {
         np_toast(a, "文本已满", "已达到 256 MB 上限", CUI_TONE_WARNING); return;
     }
-    memmove(d->text + s0 + ilen, d->text + s1, (size_t)(len - s1) + 1);
-    memcpy(d->text + s0, buf, ilen);
-    np_text_changed(a, d);
+    np_splice(a, d, s0, s1, buf, ilen);
     int caret = s0 + (int)before_len + sel_len;
     cui_code_editor_select(a->ui, d->editor_id, caret, caret);
 }
@@ -1752,9 +1774,7 @@ static bool np_latex_ensure_package(notepad *a, np_doc *d, const char *pkg) {
     size_t ilen = strlen(ins);
     int len = d->len;
     if (!np_ensure_cap(d, (size_t)len + ilen + 1)) return false;
-    memmove(d->text + at + ilen, d->text + at, (size_t)(len - at) + 1);
-    memcpy(d->text + at, ins, ilen);
-    np_text_changed(a, d);
+    np_splice(a, d, at, at, ins, ilen);
     return true;
 }
 
@@ -1853,9 +1873,7 @@ static void np_latex_preamble_line(notepad *a, np_doc *d, const char *line) {
     size_t ilen = strlen(line);
     int len = d->len;
     if (!np_ensure_cap(d, (size_t)len + ilen + 2)) return;
-    memmove(d->text + at + (int)ilen, d->text + at, (size_t)(len - at) + 1);
-    memcpy(d->text + at, line, ilen);
-    np_text_changed(a, d);
+    np_splice(a, d, at, at, line, ilen);
 }
 
 /* Insert fontspec / xeCJK setup inferred from the font picker. */
@@ -1984,10 +2002,7 @@ static void np_md_set_heading(notepad *a, int level) {
     size_t ilen = (size_t)pn;
     int removed = i - ls;
     if (!np_ensure_cap(d, (size_t)(d->len - removed) + ilen + 1)) return;
-    memmove(d->text + ls + ilen, d->text + i, (size_t)(d->len - i) + 1);
-    memcpy(d->text + ls, pre, ilen);
-    d->len += (int)ilen - removed;
-    np_text_changed(a, d);
+    np_splice(a, d, ls, i, pre, ilen);
     int off = d->caret - i; if (off < 0) off = 0;
     int caret = ls + (int)ilen + off;
     caret = NP_MAX(ls, NP_MIN(caret, d->len));
@@ -2044,10 +2059,7 @@ static void np_md_indent(notepad *a, int dir) {
     out[o] = 0;
     size_t ilen = (size_t)o;
     if (!np_ensure_cap(d, (size_t)(d->len - n) + ilen + 1)) { free(out); return; }
-    memmove(d->text + ls + ilen, d->text + le, (size_t)(d->len - le) + 1);
-    memcpy(d->text + ls, out, ilen);
-    d->len += (int)ilen - n;
-    np_text_changed(a, d);
+    np_splice(a, d, ls, le, out, ilen);
     int caret = NP_MAX(ls, NP_MIN(ls + caret_new, d->len));
     cui_code_editor_select(a->ui, d->editor_id, caret, caret);
     free(out);
@@ -2062,24 +2074,18 @@ static void np_md_toggle_task(notepad *a) {
     int ls = np_line_start(d, p), le = np_line_end(d, p);
     for (int i = ls; i + 2 < le; i++) {
         if (d->text[i] == '[' && d->text[i + 1] == ' ' && d->text[i + 2] == ']') {
-            d->text[i + 1] = 'x'; np_text_changed(a, d); return;
+            np_splice(a, d, i + 1, i + 2, "x", 1); return;
         }
         if (d->text[i] == '[' && (d->text[i + 1] == 'x' || d->text[i + 1] == 'X') &&
             d->text[i + 2] == ']') {
-            d->text[i + 1] = ' '; np_text_changed(a, d); return;
+            np_splice(a, d, i + 1, i + 2, " ", 1); return;
         }
     }
     int i = ls;
     while (i < le && d->text[i] == ' ') i++;
     if (i < le && (d->text[i] == '-' || d->text[i] == '*' || d->text[i] == '+') &&
         i + 1 < le && d->text[i + 1] == ' ') {
-        int at = i + 2;
-        if (np_ensure_cap(d, (size_t)d->len + 4 + 1)) {
-            memmove(d->text + at + 4, d->text + at, (size_t)(d->len - at) + 1);
-            memcpy(d->text + at, "[ ] ", 4);
-            d->len += 4;
-            np_text_changed(a, d);
-        }
+        np_splice(a, d, i + 2, i + 2, "[ ] ", 4);
     }
 }
 
@@ -2090,10 +2096,7 @@ static void np_md_insert_para(notepad *a, bool above) {
     int p = NP_MAX(0, NP_MIN(NP_MIN(d->caret, d->anchor), d->len));
     int at = above ? np_line_start(d, p) : np_line_end(d, p);
     if (!np_ensure_cap(d, (size_t)d->len + 1 + 1)) return;
-    memmove(d->text + at + 1, d->text + at, (size_t)(d->len - at) + 1);
-    d->text[at] = '\n';
-    d->len += 1;
-    np_text_changed(a, d);
+    np_splice(a, d, at, at, "\n", 1);
     int caret = above ? at : at + 1;
     cui_code_editor_select(a->ui, d->editor_id, caret, caret);
 }
@@ -2721,7 +2724,16 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
         cui_dialog_footer(ui) {
             if (cui_button(ui, "取消")) a->dlg_find_files = false;
-            if (cui_button(ui, a->sem_done == 1 ? "AI 搜索中…" : "AI 语义搜索",
+            if (cui_button(ui, a->sem_mode == 1 ? "问答模式" : "找文件模式",
+                           .variant = CUI_BUTTON_GHOST,
+                           .tooltip = a->sem_mode == 1
+                               ? "当前：AI 基于工作区文件回答问题\n点击切换为：只找相关文件"
+                               : "当前：AI 只找相关文件\n点击切换为：基于工作区内容回答问题")) {
+                a->sem_mode = a->sem_mode == 1 ? 0 : 1;
+            }
+            if (cui_button(ui,
+                           a->sem_done == 1 ? "AI 分析中…"
+                             : (a->sem_mode == 1 ? "AI 问答" : "AI 语义搜索"),
                            .variant = CUI_BUTTON_GHOST,
                            .disabled = !a->ff_query[0] || a->sem_done == 1)) {
                 np_sem_start(a);
@@ -2936,6 +2948,10 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 if (cui_button(ui, "编辑")) {
                     a->llm_prov_gen++;          /* invalidate in-flight tasks */
                     a->llm_prov_edit = i;
+                    snprintf(a->llm_temp_buf, sizeof a->llm_temp_buf, "%.2f",
+                             (double)p->temperature);
+                    snprintf(a->llm_tok_buf, sizeof a->llm_tok_buf, "%d",
+                             p->max_tokens);
                     a->llm_test_done = 0;
                     a->llm_test_result[0] = 0;
                     a->llm_test_err[0] = 0;
@@ -2959,6 +2975,8 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                 int idx = a->llm_prov_count;
                 memset(&a->llm_prov[idx], 0, sizeof(np_llm_provider));
                 a->llm_prov_edit = idx;
+                a->llm_temp_buf[0] = 0;
+                a->llm_tok_buf[0] = 0;
                 a->llm_models_done = 0;
                 a->llm_test_done = 0;
                 a->llm_test_result[0] = 0;
@@ -2993,6 +3011,14 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                                .disabled = a->llm_models_done == 1 || !p->url[0])) {
                     np_llm_models_start(a, idx);
                 }
+            }
+            cui_row(ui, .width = CUI_FILL, .gap = 8) {
+                cui_input(ui, "llm-ptemp", a->llm_temp_buf, sizeof a->llm_temp_buf,
+                          .label = "温度（0=默认）", .placeholder = "例如 0.7",
+                          .width = CUI_FILL);
+                cui_input(ui, "llm-ptok", a->llm_tok_buf, sizeof a->llm_tok_buf,
+                          .label = "max_tokens（0=默认）", .placeholder = "例如 8192",
+                          .width = CUI_FILL);
             }
             if (a->llm_models_done == 1) {
                 cui_spinner(ui, 16);
@@ -3037,6 +3063,11 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                                .disabled = !p->url[0] || !p->model[0])) {
                     if (!p->name[0])
                         snprintf(p->name, sizeof p->name, "服务商 %d", idx + 1);
+                    p->temperature = (float)atof(a->llm_temp_buf);
+                    if (p->temperature < 0.f || p->temperature > 2.f)
+                        p->temperature = 0.f;
+                    p->max_tokens = atoi(a->llm_tok_buf);
+                    if (p->max_tokens < 0) p->max_tokens = 0;
                     a->llm_prov_gen++;
                     if (is_new) a->llm_prov_count++;
                     a->llm_prov_edit = -1;
@@ -3872,10 +3903,48 @@ static void np_tt_install_worker(void *arg) {
 #endif
 }
 
+/* Strip ONE wrapping markdown code fence ("```lang\n...\n```") from an AI
+ * result that will be written into a document — models habitually wrap
+ * rewrites / completions in a fence even when asked not to. Conservative:
+ * only strips when the whole result is a single fenced block (opens on the
+ * first line, closes on the last line, no other fence lines in between),
+ * so a markdown document ABOUT code keeps its fences. */
+static void np_ai_strip_code_fence(char *buf, size_t cap) {
+    size_t n = strlen(buf);
+    if (n < 8 || strncmp(buf, "```", 3) != 0) return;
+    char *first_nl = strchr(buf, '\n');
+    if (!first_nl) return;
+    /* Trim trailing newline bytes, then require the last line to be ``` */
+    char *end = buf + n;
+    while (end > buf && (end[-1] == '\n' || end[-1] == '\r')) end--;
+    if (end - buf < 3 || strncmp(end - 3, "```", 3) != 0) return;
+    char *last = end - 3;                /* start of the closing fence line */
+    if (last <= first_nl || last[-1] != '\n') return;
+    /* Any other fence-looking line in between (```anything) means the
+     * fences may be real content — do not unwrap at all. */
+    for (char *p = first_nl + 1; p + 3 < last; p++) {
+        if (p[0] == '\n' && strncmp(p + 1, "```", 3) == 0)
+            return;
+    }
+    /* Also check the very first inner line (right after the language tag). */
+    if (first_nl + 4 <= last && strncmp(first_nl + 1, "```", 3) == 0) return;
+    /* Non-empty content between the fences only. */
+    if (first_nl + 1 >= last - 1) return;
+    size_t clen = (size_t)(last - 1 - (first_nl + 1));
+    memmove(buf, first_nl + 1, clen);
+    buf[clen] = 0;
+}
+
 /* Shared completion bookkeeping: stage the result for hunk decisions and
  * publish it to the UI thread via the volatile state flag. */
 static void np_ai_finish(notepad *a, bool ok) {
     if (ok) {
+        /* Rewrites / completions / templates are about to be written into
+         * the document: unwrap a single surrounding code fence. Q&A results
+         * (tasks 2/3) stay verbatim for the panel. */
+        int t = a->ai_task;
+        if (t == 0 || t == 1 || t == 4 || t == 5 || t == 6)
+            np_ai_strip_code_fence(a->ai_result, sizeof a->ai_result);
         /* The staged buffer starts as the ORIGINAL text sent to the model:
          * the diff view compares staged vs result, and each accepted hunk
          * advances staged toward the result. Seeding it with the result
@@ -4246,6 +4315,7 @@ static void np_ai_openai_worker(void *arg) {
         goto done;
     }
     const np_llm_provider *p = &a->llm_prov[idx];
+    np_openai_set_params(p->temperature, p->max_tokens);
     size_t prompt_cap = np_ai_prompt_size(a);
     char *prompt = (char *)malloc(prompt_cap);
     if (!prompt) {
@@ -4942,14 +5012,27 @@ static void np_sem_build_prompt(notepad *a) {
     const char *root = a->ff_dir[0] ? a->ff_dir : ".";
     np_ignore_load(root);
 
-    size_t po = np_ctx_app(a->sem_prompt, sizeof a->sem_prompt, 0,
-        "你在帮用户做代码与文档检索。用户想找：%s\n"
-        "下面是工作区里的文本文件，每个都有编号、路径和开头几行内容。\n"
-        "请选出与用户需求最相关的文件，最多 12 个。严格按每行一条输出，格式：\n"
-        "编号|行号|一句话理由\n"
-        "编号必须取自清单，行号填最相关的代码所在行（不确定就填 1）。\n"
-        "不要输出标题、代码块或其它文字。没有相关文件就输出：无\n\n文件清单：\n",
-        a->ff_query);
+    size_t po;
+    if (a->sem_mode == 1) {
+        po = np_ctx_app(a->sem_prompt, sizeof a->sem_prompt, 0,
+            "你在帮用户分析他的工作区。用户的问题：%s\n"
+            "下面是工作区里的文本文件，每个都有编号、路径和开头几行内容。\n"
+            "请只依据这些内容回答问题，不要编造。回答中引用文件时用 [编号] 标记。\n"
+            "回答写完后，另起一行输出「引用：」，之后每行一条引用，格式严格为：\n"
+            "编号|行号|一句话理由\n"
+            "编号必须取自清单，行号是最能支撑该引用的行（不确定填 1），最多 8 条。\n"
+            "没有相关信息就回答：未在工作区找到相关信息。\n\n文件清单：\n",
+            a->ff_query);
+    } else {
+        po = np_ctx_app(a->sem_prompt, sizeof a->sem_prompt, 0,
+            "你在帮用户做代码与文档检索。用户想找：%s\n"
+            "下面是工作区里的文本文件，每个都有编号、路径和开头几行内容。\n"
+            "请选出与用户需求最相关的文件，最多 12 个。严格按每行一条输出，格式：\n"
+            "编号|行号|一句话理由\n"
+            "编号必须取自清单，行号填最相关的代码所在行（不确定就填 1）。\n"
+            "不要输出标题、代码块或其它文字。没有相关文件就输出：无\n\n文件清单：\n",
+            a->ff_query);
+    }
 
     char dirs[NP_FF_DIR_MAX][NP_PATH_CAP];
     snprintf(dirs[0], NP_PATH_CAP, "%s", root);
@@ -5062,6 +5145,7 @@ static void np_sem_worker(void *arg) {
                                 a->sem_error, sizeof a->sem_error);
     } else if (a->sem_backend >= 5) {
         const np_llm_provider *p = &a->sem_prov;
+        np_openai_set_params(p->temperature, p->max_tokens);
         ok = np_openai_chat(p->url, p->api_key, p->model, a->sem_prompt,
                             a->sem_result, sizeof a->sem_result,
                             a->sem_error, sizeof a->sem_error);
@@ -5101,6 +5185,8 @@ static void np_sem_apply(notepad *a) {
     for (int i = 0; i < a->sem_count && i < NP_FF_FILE_MAX; i++)
         snprintf(a->ff_paths[i], NP_PATH_CAP, "%s", a->sem_paths[i]);
     a->ff_hit_count = 0;
+    a->sem_answer[0] = 0;
+    size_t ao = 0;
     char *p = a->sem_result;
     while (*p && a->ff_hit_count < NP_FF_MAX) {
         char *e = strchr(p, '\n');
@@ -5108,6 +5194,7 @@ static void np_sem_apply(notepad *a) {
         char *s = p;
         while (*s == ' ' || *s == '\t' || *s == '\r') s++;
         char *bar1 = strchr(s, '|');
+        bool was_hit = false;
         if (bar1 && s != bar1) {
             int id = atoi(s);
             int line = atoi(bar1 + 1);
@@ -5121,14 +5208,30 @@ static void np_sem_apply(notepad *a) {
                 if (!h->text[0])
                     snprintf(h->text, sizeof h->text, "%s（第 %d 行）",
                              np_base(a->ff_paths[id - 1]), line);
+                was_hit = true;
             }
+        }
+        /* Q&A mode: keep every non-reference line as the answer body. */
+        if (a->sem_mode == 1 && !was_hit && s[0] && ao < sizeof a->sem_answer - 2) {
+            size_t sl = strlen(s);
+            if (sl >= sizeof a->sem_answer - 1 - ao)
+                sl = sizeof a->sem_answer - 1 - ao;
+            memcpy(a->sem_answer + ao, s, sl);
+            ao += sl;
+            a->sem_answer[ao++] = '\n';
+            a->sem_answer[ao] = 0;
         }
         if (!e) break;
         p = e + 1;
     }
-    snprintf(a->sem_summary, sizeof a->sem_summary,
-             "语义搜索 “%s”：%d 个相关位置（基于 %d 个候选文件）",
-             a->ff_query, a->ff_hit_count, a->sem_count);
+    if (a->sem_mode == 1)
+        snprintf(a->sem_summary, sizeof a->sem_summary,
+                 "工作区问答 “%s”：%d 条引用（基于 %d 个候选文件）",
+                 a->ff_query, a->ff_hit_count, a->sem_count);
+    else
+        snprintf(a->sem_summary, sizeof a->sem_summary,
+                 "语义搜索 “%s”：%d 个相关位置（基于 %d 个候选文件）",
+                 a->ff_query, a->ff_hit_count, a->sem_count);
     np_logf(a, "%s", a->sem_summary);
     np_toast(a, a->ff_hit_count ? "语义搜索完成" : "没有相关结果", a->sem_summary,
              a->ff_hit_count ? CUI_TONE_SUCCESS : CUI_TONE_WARNING);
@@ -5195,7 +5298,10 @@ static void np_sem_start(notepad *a) {
 
 /* ---- text transforms ---------------------------------------------- */
 
-/* Replace [s,e) with `ins` in one undoable-ish edit and place the caret. */
+/* Replace [s,e) with `ins` as ONE undoable editor step and place the caret.
+ * Writing through cui_code_editor_replace_external keeps CUI's delta history
+ * consistent; a plain memmove would leave stale byte offsets so the next
+ * Ctrl+Z would edit unrelated text (same reasoning as np_ai_apply). */
 static void np_splice(notepad *a, np_doc *d, int s, int e,
                       const char *ins, size_t n) {
     int len = d->len;
@@ -5205,8 +5311,15 @@ static void np_splice(notepad *a, np_doc *d, int s, int e,
         np_toast(a, "文本已满", "已达到 256 MB 上限", CUI_TONE_WARNING);
         return;
     }
-    memmove(d->text + s + (int)n, d->text + e, (size_t)(len - e) + 1);
-    if (n) memcpy(d->text + s, ins, n);
+    int applied_len = len;
+    if (!cui_code_editor_replace_external(a->ui, d->editor_id,
+                                          d->text, d->cap, d->len,
+                                          s, e, ins, (int)n, &applied_len) ||
+        applied_len != len - (e - s) + (int)n) {
+        np_toast(a, "文本已满", "写入编辑器失败", CUI_TONE_WARNING);
+        return;
+    }
+    d->len = applied_len;
     np_text_changed(a, d);
     cui_code_editor_select(a->ui, d->editor_id, s + (int)n, s + (int)n);
 }
@@ -5769,6 +5882,8 @@ static void np_config_load(notepad *a) {
                 }
                 else if (!strcmp(field, "model")) snprintf(p->model, sizeof p->model, "%s", val);
                 else if (!strcmp(field, "models")) snprintf(p->models, sizeof p->models, "%s", val);
+                else if (!strcmp(field, "temp")) { float v = (float)atof(val); if (v >= 0.f && v <= 2.f) p->temperature = v; }
+                else if (!strcmp(field, "maxtok")) { int v = atoi(val); if (v >= 0) p->max_tokens = v; }
                 if (idx + 1 > a->llm_prov_count) a->llm_prov_count = idx + 1;
             }
         }
@@ -5783,6 +5898,12 @@ static void np_config_load(notepad *a) {
             if (i >= 0 && i < NP_RECENT_MAX && val[0]) {
                 snprintf(a->recent[i], NP_PATH_CAP, "%s", val);
                 if (i + 1 > a->recent_count) a->recent_count = i + 1;
+            }
+        } else if (!strncmp(key, "session_cur", 11)) {
+            int i = atoi(key + 11);
+            if (i >= 0 && i < NP_SESSION_MAX && val[0]) {
+                a->session_cur[i] = atoi(val);
+                if (i + 1 > a->session_count) a->session_count = i + 1;
             }
         } else if (!strncmp(key, "session", 7)) {
             int i = atoi(key + 7);
@@ -5826,8 +5947,12 @@ static void np_config_save(notepad *a) {
     a->session_count = 0;
     for (int i = 0; i < a->count && a->session_count < NP_SESSION_MAX; i++) {
         np_doc *d = a->docs[i];
-        if (d->path[0] && !d->dirty)
-            snprintf(a->session[a->session_count++], NP_PATH_CAP, "%s", d->path);
+        if (d->path[0] && !d->dirty) {
+            snprintf(a->session[a->session_count], NP_PATH_CAP, "%s", d->path);
+            a->session_cur[a->session_count] =
+                NP_MAX(0, NP_MIN(d->caret, d->len));
+            a->session_count++;
+        }
     }
     fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\nstyle=%d\n",
             a->dark ? 1 : 0, a->accent, a->font_size, a->density, a->style);
@@ -5896,11 +6021,15 @@ static void np_config_save(notepad *a) {
                 np_cfg_one_line(p->model, cfgline1, sizeof cfgline1));
         fprintf(f, "llm_p%d_models=%s\n", i,
                 np_cfg_one_line(p->models, cfgline2, sizeof cfgline2));
+        fprintf(f, "llm_p%d_temp=%.2f\nllm_p%d_maxtok=%d\n", i,
+                (double)p->temperature, i, p->max_tokens);
     }
     for (int i = 0; i < a->recent_count; i++)
         fprintf(f, "recent%d=%s\n", i, a->recent[i]);
-    for (int i = 0; i < a->session_count; i++)
+    for (int i = 0; i < a->session_count; i++) {
         fprintf(f, "session%d=%s\n", i, a->session[i]);
+        fprintf(f, "session_cur%d=%d\n", i, a->session_cur[i]);
+    }
     for (int i = 0; i < a->draft_count; i++) {
         const np_draft_entry *e = &a->drafts[i];
         fprintf(f, "draft_path%d=%s\ndraft_file%d=%s\ndraft_enc%d=%d\ndraft_crlf%d=%d\n",
@@ -6259,6 +6388,30 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                 } else if (!a->ff_query[0]) {
                     cui_text(ui, "用「搜索 → 在文件中查找…」(Ctrl+Shift+F) 搜索文字，或点「AI 语义搜索」用自然语言找文件。",
                              .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                } else if (a->sem_mode == 1 && a->sem_done == 2 && a->sem_answer[0]) {
+                    cui_text(ui, a->sem_answer, .size = 12, .nowrap = false);
+                    if (a->ff_hit_count) {
+                        char cap[128];
+                        snprintf(cap, sizeof cap, "引用（点击跳转）· %d 条",
+                                 a->ff_hit_count);
+                        cui_text(ui, cap, .size = 11,
+                                 .color = CUI_COLOR_TEXT_MUTED);
+                    } else {
+                        cui_text(ui, "AI 未给出可跳转的引用。",
+                                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+                    }
+                    for (int i = 0; i < a->ff_hit_count; i++) {
+                        np_fhit *h = &a->ff_hits[i];
+                        const char *fname = h->file >= 0 && h->file < a->ff_count
+                                            ? np_base(a->ff_paths[h->file]) : "?";
+                        char label[384], num[48];
+                        snprintf(label, sizeof label, "%s:%d: %s###ffhit%d",
+                                 fname, h->line, h->text, i);
+                        snprintf(num, sizeof num, "第 %d 行", h->line);
+                        if (cui_list_item(ui, label, .icon = CUI_ICON_SEARCH,
+                                          .trailing = num))
+                            np_open_fhit(a, i);
+                    }
                 } else if (!a->ff_hit_count) {
                     cui_text(ui, a->sem_done == 2
                              ? "AI 未找到相关文件，可换一种描述或放宽文件类型。"
@@ -8251,10 +8404,18 @@ static void np_frame(cui_ctx *ui, void *user) {
         np_webview_boot(a);      /* async: bring up native WebView for HTML preview */
         a->quiet = true;
         for (int i = 0; i < a->startup_count; i++) {
-            if (!strncmp(a->startup[i], "draft:", 6))
+            if (!strncmp(a->startup[i], "draft:", 6)) {
                 np_restore_draft(a, atoi(a->startup[i] + 6));
-            else
-                np_open_path(a, a->startup[i], false);
+            } else if (np_open_path(a, a->startup[i], false) &&
+                       a->startup_cur[i] >= 0) {
+                /* Session restore: put the caret back where it was. */
+                np_doc *sd = np_cur(a);
+                if (sd && !sd->is_hex) {
+                    int c = NP_MAX(0, NP_MIN(a->startup_cur[i], sd->len));
+                    sd->caret = sd->anchor = c;
+                    cui_code_editor_select(a->ui, sd->editor_id, c, c);
+                }
+            }
         }
         if (a->startup_bt[0]) {
             np_doc *sd = np_cur(a);
@@ -9204,6 +9365,7 @@ static void np_android_bootstrap(notepad *a) {
 #endif
 
 int main(int argc, char **argv) {
+    for (int i = 0; i < NP_DOC_MAX; i++) g.startup_cur[i] = -1;
     g.font_size = NP_FONT_DEF;
     snprintf(g.font_ident, sizeof g.font_ident, "default");
     g.line_numbers = true;
@@ -9271,8 +9433,10 @@ int main(int argc, char **argv) {
     /* No files on the command line: reopen the last session (unsaved and
      * untitled documents were never recorded, so nothing is lost). */
     if (g.startup_count == 0 && g.session_restore) {
-        for (int i = 0; i < g.session_count && g.startup_count < NP_DOC_MAX; i++)
+        for (int i = 0; i < g.session_count && g.startup_count < NP_DOC_MAX; i++) {
+            g.startup_cur[g.startup_count] = g.session_cur[i];
             snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", g.session[i]);
+        }
         for (int i = 0; i < g.draft_count && g.startup_count < NP_DOC_MAX; i++)
             snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "draft:%d", i);
     }

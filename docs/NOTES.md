@@ -424,3 +424,50 @@ MSVC 构建通过；`scripts/test_maclaw.c`、`scripts/test_openai.c` 均 `ALL T
 ## 版本 1.3.0
 
 九批累计改动（AI 全流程、可靠性、撤销完整性、配置/草稿安全）发布为 v1.3.0。
+
+## 第一组：程序化编辑撤销统一 + AI 围栏剥离 + 编码提示（v1.3.0 后）
+
+按方向评审实施的第一组（正确性收尾）：
+
+- **程序化编辑统一走撤销栈**：`np_splice()` 改为通过
+  `cui_code_editor_replace_external()` 写入（一处修改、行变换类全部受益）；
+  `np_insert_at_caret`（LaTeX 块/表格/时间戳/菜单插入，非打字路径）、
+  `np_latex_wrap`、`np_latex_ensure_package`、`np_latex_preamble_line`、
+  `np_md_set_heading`、Markdown 行重排、`np_md_toggle_task`（勾选/取消也可
+  撤销了）、`np_md_insert_para` 全部改为调用 `np_splice`。grep 确认
+  `memmove(d->text` 清零——正文不再有任何绕过编辑器历史的写路径。
+- **AI 结果代码块剥离**：`np_ai_strip_code_fence()` 在任务 0/1/4/5/6（结果
+  将写入文档）完成时，剥掉单个包裹性 ```` ```lang ... ``` ```` 围栏；任务
+  2/3（问答）保留原样。保守策略：仅当整段是单一围栏块（首行开、末行关、
+  中间无任何 ``` 开头的行）才剥，markdown 文档本身不受影响。
+  `scripts/test_fence.c` 用 awk 从源码提取真实函数做回归（12 用例），测试
+  抓到过「``` mid」行未被识别为围栏的漏洞后收紧了条件。
+  **坑：re.sub 的 repl 字符串会转义 `\n` 等——用 lambda 作 repl 传入。**
+- **编码风险提示**：`np_utf8_to_ansi()` 增加 `lossy` 出参（WinAPI
+  `lpUsedDefaultChar` 检测），保存 ANSI 文档有字符被替换为 ? 时 toast 建议
+  另存 UTF-8；打开 UTF-16 文件转换时 toast 明确「保存时将写为 UTF-8」。
+
+MSVC 构建通过；`test_fence`(12)、`test_maclaw`、`test_openai` 全绿。
+
+## 第二、三组：会话光标恢复 + AI 参数 + 工作区问答（v1.3.0 后）
+
+按方向评审实施的第二批与第三批：
+
+- **会话恢复补光标位置**：核实发现会话恢复（`session<N>`/`session_restore`）
+  此前已存在——上一轮评审说「没有会话恢复」是 grep 关键词不对导致的误判。
+  增量补齐：config 保存 `session_cur<N>`（各文件退出时的光标偏移），启动
+  恢复时按 startup 平行数组 `startup_cur` 回填 caret 并 select 定位滚动。
+  命令行打开的文件不恢复光标（-1）。**教训：判断「某功能不存在」前先全面
+  grep 功能关键词本身（session），而不是只搜自己猜的 API 名。**
+- **AI 采样参数**：`np_llm_provider` 加 `temperature`/`max_tokens`（0=不发送），
+  `np_openai_set_params()` 全局下发，chat/stream 的 JSON body 按需插入字段；
+  服务商编辑表单加两个输入（进入编辑时格式化、保存时解析 clamp），配置
+  持久化为 `llm_p<N>_temp`/`llm_p<N>_maxtok`。主 AI 与语义搜索 worker 在
+  使用快照前设置参数（`sem_prov` 为整体赋值快照，自动携带新字段）。
+- **工作区问答模式**：`sem_mode` 开关（查找对话框底栏切换按钮）。问答模式
+  的 prompt 要求「只依据清单内容回答、引用用 [编号] 标记，末尾输出
+  引用：列表（编号|行号|理由）」——现有 `np_sem_apply` 的逐行解析天然兼容
+  （命中行照常入库供跳转），其余行进 `sem_answer` 作为回答正文显示在
+  引用列表上方。防幻觉机制不变：跳转目标与行内原文始终从本地文件读回。
+
+MSVC 构建通过；三组回归全绿。改动为 v1.3.0 之后的常规提交，未打新 tag。

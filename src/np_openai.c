@@ -129,6 +129,28 @@ static void normalize_base(const char *in, char *out, size_t cap) {
         snprintf(out, cap, "%s", tmp);
 }
 
+/* Optional sampling parameters; zero = omit from the JSON body. */
+static float g_temperature = 0.f;
+static int   g_max_tokens = 0;
+
+void np_openai_set_params(float temperature, int max_tokens) {
+    g_temperature = temperature;
+    g_max_tokens = max_tokens;
+}
+
+/* Append sampling params when configured. Must be called with extra body
+ * headroom (>= 64 bytes) reserved by the caller. */
+static void write_params(char *body, size_t cap, size_t *used) {
+    size_t o = strlen(body);
+    if (g_temperature > 0.f)
+        o += (size_t)snprintf(body + o, cap - o, "\"temperature\":%.2f,",
+                              (double)g_temperature);
+    if (g_max_tokens > 0)
+        o += (size_t)snprintf(body + o, cap - o, "\"max_tokens\":%d,",
+                              g_max_tokens);
+    (void)used;
+}
+
 bool np_openai_chat(const char *base_url, const char *api_key,
                     const char *model, const char *prompt,
                     char *out, size_t out_cap,
@@ -153,17 +175,19 @@ bool np_openai_chat(const char *base_url, const char *api_key,
         return false;
     }
     json_escape(prompt, escaped, esc_cap);
-    size_t body_cap = strlen(escaped) + strlen(model) + 256;
+    size_t body_cap = strlen(escaped) + strlen(model) + 384;
     char *body = (char *)malloc(body_cap);
     if (!body) {
         free(escaped);
         if (err && err_cap) snprintf(err, err_cap, "内存不足");
         return false;
     }
-    snprintf(body, body_cap,
-             "{\"model\":\"%s\",\"stream\":false,"
+    snprintf(body, body_cap, "{\"model\":\"%s\",\"stream\":false,", model);
+    write_params(body, body_cap, NULL);
+    size_t bo = strlen(body);
+    snprintf(body + bo, body_cap - bo,
              "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
-             model, escaped);
+             escaped);
     free(escaped);
 
     char url[1200];
@@ -281,17 +305,19 @@ bool np_openai_chat_stream(const char *base_url, const char *api_key,
         return false;
     }
     json_escape(prompt, escaped, esc_cap);
-    size_t body_cap = strlen(escaped) + strlen(model) + 256;
+    size_t body_cap = strlen(escaped) + strlen(model) + 384;
     char *body = (char *)malloc(body_cap);
     if (!body) {
         free(escaped);
         if (err && err_cap) snprintf(err, err_cap, "内存不足");
         return false;
     }
-    snprintf(body, body_cap,
-             "{\"model\":\"%s\",\"stream\":true,"
+    snprintf(body, body_cap, "{\"model\":\"%s\",\"stream\":true,", model);
+    write_params(body, body_cap, NULL);
+    size_t bo = strlen(body);
+    snprintf(body + bo, body_cap - bo,
              "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
-             model, escaped);
+             escaped);
     free(escaped);
 
     char url[1200];

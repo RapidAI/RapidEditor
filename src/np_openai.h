@@ -26,7 +26,13 @@ typedef struct {
     char api_key[NP_LLM_PROV_KEY_CAP];
     char model[NP_LLM_PROV_MODEL_CAP];  /* selected model id */
     char models[NP_LLM_PROV_MODELS_CAP];/* cached model ids, comma-separated */
+    float temperature;                  /* 0 = provider default (omitted) */
+    int   max_tokens;                   /* 0 = provider default (omitted) */
 } np_llm_provider;
+
+/* Optional sampling parameters applied to the next chat / stream calls made
+ * by THIS thread's workers. Zero values omit the JSON fields entirely. */
+void np_openai_set_params(float temperature, int max_tokens);
 
 /* One non-streaming chat completion. Returns true and writes
  * choices[0].message.content to `out`; errors go to `err`. */
