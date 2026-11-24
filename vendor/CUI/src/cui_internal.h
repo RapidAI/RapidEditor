@@ -567,6 +567,7 @@ struct cui_ctx {
     cui_theme target_theme;
     cui_theme_mode mode;
     cui_accent accent;
+    float neutral_hue, neutral_chroma;  /* neutral palette tint (chroma 0 = pure gray) */
     bool reduced_motion;
     float theme_t;              /* theme transition progress */
     cui_theme from_theme;
@@ -661,6 +662,8 @@ struct cui_ctx {
 
 /* ---- theme ---- */
 void cui__theme_init(cui_ctx *ui, cui_theme_mode mode, cui_accent accent);
+/* Build a theme with a custom neutral tint (OKLCH hue/chroma, 0 = pure gray). */
+void cui__theme_build_ex(cui_theme *t, cui_theme_mode mode, cui_accent accent, float neutral_hue, float neutral_chroma);
 void cui__theme_update(cui_ctx *ui);
 void cui__theme_build(cui_theme *t, cui_theme_mode mode, cui_accent accent);
 cui_color cui__tone_color(cui_ctx *ui, cui_tone tone);

@@ -270,6 +270,32 @@ typedef struct np_fhit {
     char text[160];
 } np_fhit;
 
+/* Appearance style presets. Each entry is a complete look: light/dark mode,
+ * accent color and a neutral tint (OKLCH hue/chroma). To add a style, add one
+ * row here — the settings dialog and persistence pick it up automatically. */
+typedef struct {
+    const char *name;         /* UI label */
+    const char *desc;         /* one-line description on the card */
+    const char *icon;         /* CUI icon glyph */
+    const char *badge;        /* short badge, e.g. "Light" / "Dark" / NULL */
+    cui_theme_mode mode;
+    cui_accent accent;
+    float hue, chroma;        /* neutral tint */
+} np_style;
+
+static const np_style np_styles[] = {
+    { "极光蓝",   "冷调岩灰 · 沉稳蓝，推荐日常使用", CUI_ICON_SPARKLES, "推荐", CUI_THEME_LIGHT, CUI_ACCENT_BLUE,   255.f, 0.011f },
+    { "纯银灰",   "经典中性灰 · 冷静克制",           CUI_ICON_CIRCLE,   "浅色", CUI_THEME_LIGHT, CUI_ACCENT_BLUE,   255.f, 0.0f   },
+    { "暖砂",     "暖调米灰 · 琥珀点缀",             CUI_ICON_SUN,      "浅色", CUI_THEME_LIGHT, CUI_ACCENT_AMBER,   70.f,  0.014f },
+    { "苔绿",     "自然绿灰 · 护眼柔和",             CUI_ICON_SPARKLES, "浅色", CUI_THEME_LIGHT, CUI_ACCENT_GREEN,   155.f, 0.013f },
+    { "紫罗兰",   "淡紫冷灰 · 优雅专注",             CUI_ICON_ZAP,      "浅色", CUI_THEME_LIGHT, CUI_ACCENT_VIOLET,  290.f, 0.013f },
+    { "深海",     "冷调深灰 · 深海蓝，长时间编码",   CUI_ICON_MOON,     "深色", CUI_THEME_DARK,  CUI_ACCENT_BLUE,   255.f, 0.012f },
+    { "曜石",     "中性纯黑灰 · 极致沉稳",           CUI_ICON_CIRCLE,   "深色", CUI_THEME_DARK,  CUI_ACCENT_NEUTRAL, 255.f, 0.0f   },
+    { "午夜紫",   "深紫灰 · 靛紫点缀",               CUI_ICON_STAR,     "深色", CUI_THEME_DARK,  CUI_ACCENT_VIOLET,  290.f, 0.014f },
+    { "炭火",     "暖调炭灰 · 琥珀暖意",             CUI_ICON_SUN,      "深色", CUI_THEME_DARK,  CUI_ACCENT_AMBER,   60.f,  0.013f },
+};
+#define NP_STYLE_COUNT ((int)(sizeof np_styles / sizeof np_styles[0]))
+
 typedef struct notepad {
     np_doc *docs[NP_DOC_MAX];
     int  count, active;
@@ -288,6 +314,7 @@ typedef struct notepad {
     bool quiet;                         /* no "opened" toasts while loading startup files */
     int  accent, font_size;
     int  density;                       /* 0 comfortable, 1 compact, 2 spacious */
+    int  style;                         /* index into np_styles; -1 = custom/legacy */
 
     /* Editor font ------------------------------------------------------ */
     char font_ident[128];               /* bundled id, "default", or "custom" */
@@ -300,6 +327,7 @@ typedef struct notepad {
 
     /* dialogs */
     bool dlg_confirm, dlg_replace, dlg_goto, dlg_help, dlg_about, dlg_lang;
+    bool dlg_settings;                  /* appearance / theme style settings */
     bool dlg_latex_tpl;                 /* new LaTeX document from a template */
     int  latex_tpl_pick;
 
@@ -562,7 +590,7 @@ static void np_config_save(notepad *a);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
-           a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
+           a->dlg_settings || a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
            a->dlg_math_preview || a->dlg_maclaw ||
@@ -2276,6 +2304,22 @@ static void np_load_fonts(cui_ctx *ui, notepad *a) {
     np_font_restore(ui, a);
 }
 
+/* Apply an appearance style preset in one shot. Uses CUI's animated theme
+ * setters so a switch cross-fades rather than snapping. */
+static void np_apply_style(cui_ctx *ui, notepad *a, int idx) {
+    if (idx < 0 || idx >= NP_STYLE_COUNT) return;
+    const np_style *s = &np_styles[idx];
+    a->style = idx;
+    a->dark = s->mode == CUI_THEME_DARK;
+    a->dark_valid = true;               /* explicit style wins over "follow OS" */
+    a->accent = (int)s->accent;
+    cui_app_follow_system_theme(NULL, false);
+    cui_set_theme(ui, s->mode);
+    cui_set_accent(ui, s->accent);
+    cui_set_neutral_tint(ui, s->hue, s->chroma);
+    cui_request_redraw(ui);
+}
+
 /* Tighter radii, calmer elevation and a controlled type scale give the stock
  * CUI widgets a professional editor feel. Applied every frame so a system
  * theme change or a set_theme() call cannot silently reset the settings. */
@@ -2299,6 +2343,51 @@ static void np_apply_theme(cui_ctx *ui, const notepad *a) {
     t->shadow_raised[1]   = (cui_shadow){ 8, 20, -6, 0.10f };
     t->shadow_floating[0] = (cui_shadow){ 6, 18, -4, 0.12f };
     t->shadow_floating[1] = (cui_shadow){ 16, 44, -12, 0.18f };
+}
+
+/* Appearance settings: visual style picker + density/font-size controls.
+ * Selecting a style applies it live (animated); changes persist on exit. */
+static void np_settings_dialog(cui_ctx *ui, notepad *a) {
+    cui_dialog(ui, "外观设置", &a->dlg_settings,
+               .description = "选择界面风格，切换即时生效", .width = 620,
+               .resizable = true, .draggable = true) {
+
+    cui_text(ui, "界面风格", .size = 13, .font = CUI_FONT_MEDIUM);
+    cui_text(ui, "每套风格包含独立的明暗模式、强调色与中性色调。",
+             .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+
+    cui_choice choices[NP_STYLE_COUNT];
+    for (int i = 0; i < NP_STYLE_COUNT; i++) {
+        choices[i].title = np_styles[i].name;
+        choices[i].description = np_styles[i].desc;
+        choices[i].icon = np_styles[i].icon;
+        choices[i].badge = np_styles[i].badge;
+    }
+    int sel = a->style >= 0 && a->style < NP_STYLE_COUNT ? a->style : 0;
+    if (cui_radio_cards(ui, "np-style-cards", choices, NP_STYLE_COUNT, &sel,
+                        .columns = 3)) {
+        np_apply_style(ui, a, sel);
+    }
+
+    cui_separator(ui);
+    cui_text(ui, "界面密度", .size = 13, .font = CUI_FONT_MEDIUM);
+    {
+        static const char *dens[] = { "舒适", "紧凑", "宽松" };
+        if (cui_segmented(ui, "np-density", dens, 3, &a->density, .full_width = true))
+            cui_request_redraw(ui);
+    }
+
+    cui_separator(ui);
+    cui_text(ui, "编辑器字号", .size = 13, .font = CUI_FONT_MEDIUM);
+    {
+        float fs = (float)a->font_size;
+        if (cui_slider(ui, "字号", &fs, NP_FONT_MIN, NP_FONT_MAX,
+                       .step = 1, .show_value = true, .format = "%.0f pt"))
+            a->font_size = (int)(fs + 0.5f);
+    }
+    cui_text(ui, "提示：外观改动会在退出时自动保存，下次启动保持。",
+             .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2333,6 +2422,8 @@ static void np_install_close_hook(void) {
 /* ------------------------------------------------------------------ */
 
 static void np_dialogs(notepad *a, cui_ctx *ui) {
+    np_settings_dialog(ui, a);
+
     cui_dialog(ui, "有未保存的修改", &a->dlg_confirm,
                .description = a->confirm_desc, .width = 420) {
         cui_text(ui, "要先保存这份文档吗？", .size = 13);
@@ -4523,6 +4614,7 @@ static void np_config_load(notepad *a) {
     np_config_path(path, sizeof path);
     FILE *f = np_fopen_utf8(path, "rb");
     if (!f) return;
+    a->style = -1;   /* legacy config without a style key keeps dark/accent behaviour */
     char line[NP_PATH_CAP + 128];
     while (fgets(line, sizeof line, f)) {
         size_t n = strlen(line);
@@ -4539,6 +4631,9 @@ static void np_config_load(notepad *a) {
         } else if (!strcmp(key, "accent")) {
             int v = atoi(val);
             if (v >= 0 && v < CUI_ACCENT_COUNT) a->accent = v;
+        } else if (!strcmp(key, "style")) {
+            int v = atoi(val);
+            a->style = (v >= 0 && v < NP_STYLE_COUNT) ? v : -1;
         } else if (!strcmp(key, "font")) {
             int v = atoi(val);
             if (v >= NP_FONT_MIN && v <= NP_FONT_MAX) a->font_size = v;
@@ -4641,8 +4736,8 @@ static void np_config_save(notepad *a) {
         if (d->path[0] && !d->dirty)
             snprintf(a->session[a->session_count++], NP_PATH_CAP, "%s", d->path);
     }
-    fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\n",
-            a->dark ? 1 : 0, a->accent, a->font_size, a->density);
+    fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\nstyle=%d\n",
+            a->dark ? 1 : 0, a->accent, a->font_size, a->density, a->style);
     fprintf(f, "line_numbers=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n"
                "show_preview=%d\npreview_ratio=%.4f\nshow_ai=%d\nai_ratio=%.4f\n",
             a->line_numbers ? 1 : 0, a->show_status ? 1 : 0,
@@ -6397,13 +6492,20 @@ static void np_frame(cui_ctx *ui, void *user) {
     if (!a->boot_done) {
         a->boot_done = true;
         np_load_fonts(ui, a);
-        if (a->dark_valid) {            /* persisted choice wins over system */
-            cui_app_follow_system_theme(NULL, false);
-            cui_set_theme(ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
+        if (a->style >= 0 && a->style < NP_STYLE_COUNT) {
+            /* A saved style is the single source of truth for the look. */
+            np_apply_style(ui, a, a->style);
         } else {
-            a->dark = cui_get_theme_mode(ui) == CUI_THEME_DARK;
+            /* Legacy config: honour the old dark/accent keys with the default tint. */
+            if (a->dark_valid) {        /* persisted choice wins over system */
+                cui_app_follow_system_theme(NULL, false);
+                cui_set_theme(ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
+            } else {
+                a->dark = cui_get_theme_mode(ui) == CUI_THEME_DARK;
+            }
+            cui_set_accent(ui, (cui_accent)a->accent);
+            cui_set_neutral_tint(ui, 255.f, 0.011f);
         }
-        cui_set_accent(ui, (cui_accent)a->accent);
 #ifdef _WIN32
         np_install_close_hook();
 #endif
@@ -6547,6 +6649,7 @@ static void np_frame(cui_ctx *ui, void *user) {
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P))
             a->show_preview = !a->show_preview;
         if (cui_key_pressed(ui, CUI_KEY_F1)) a->dlg_help = true;
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_COMMA)) a->dlg_settings = true;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) {
             a->dlg_find_files = true;
             if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
@@ -6819,19 +6922,30 @@ static void np_frame(cui_ctx *ui, void *user) {
                         np_dir_set(a, dir);
                 }
                 cui_menu_separator(ui);
+                {
+                    const char *sname = a->style >= 0 && a->style < NP_STYLE_COUNT
+                                      ? np_styles[a->style].name : "自定义";
+                    char slabel[96];
+                    snprintf(slabel, sizeof slabel, "外观设置…（%s）", sname);
+                    if (cui_menu_item(ui, slabel, .icon = CUI_ICON_PALETTE, .shortcut = "Ctrl ,"))
+                        a->dlg_settings = true;
+                }
                 if (cui_menu_item(ui, "深色模式", .icon = CUI_ICON_MOON, .checked = a->dark)) {
                     a->dark = !a->dark;
                     a->dark_valid = true;
+                    a->style = -1;              /* manual override → custom look */
                     cui_app_follow_system_theme(NULL, false);
                     cui_set_theme(ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
                 }
                 if (cui_menu_item(ui, "跟随系统主题", .checked = !a->dark_valid)) {
                     a->dark_valid = false;
+                    a->style = -1;
                     cui_app_follow_system_theme(NULL, true);
                     a->dark = cui_get_theme_mode(ui) == CUI_THEME_DARK;
                 }
                 if (cui_menu_item(ui, "切换强调色", .icon = CUI_ICON_PALETTE)) {
                     a->accent = (a->accent + 1) % CUI_ACCENT_COUNT;
+                    a->style = -1;
                     cui_set_accent(ui, (cui_accent)a->accent);
                 }
                 {
@@ -7129,6 +7243,9 @@ static void np_frame(cui_ctx *ui, void *user) {
             if (cui_toolbar_button(ui, CUI_ICON_SLIDERS_HORIZONTAL,
                                    .tooltip = "切换界面密度（舒适/紧凑/宽松）"))
                 a->density = (a->density + 1) % 3;
+            if (cui_toolbar_button(ui, CUI_ICON_PALETTE,
+                                   .tooltip = "外观设置…（界面风格 / 主题）"))
+                a->dlg_settings = true;
             if (cui_toolbar_button(ui, CUI_ICON_KEYBOARD,
                                    .tooltip = "快捷键帮助  F1"))
                 a->dlg_help = true;
@@ -7136,6 +7253,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                                    .tooltip = a->dark ? "浅色模式" : "深色模式")) {
                 a->dark = !a->dark;
                 a->dark_valid = true;
+                a->style = -1;
                 cui_app_follow_system_theme(NULL, false);
                 cui_set_theme(ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
             }

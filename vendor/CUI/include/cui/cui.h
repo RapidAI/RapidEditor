@@ -335,6 +335,9 @@ CUI_API void cui_set_theme(cui_ctx *ui, cui_theme_mode mode);
 CUI_API cui_theme_mode cui_get_theme_mode(cui_ctx *ui);
 CUI_API void cui_set_accent(cui_ctx *ui, cui_accent accent);
 CUI_API cui_accent cui_get_accent(cui_ctx *ui);
+/* Neutral palette tint, in OKLCH: hue in degrees, chroma in [0, ~0.05].
+ * 0 chroma gives a pure neutral gray. Retargets the theme (animated). */
+CUI_API void cui_set_neutral_tint(cui_ctx *ui, float hue, float chroma);
 /* The active theme. Edit it to customize; changes apply next frame. Theme
  * changes through cui_set_theme/cui_set_accent animate smoothly. */
 CUI_API cui_theme *cui_theme_get(cui_ctx *ui);

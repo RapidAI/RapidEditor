@@ -115,7 +115,7 @@ typedef struct {
 static const cui__accent_def cui__accents[CUI_ACCENT_COUNT] = {
     { "neutral", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     { "violet", 0x7747ff, 0x5528ce, 0x21, 0xffffff, 0xa78bff, 0xc7b7ff, 0x38, 0x15102b, 0x7747ff, 0xffffff, 0x8a66ff, 0xffffff },
-    { "blue",   0x0562ef, 0x074db7, 0x1f, 0xffffff, 0x6ba3ff, 0xa4c7ff, 0x38, 0x0b1526, 0x0562ef, 0xffffff, 0x3b82f6, 0xffffff },
+    { "blue",   0x2563d7, 0x1a4fb0, 0x1b, 0xffffff, 0x6ba3ff, 0xa4c7ff, 0x38, 0x0b1526, 0x2f6fe8, 0xffffff, 0x3b82f6, 0xffffff },
     { "green",  0x00864b, 0x006c36, 0x21, 0xffffff, 0x53dca6, 0x93efd0, 0x33, 0x102016, 0x00864b, 0xffffff, 0x1fae78, 0xffffff },
     { "amber",  0xf3ad20, 0x9c6300, 0x29, 0x20190d, 0xffcb62, 0xffe0a1, 0x33, 0x20190d, 0xeda11a, 0x2a1c03, 0xe8a52a, 0x241803 },
     { "orange", 0xc25300, 0xa43d00, 0x21, 0xffffff, 0xffad5e, 0xffd0a0, 0x33, 0x17130f, 0xc25300, 0xffffff, 0xef873a, 0xffffff },
@@ -125,29 +125,70 @@ static const cui__accent_def cui__accents[CUI_ACCENT_COUNT] = {
 
 const char *cui_accent_name(cui_accent a) { return (a >= 0 && a < CUI_ACCENT_COUNT) ? cui__accents[a].name : "neutral"; }
 
-void cui__theme_build(cui_theme *t, cui_theme_mode mode, cui_accent accent) {
+/* Neutral palette from one (hue, chroma) tint. Each token keeps its original
+ * lightness step (so contrast is identical whatever the tint) and takes a
+ * fraction of the requested chroma: large surfaces stay almost neutral while
+ * text and borders carry a little more of the hue. A chroma of 0 yields the
+ * original pure-gray palette. */
+typedef struct { float L, cscale; } cui__neutral_step;
+
+void cui__theme_build_ex(cui_theme *t, cui_theme_mode mode, cui_accent accent, float nh, float nc) {
     memset(t, 0, sizeof *t);
     bool dark = mode == CUI_THEME_DARK;
     cui_color *c = t->colors;
     if ((int)accent < 0 || accent >= CUI_ACCENT_COUNT) accent = CUI_ACCENT_NEUTRAL;
+    if (nc < 0) nc = 0;
 
+    /* lightness steps are the calibrated defaults; cscale weights the tint */
+    static const cui__neutral_step ns_light[] = {
+        [CUI_TOKEN_BACKGROUND]        = { 0.992f, 0.55f },
+        [CUI_TOKEN_SURFACE]           = { 1.0f,   0.35f },
+        [CUI_TOKEN_SURFACE_RAISED]    = { 1.0f,   0.35f },
+        [CUI_TOKEN_SURFACE_MUTED]     = { 0.972f, 1.0f  },
+        [CUI_TOKEN_FOREGROUND]        = { 0.17f,  1.0f  },
+        [CUI_TOKEN_TEXT_SECONDARY]    = { 0.46f,  1.0f  },
+        [CUI_TOKEN_TEXT_MUTED]        = { 0.565f, 1.0f  },
+        [CUI_TOKEN_BORDER]            = { 0.910f, 0.9f  },
+        [CUI_TOKEN_BORDER_SUBTLE]     = { 0.950f, 0.7f  },
+        [CUI_TOKEN_BORDER_STRONG]     = { 0.655f, 1.0f  },
+        [CUI_TOKEN_CONTROL_ON]        = { 0.23f,  1.0f  },
+        [CUI_TOKEN_CONTROL_TRACK]     = { 0.893f, 0.9f  },
+        [CUI_TOKEN_CONTROL_TRACK_HOVER] = { 0.86f, 1.0f },
+    };
+    static const cui__neutral_step ns_dark[] = {
+        [CUI_TOKEN_BACKGROUND]        = { 0.18f,  0.55f },
+        [CUI_TOKEN_SURFACE]           = { 0.21f,  0.35f },
+        [CUI_TOKEN_SURFACE_RAISED]    = { 0.24f,  0.35f },
+        [CUI_TOKEN_SURFACE_MUTED]     = { 0.26f,  1.0f  },
+        [CUI_TOKEN_FOREGROUND]        = { 0.96f,  0.55f },
+        [CUI_TOKEN_TEXT_SECONDARY]    = { 0.77f,  0.7f  },
+        [CUI_TOKEN_TEXT_MUTED]        = { 0.64f,  0.8f  },
+        [CUI_TOKEN_BORDER]            = { 0.29f,  0.9f  },
+        [CUI_TOKEN_BORDER_SUBTLE]     = { 0.25f,  0.7f  },
+        [CUI_TOKEN_BORDER_STRONG]     = { 0.515f, 1.0f  },
+        [CUI_TOKEN_CONTROL_ON]        = { 0.93f,  0.55f },
+        [CUI_TOKEN_CONTROL_TRACK]     = { 0.33f,  0.9f  },
+        [CUI_TOKEN_CONTROL_TRACK_HOVER] = { 0.37f, 1.0f },
+    };
+    const cui__neutral_step *ns = dark ? ns_dark : ns_light;
+    #define NP_NEUTRAL(tok) c[tok] = cui_oklch(ns[tok].L, nc * ns[tok].cscale, nh, 1)
     if (!dark) {
-        c[CUI_TOKEN_BACKGROUND] = cui__gray(1.0f);
-        c[CUI_TOKEN_SURFACE] = cui__gray(1.0f);
-        c[CUI_TOKEN_SURFACE_RAISED] = cui__gray(1.0f);
-        c[CUI_TOKEN_SURFACE_MUTED] = cui__gray(0.978f);
-        c[CUI_TOKEN_FOREGROUND] = cui__gray(0.15f);
-        c[CUI_TOKEN_TEXT_SECONDARY] = cui__gray(0.46f);
-        c[CUI_TOKEN_TEXT_MUTED] = cui__gray(0.565f);
-        c[CUI_TOKEN_BORDER] = cui__gray(0.915f);
-        c[CUI_TOKEN_BORDER_SUBTLE] = cui__gray(0.955f);
-        c[CUI_TOKEN_BORDER_STRONG] = cui__gray(0.665f);
-        c[CUI_TOKEN_CONTROL_ON] = cui__gray(0.23f);
-        c[CUI_TOKEN_CONTROL_GLYPH] = cui__gray(1.0f);
-        c[CUI_TOKEN_CONTROL_TRACK] = cui__gray(0.895f);
-        c[CUI_TOKEN_CONTROL_TRACK_HOVER] = cui__gray(0.86f);
-        c[CUI_TOKEN_CONTROL_THUMB] = cui__gray(1.0f);
-        c[CUI_TOKEN_CONTROL_THUMB_ON] = cui__gray(1.0f);
+        NP_NEUTRAL(CUI_TOKEN_BACKGROUND);
+        NP_NEUTRAL(CUI_TOKEN_SURFACE);
+        NP_NEUTRAL(CUI_TOKEN_SURFACE_RAISED);
+        NP_NEUTRAL(CUI_TOKEN_SURFACE_MUTED);
+        NP_NEUTRAL(CUI_TOKEN_FOREGROUND);
+        NP_NEUTRAL(CUI_TOKEN_TEXT_SECONDARY);
+        NP_NEUTRAL(CUI_TOKEN_TEXT_MUTED);
+        NP_NEUTRAL(CUI_TOKEN_BORDER);
+        NP_NEUTRAL(CUI_TOKEN_BORDER_SUBTLE);
+        NP_NEUTRAL(CUI_TOKEN_BORDER_STRONG);
+        NP_NEUTRAL(CUI_TOKEN_CONTROL_ON);
+        c[CUI_TOKEN_CONTROL_GLYPH] = cui_oklch(1.0f, 0, 0, 1);
+        NP_NEUTRAL(CUI_TOKEN_CONTROL_TRACK);
+        NP_NEUTRAL(CUI_TOKEN_CONTROL_TRACK_HOVER);
+        c[CUI_TOKEN_CONTROL_THUMB] = cui_oklch(1.0f, 0, 0, 1);
+        c[CUI_TOKEN_CONTROL_THUMB_ON] = cui_oklch(1.0f, 0, 0, 1);
         t->tone_teal = cui_oklch(0.50f, 0.095f, 182, 1);
         t->tone_sky = cui_oklch(0.51f, 0.11f, 240, 1);
         t->tone_orchid = cui_oklch(0.52f, 0.17f, 322, 1);
@@ -155,24 +196,24 @@ void cui__theme_build(cui_theme *t, cui_theme_mode mode, cui_accent accent) {
         t->tone_rose = cui_oklch(0.53f, 0.18f, 10, 1);
         t->tone_amber = cui_oklch(0.55f, 0.12f, 68, 1);
         t->tone_green = cui_oklch(0.50f, 0.12f, 162, 1);
-        c[CUI_TOKEN_SCRIM] = cui__rgba(10, 10, 12, 82);
+        c[CUI_TOKEN_SCRIM] = cui__rgba(12, 18, 32, 82);
     } else {
-        c[CUI_TOKEN_BACKGROUND] = cui__gray(0.18f);
-        c[CUI_TOKEN_SURFACE] = cui__gray(0.21f);
-        c[CUI_TOKEN_SURFACE_RAISED] = cui__gray(0.24f);
-        c[CUI_TOKEN_SURFACE_MUTED] = cui__gray(0.26f);
-        c[CUI_TOKEN_FOREGROUND] = cui__gray(0.96f);
-        c[CUI_TOKEN_TEXT_SECONDARY] = cui__gray(0.77f);
-        c[CUI_TOKEN_TEXT_MUTED] = cui__gray(0.64f);
-        c[CUI_TOKEN_BORDER] = cui__gray(0.29f);
-        c[CUI_TOKEN_BORDER_SUBTLE] = cui__gray(0.25f);
-        c[CUI_TOKEN_BORDER_STRONG] = cui__gray(0.515f);
-        c[CUI_TOKEN_CONTROL_ON] = cui__gray(0.93f);
-        c[CUI_TOKEN_CONTROL_GLYPH] = cui__gray(0.19f);
-        c[CUI_TOKEN_CONTROL_TRACK] = cui__gray(0.33f);
-        c[CUI_TOKEN_CONTROL_TRACK_HOVER] = cui__gray(0.37f);
-        c[CUI_TOKEN_CONTROL_THUMB] = cui__gray(0.97f);
-        c[CUI_TOKEN_CONTROL_THUMB_ON] = cui__gray(0.19f);
+        NP_NEUTRAL(CUI_TOKEN_BACKGROUND);
+        NP_NEUTRAL(CUI_TOKEN_SURFACE);
+        NP_NEUTRAL(CUI_TOKEN_SURFACE_RAISED);
+        NP_NEUTRAL(CUI_TOKEN_SURFACE_MUTED);
+        NP_NEUTRAL(CUI_TOKEN_FOREGROUND);
+        NP_NEUTRAL(CUI_TOKEN_TEXT_SECONDARY);
+        NP_NEUTRAL(CUI_TOKEN_TEXT_MUTED);
+        NP_NEUTRAL(CUI_TOKEN_BORDER);
+        NP_NEUTRAL(CUI_TOKEN_BORDER_SUBTLE);
+        NP_NEUTRAL(CUI_TOKEN_BORDER_STRONG);
+        NP_NEUTRAL(CUI_TOKEN_CONTROL_ON);
+        c[CUI_TOKEN_CONTROL_GLYPH] = cui_oklch(0.19f, 0, 0, 1);
+        NP_NEUTRAL(CUI_TOKEN_CONTROL_TRACK);
+        NP_NEUTRAL(CUI_TOKEN_CONTROL_TRACK_HOVER);
+        c[CUI_TOKEN_CONTROL_THUMB] = cui_oklch(0.97f, 0, 0, 1);
+        c[CUI_TOKEN_CONTROL_THUMB_ON] = cui_oklch(0.19f, 0, 0, 1);
         t->tone_teal = cui_oklch(0.79f, 0.13f, 182, 1);
         t->tone_sky = cui_oklch(0.79f, 0.095f, 236, 1);
         t->tone_orchid = cui_oklch(0.76f, 0.15f, 322, 1);
@@ -266,12 +307,21 @@ void cui__theme_build(cui_theme *t, cui_theme_mode mode, cui_accent accent) {
     }
     t->motion = 1;
     t->font_scale = 1;
+    #undef NP_NEUTRAL
+}
+
+/* Default tint: a calm cool slate. Wrapper keeps the old 3-arg signature used
+ * by the context constructor and any external callers. */
+void cui__theme_build(cui_theme *t, cui_theme_mode mode, cui_accent accent) {
+    cui__theme_build_ex(t, mode, accent, 255.0f, 0.011f);
 }
 
 void cui__theme_init(cui_ctx *ui, cui_theme_mode mode, cui_accent accent) {
     ui->mode = mode;
     ui->accent = accent;
-    cui__theme_build(&ui->target_theme, mode, accent);
+    ui->neutral_hue = 255.0f;
+    ui->neutral_chroma = 0.011f;
+    cui__theme_build_ex(&ui->target_theme, mode, accent, ui->neutral_hue, ui->neutral_chroma);
     ui->theme = ui->target_theme;
     ui->from_theme = ui->theme;
     ui->theme_t = 1;
@@ -280,7 +330,7 @@ void cui__theme_init(cui_ctx *ui, cui_theme_mode mode, cui_accent accent) {
 static void cui__theme_retarget(cui_ctx *ui) {
     cui_theme keep = ui->theme;
     ui->from_theme = ui->theme;
-    cui__theme_build(&ui->target_theme, ui->mode, ui->accent);
+    cui__theme_build_ex(&ui->target_theme, ui->mode, ui->accent, ui->neutral_hue, ui->neutral_chroma);
     /* keep user customizations of the non-color fields */
     memcpy(ui->target_theme.shadow_resting, keep.shadow_resting, sizeof keep.shadow_resting);
     ui->target_theme.radius_control = keep.radius_control;
@@ -304,6 +354,14 @@ void cui_set_accent(cui_ctx *ui, cui_accent accent) {
     cui__theme_retarget(ui);
 }
 cui_accent cui_get_accent(cui_ctx *ui) { return ui->accent; }
+
+void cui_set_neutral_tint(cui_ctx *ui, float hue, float chroma) {
+    if (fabsf(hue - ui->neutral_hue) < 0.5f && fabsf(chroma - ui->neutral_chroma) < 0.0005f)
+        return;
+    ui->neutral_hue = hue;
+    ui->neutral_chroma = chroma;
+    cui__theme_retarget(ui);
+}
 
 cui_theme *cui_theme_get(cui_ctx *ui) { return &ui->theme; }
 
