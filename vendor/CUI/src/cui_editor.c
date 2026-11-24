@@ -636,6 +636,7 @@ typedef struct {
     int vc0, vc1;               /* columns in view */
     const char *ghost;          /* inline suggestion drawn after the caret, or NULL */
     int ghost_len;
+    int ghost_extra;            /* suggestion lines beyond the first (marker shown) */
 } cui__ed_paint;
 
 /* Draws s[a, b) starting xoff points from the line start. Tabs expand and
@@ -802,9 +803,24 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
         float y = r.y + CUI__ED_INSET + (float)((double)p->caret_line * p->lh - p->sy);
         float cx = x0 + p->caret_px;
         cui_draw_rect(ui, (cui_rect){ roundf(cx * ui->scale) / ui->scale - 0.75f, y + ty, 1.5f, fh }, CUI_CORNERS(0.75f), cui_alpha(p->caret, a));
-        /* inline suggestion (ghost text) right after the caret */
-        if (p->ghost && p->ghost_len > 0)
-            cui__draw_text_line(ui, CUI_FONT_MONO, p->size, cx + 3.0f, y + ty, p->muted, p->ghost, -1, true);
+        /* inline suggestion (ghost text) right after the caret: the first
+         * line of the suggestion, plus an extra-lines marker when the
+         * suggestion spans more than one line (Tab accepts it all) */
+        if (p->ghost && p->ghost_len > 0) {
+            int fl = p->ghost_len;
+            for (int i = 0; i < p->ghost_len; i++)
+                if (p->ghost[i] == '\n' || p->ghost[i] == '\r') { fl = i; break; }
+            cui__draw_text_line(ui, CUI_FONT_MONO, p->size, cx + 3.0f, y + ty,
+                                p->muted, p->ghost, fl, true);
+            if (p->ghost_extra > 0) {
+                char mark[24];
+                snprintf(mark, sizeof mark, " \xe2\x80\xa6 +%d", p->ghost_extra);
+                float w = cui__text_width(ui, CUI_FONT_MONO, p->size,
+                                          p->ghost, fl, true);
+                cui__draw_text_line(ui, CUI_FONT_MONO, p->size,
+                                    cx + 3.0f + w, y + ty, p->muted, mark, -1, true);
+            }
+        }
     }
     cui_pop_clip(ui);
     /* scrollbars */
@@ -868,11 +884,8 @@ void cui_code_editor_ghost(cui_ctx *ui, const char *id, const char *text) {
     }
     int n = 0;
     while (text[n] && n < cap) n++;
-    /* The suggestion renders on the caret's own line, so only the first
-     * line of `text` is meaningful: drop everything after a newline. */
-    for (int i = 0; i < n; i++) {
-        if (text[i] == '\n' || text[i] == '\r') { n = i; break; }
-    }
+    /* Multi-line suggestions are kept whole: Tab accepts everything and
+     * the renderer shows the first line plus an extra-lines marker. */
     memcpy(s->ghost, text, (size_t)n);
     s->ghost[n] = 0;
     s->ghost_len = n;
@@ -1481,6 +1494,13 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     p->caret_phase = ui->time - ui->caret_time;
     p->ghost = st->ghost_len > 0 ? st->ghost : NULL;
     p->ghost_len = st->ghost_len;
+    p->ghost_extra = 0;
+    if (p->ghost) {
+        int lines = 1;
+        for (int i = 0; i < st->ghost_len; i++)
+            if (st->ghost[i] == '\n') lines++;
+        p->ghost_extra = lines - 1;
+    }
     p->br_line[0] = p->br_line[1] = -1;
     if (e->cursor == e->anchor && p->show_line) {
         int ba, bb;

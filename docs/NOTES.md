@@ -565,3 +565,24 @@ MSVC 构建通过；三组回归全绿。
   0 值省略字段）。
 
 MSVC 构建通过；四组回归全绿。
+
+## ghost 多行建议（第十七批）
+
+行内补全此前把建议截断到首行，续写类多行建议（整段 / 整个代码块）价值折损。
+
+- **CUI 端**：`cui_code_editor_ghost` 不再截断，保存完整文本（cap 2048 不变）；
+  paint 增加 `ghost_extra`（首行以外行数），渲染仍是光标行内单行绘制——
+  画首行后用 `cui__text_width` 接一个 muted 标记「 … +N」。Tab 接受路径
+  `cui__ed_replace(..., st->ghost, st->ghost_len, 1)` 本就按完整长度插入
+  （replace 会清理 \r），多行插入零改动即生效。
+- **app 端 `np_inline_clean` 重写**：CRLF 归一为单个 LF（旧写法 `\r`→`\n`
+  会把 CRLF 变成两个换行）；围栏剥壳支持多行——剥壳**前**判断 opening
+  fence 是否为独立行（首个换行在 closing fence 之前且行内无反引号），
+  是则整行丢弃（含语言标签）；` ```text``` ` 这类内容和 fence 同行的单行
+  输出仍只剥首尾标记。
+- **教训（测试抓到两个真实 bug）**：①"bare CR normalized"用例暴露 CRLF
+  双换行瑕疵；②"tagless fence"用例暴露剥壳后按首行判断语言标签会把内容
+  行丢掉（```` ```\nprint(1)\n``` ```` 变 NULL）。语言标签判定必须基于
+  剥壳前的 fence 行结构，剥壳后的首行无法区分标签与内容。
+
+MSVC 构建通过；四组回归全绿（test_inline 13 用例）。

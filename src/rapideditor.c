@@ -6809,25 +6809,44 @@ static void np_smart_paste_open(notepad *a) {
 
 /* ---- inline completion (ghost text) --------------------------------- */
 
-/* Clean a raw model completion for inline display: trim whitespace, keep
- * only the first line (the ghost renders on the caret's line) and unwrap a
- * one-line code fence. Returns a pointer into buf, or NULL when nothing
- * usable remains. Kept as a pure function so the regression test extracts
- * and exercises the real implementation. */
+/* Clean a raw model completion for inline display: trim whitespace,
+ * normalize \r line breaks to \n, keep the whole (possibly multi-line)
+ * text and unwrap a wrapping code fence (language tag lines dropped).
+ * Returns a pointer into buf, or NULL when nothing usable remains. Kept
+ * as a pure function so the regression test extracts and exercises the
+ * real implementation. */
 static char *np_inline_clean(char *buf) {
     char *s = buf, *e = buf + strlen(buf);
     while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
     while (e > s && (e[-1] == ' ' || e[-1] == '\t' ||
                      e[-1] == '\r' || e[-1] == '\n')) e--;
     *e = 0;
-    char *nl = strchr(s, '\n');
-    if (nl) *nl = 0;
-    /* models occasionally wrap one-liners in a code fence anyway */
+    /* normalize line breaks in place: CRLF becomes one LF, lone CR too */
+    char *w = s;
+    for (char *p = s; *p; p++) {
+        if (*p == '\r') {           /* CR: dropped when followed by LF */
+            if (p[1] != '\n') *w++ = '\n';
+        } else *w++ = *p;
+    }
+    *w = 0;
+    /* models occasionally wrap the suggestion in a code fence anyway;
+     * unwrap only when the fences enclose the whole text */
     size_t ln = strlen(s);
     if (ln >= 6 && !strncmp(s, "```", 3) &&
         !strncmp(s + ln - 3, "```", 3)) {
+        char *after = s + 3;                 /* rest of the opening line */
+        char *fnl = strchr(after, '\n');     /* opening line's newline */
+        char *tail = s + ln - 3;             /* closing fence */
         s[ln - 3] = 0;
-        s += 3;
+        s = after;
+        /* a standalone opening line (``` or ```lang) is dropped; a line
+         * that also holds content (```text```) stays untouched */
+        if (fnl && fnl < tail &&
+            !memchr(after, '`', (size_t)(fnl - after)))
+            s = fnl + 1;
+        e = s + strlen(s);
+        while (e > s && (e[-1] == '\n' || e[-1] == ' ' || e[-1] == '\t')) e--;
+        *e = 0;
     }
     return *s ? s : NULL;
 }

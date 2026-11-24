@@ -23,11 +23,16 @@ int main(void) {
     t("print(1)", "print(1)", "plain text passes through");
     t("  hello  ", "hello", "leading/trailing spaces trimmed");
     t("hello\r\n", "hello", "crlf trimmed");
-    t("first\nsecond", "first", "multiline keeps only first line");
+    t("first\nsecond", "first\nsecond", "multiline kept whole");
+    t("a\r\nb\rc", "a\nb\nc", "bare CR normalized to LF");
     t("```int x```", "int x", "one-line code fence unwrapped");
     t("```int x``", "```int x``", "unbalanced fence untouched");
     t("````", "````", "fence markers only: untouched (>=6 required)");
-    t("a\n```b```", "a", "first line wins before fence logic");
+    t("a\n```b```", "a\n```b```", "unwrapped multiline untouched");
+    t("```py\nprint(1)\n```", "print(1)", "multiline fence with language tag unwrapped");
+    t("```\nprint(1)\n```", "print(1)", "multiline tagless fence unwrapped");
+    t("```c\nint x;\n```\n", "int x;", "fence with trailing newline unwrapped");
+    t("```\nprint(1)", "```\nprint(1)", "multiline unclosed fence untouched");
     {
         char b[64];
         snprintf(b, sizeof b, "   \n\t  ");
