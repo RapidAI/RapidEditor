@@ -640,6 +640,7 @@ typedef struct notepad {
     int  session_count;
     int  session_cur[NP_SESSION_MAX];   /* caret offset per session file */
     bool make_backup;               /* keep a .bak copy when saving */
+    bool auto_save;                 /* save dirty text docs after 5 idle s */
     bool session_restore;           /* reopen last session at startup */
     bool dark_valid;                /* dark came from the config file */
 } notepad;
@@ -723,7 +724,7 @@ static bool np_any_dialog(const notepad *a) {
            a->dlg_settings || a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
-           a->dlg_math_preview || a->dlg_maclaw ||
+           a->dlg_math_preview || a->dlg_maclaw || a->dlg_reload ||
            a->dlg_llm_prov || a->dlg_ai_actions || a->dlg_smart_paste;
 }
 
@@ -1536,6 +1537,29 @@ static void np_disk_check(notepad *a) {
 
 static bool np_blank_untitled(const np_doc *d) {
     return !d->path[0] && !d->dirty && !d->text[0];
+}
+
+/* Idle auto-save for the active text document (opt-in). Reuses
+ * inline_last_edit (bumped on every edit / caret move) as the idle
+ * clock; a failed save backs off by the full idle window. Hex docs
+ * are excluded - writing binaries back silently is too risky. */
+static void np_auto_save_tick(notepad *a) {
+    if (!a->auto_save || np_any_dialog(a)) return;
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex || !d->dirty || !d->path[0]) return;
+    /* The disk copy changed while we hold unsaved edits: auto-saving would
+     * silently overwrite it, which is exactly what the np_disk_check
+     * warning is about. Leave the decision to the user. */
+    if (d->disk_mtime_seen != 0 && d->disk_mtime_seen != d->disk_mtime) return;
+    time_t now = time(NULL);
+    if (now - a->inline_last_edit < 5) return;
+    if (np_save(a, d, d->path)) {
+        char msg[NP_PATH_CAP + 32];
+        snprintf(msg, sizeof msg, "%s", np_base(d->path));
+        np_toast(a, "已自动保存", msg, CUI_TONE_SUCCESS);
+    } else {
+        a->inline_last_edit = now;      /* back off before retrying */
+    }
 }
 
 /* Open a path in a new tab (or switch to the tab that already has it). */
@@ -6008,6 +6032,7 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "follow_active")) a->follow_active = atoi(val) != 0;
         else if (!strcmp(key, "default_crlf")) a->default_crlf = atoi(val) != 0;
         else if (!strcmp(key, "make_backup")) a->make_backup = atoi(val) != 0;
+        else if (!strcmp(key, "auto_save")) a->auto_save = atoi(val) != 0;
         else if (!strcmp(key, "session_restore")) a->session_restore = atoi(val) != 0;
         else if (!strcmp(key, "match_case")) a->match_case = atoi(val) != 0;
         else if (!strcmp(key, "lt_align")) snprintf(a->ltable_align, sizeof a->ltable_align, "%s", val);
@@ -6146,10 +6171,12 @@ static void np_config_save(notepad *a) {
             a->show_preview ? 1 : 0, a->preview_ratio,
             a->show_ai ? 1 : 0, a->ai_ratio);
     fprintf(f, "follow_active=%d\ndefault_crlf=%d\nmake_backup=%d\n"
-               "session_restore=%d\nmatch_case=%d\nsystem_theme=%d\n",
+               "session_restore=%d\nmatch_case=%d\nsystem_theme=%d\n"
+               "auto_save=%d\n",
             a->follow_active ? 1 : 0, a->default_crlf ? 1 : 0,
             a->make_backup ? 1 : 0, a->session_restore ? 1 : 0,
-            a->match_case ? 1 : 0, a->dark_valid ? 0 : 1);
+            a->match_case ? 1 : 0, a->dark_valid ? 0 : 1,
+            a->auto_save ? 1 : 0);
     fprintf(f, "editor_font=%s\neditor_font_path=%s\n",
             a->font_ident[0] ? a->font_ident : "default", a->font_custom_path);
     fprintf(f, "find=%s\n",
@@ -8823,6 +8850,9 @@ static void np_frame(cui_ctx *ui, void *user) {
     /* Detect files changed outside the editor (git, other tools, builds). */
     np_disk_check(a);
 
+    /* Opt-in idle auto-save (after the disk check: it updates mtime). */
+    np_auto_save_tick(a);
+
     /* EditPlus-style "directory follows the active file". */
     if (a->follow_active && a->active != a->last_active) {
         np_doc *cur = np_cur(a);
@@ -9199,6 +9229,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "保存时创建 .bak 备份", .checked = a->make_backup))
                     a->make_backup = !a->make_backup;
+                if (cui_menu_item(ui, "自动保存（空闲 5 秒，文本模式）",
+                                  .checked = a->auto_save))
+                    a->auto_save = !a->auto_save;
                 if (cui_menu_item(ui, "启动时恢复上次会话", .checked = a->session_restore))
                     a->session_restore = !a->session_restore;
             }
@@ -9780,6 +9813,7 @@ int main(int argc, char **argv) {
     g.out_tab = 1;           /* start on the message log */
     g.last_active = -1;
     g.make_backup = true;
+    g.auto_save = false;
     g.session_restore = true;
     g.tidy_indent = true; g.tidy_join = true; g.tidy_trim = true;
     g.tidy_spaces = 4;
