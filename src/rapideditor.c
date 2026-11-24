@@ -1638,11 +1638,29 @@ static void np_confirm(notepad *a, int action, int idx) {
     a->dlg_confirm = true;
 }
 
+/* With auto-save on, a dirty text document that could have been
+ * auto-saved anyway is flushed instead of prompting - matching editor
+ * conventions where autoSave users are never asked. Documents outside
+ * auto-save's reach (untitled, hex, disk changed underneath us) still
+ * go through the normal guard. */
+static bool np_try_autosave_close(notepad *a, np_doc *d) {
+    if (!a->auto_save || !d || d->is_hex || !d->dirty || !d->path[0]) return false;
+    if (d->disk_mtime_seen != 0 && d->disk_mtime_seen != d->disk_mtime) return false;
+    return np_save(a, d, d->path);
+}
+
 static void np_request_close(notepad *a, int idx) {
     np_doc *d = np_doc_at(a, idx);
     if (!d) return;
-    if (d->dirty) np_confirm(a, ACT_CLOSE_DOC, idx);
-    else np_close_doc(a, idx);
+    if (d->dirty) {
+        if (np_try_autosave_close(a, d)) {
+            np_close_doc(a, idx);
+            return;
+        }
+        np_confirm(a, ACT_CLOSE_DOC, idx);
+    } else {
+        np_close_doc(a, idx);
+    }
 }
 
 /* Reload the current document from disk, keeping the caret/selection.
@@ -1684,6 +1702,11 @@ static void np_request_reload(notepad *a) {
 }
 
 static void np_request_quit(notepad *a) {
+    if (a->auto_save) {
+        /* flush everything auto-save could have handled on its own */
+        for (int i = 0; i < a->count; i++)
+            np_try_autosave_close(a, a->docs[i]);
+    }
     int idx = np_first_dirty(a);
     if (idx >= 0) np_confirm(a, ACT_QUIT, idx);   /* one document at a time */
     else cui_app_quit(NULL);
