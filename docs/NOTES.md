@@ -709,3 +709,18 @@ MSVC 构建通过；四组回归全绿。
   手动出口在警告里点明。
 
 MSVC 构建通过；四组回归全绿。
+
+## 配置键一致性检查（第二十五批）
+
+连续多批加配置键后做一次脚本化审查：np_config_save 写出的每个键必须
+有 load 分支，反之亦然。
+
+- 结果：**主配置 51 load / 54 save 完全配对**，无漂移（save 多出的
+  path/enc/crlf 是 draft 文件头，由 np_load_draft 专用解析，列入
+  白名单）。session 光标键实际为 session_cur%d（read 用
+  strncmp 前缀匹配），配对正确。
+- 固化为 `scripts/check_config.py`（纯文本静态检查，不需要编译器），
+  并入 run_tests.ps1 作为第一项——今后任何配置键失同步在回归阶段
+  即被抓到。负向验证过：注入假保存键可被检出。
+
+MSVC 构建通过；五项回归全绿（check_config + 4 组单测）。

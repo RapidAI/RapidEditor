@@ -50,6 +50,12 @@ function Extract-Fn([string]$signature, [string]$implPath) {
 Extract-Fn "static void np_ai_strip_code_fence(char *buf, size_t cap)" (Join-Path $out "np_ai_strip_code_fence.impl")
 Extract-Fn "static char *np_inline_clean(char *buf)" (Join-Path $out "np_inline_clean.impl")
 
+# Static config-key consistency check (needs no compiler).
+Write-Host "== check_config ==" -ForegroundColor Cyan
+python (Join-Path $repo "scripts\check_config.py")
+if ($LASTEXITCODE -ne 0) { Write-Host "CONFIG CHECK FAILED" -ForegroundColor Red; $fail++ }
+else { Write-Host "PASSED" -ForegroundColor Green }
+
 $tests = @(
     @{ name = "test_fence";   src = "scripts\test_fence.c";   link = @() },
     @{ name = "test_inline";  src = "scripts\test_inline.c";  link = @() },
