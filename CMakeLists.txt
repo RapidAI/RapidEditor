@@ -5,13 +5,13 @@ cmake_minimum_required(VERSION 3.16)
 # "required internal CMake variable not set: CMAKE_OBJCXX_COMPILE_OBJECT".
 if(APPLE)
     project(RapidEditor
-        VERSION 1.3.1
+        VERSION 1.3.2
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX OBJCXX)
 else()
     project(RapidEditor
-        VERSION 1.3.1
+        VERSION 1.3.2
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX)
