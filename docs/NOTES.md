@@ -506,3 +506,25 @@ MSVC 构建通过；test_openai / test_maclaw / test_fence 三组回归全绿。
 路径全部清零：所有对既有文档正文的写入都经过编辑器撤销栈。
 
 MSVC 构建通过；三组回归全绿。
+
+## 行内补全打磨（第十二批）
+
+审查第十批的 ghost text 实现后发现一个停摆 bug 与几个打磨点：
+
+- **停摆 bug**：应用侧用 `inline_ghost_shown` 标志记住"建议已显示"，但编辑器
+  会在 Esc、光标移动时自行清除 ghost，应用侧标志却永远不复位 → 行内补全在该
+  文档永久停摆（Esc 一次就中）。修法：CUI 新增查询 API
+  `cui_code_editor_ghost_active(ui, id)`，应用侧 idle 触发条件与工具条提示
+  都改为实时查询，删除 `inline_ghost_shown` 字段。教训：**跨层共享的"显示中"
+  状态必须以持有真相的一方（编辑器）为准做查询，不要在另一方镜像一份**。
+- **ghost 单行化**：ghost 渲染在光标所在行右侧（单行绘制），含 `\n` 的建议
+  画出来是坏的。两处防御：CUI 端 `cui_code_editor_ghost` 截断到首行；应用端
+  worker 结果先截首行再剥模型可能输出的单行围栏（```` ```xxx``` ````），
+  再做 600 字节可用性判断。
+- **手动触发**：工具条新增「补全」按钮（选中后端时显示）+ 编辑器右键菜单
+  「行内补全（光标处）」。`np_inline_manual` 只在无在途请求时发起（两个
+  worker 会竞态写共享结果缓冲，1 秒防抖窗口内等待无害）。
+- **可见性提示**：ghost 显示期间工具条右侧显示 muted 文本「Tab 接受补全 ·
+  Esc 忽略」，同样基于 ghost_active 查询。
+
+MSVC 构建通过；test_openai / test_maclaw / test_fence 三组回归全绿。

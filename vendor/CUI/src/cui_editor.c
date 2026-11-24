@@ -868,10 +868,20 @@ void cui_code_editor_ghost(cui_ctx *ui, const char *id, const char *text) {
     }
     int n = 0;
     while (text[n] && n < cap) n++;
+    /* The suggestion renders on the caret's own line, so only the first
+     * line of `text` is meaningful: drop everything after a newline. */
+    for (int i = 0; i < n; i++) {
+        if (text[i] == '\n' || text[i] == '\r') { n = i; break; }
+    }
     memcpy(s->ghost, text, (size_t)n);
     s->ghost[n] = 0;
     s->ghost_len = n;
     s->ghost_cursor = s->ed.cursor;
+}
+
+bool cui_code_editor_ghost_active(cui_ctx *ui, const char *id) {
+    cui__ed_state *s = cui__ed_get(ui, id);
+    return s->init && s->ghost_len > 0;
 }
 
 bool cui_code_editor_replace_external(cui_ctx *ui, const char *id,

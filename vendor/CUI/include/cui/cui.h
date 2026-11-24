@@ -1800,6 +1800,10 @@ CUI_API void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query
  * NULL or "" clears it. The editor clears the suggestion automatically on any
  * edit, caret move or Escape. Tab accepts it as one undoable edit. */
 CUI_API void cui_code_editor_ghost(cui_ctx *ui, const char *id, const char *text);
+/* True while the editor is showing an inline suggestion for this editor.
+ * The app cannot track the suggestion itself (the editor clears it on Escape
+ * or caret moves), so state queries go through here. */
+CUI_API bool cui_code_editor_ghost_active(cui_ctx *ui, const char *id);
 #ifndef __cplusplus
 #define cui_code_editor(ui, id, buf, cap, ...) cui_code_editor_ex((ui), (id), (buf), (cap), CUI__OPTS(cui_code_editor_opts, __VA_ARGS__))
 #endif

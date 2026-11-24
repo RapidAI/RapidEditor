@@ -519,7 +519,6 @@ typedef struct notepad {
     volatile long inline_done;          /* 0 idle 1 running 2 ok 3 fail */
     int  inline_gen;                    /* bumped on every edit / caret move */
     int  inline_res_gen;                /* generation the pending result belongs to */
-    bool inline_ghost_shown;            /* a suggestion is on screen */
     unsigned inline_last_uid;           /* doc the last activity happened in */
     int  inline_last_cursor;            /* caret at last activity */
     time_t inline_last_edit;            /* wall time of the last edit / caret move */
@@ -6809,6 +6808,16 @@ static void np_inline_worker(void *arg) {
         while (e > s && (e[-1] == ' ' || e[-1] == '\t' ||
                          e[-1] == '\r' || e[-1] == '\n')) e--;
         *e = 0;
+        /* the suggestion renders on the caret's line: keep the first line */
+        char *nl = strchr(s, '\n');
+        if (nl) *nl = 0;
+        /* models occasionally wrap one-liners in a code fence anyway */
+        size_t ln = strlen(s);
+        if (ln >= 6 && !strncmp(s, "```", 3) &&
+            !strncmp(s + ln - 3, "```", 3)) {
+            s[ln - 3] = 0;
+            s += 3;
+        }
         /* usable only when short enough to read at a glance */
         if (*s && strlen(s) < 600) snprintf(a->inline_result, sizeof a->inline_result, "%s", s);
     }
@@ -6857,6 +6866,16 @@ static void np_inline_start(notepad *a, np_doc *d) {
     NP_BEGIN_THREAD(np_inline_worker, a);
 }
 
+/* Manual trigger from the toolbar / context menu. Only fires when no request
+ * is in flight - the one-second idle window makes waiting harmless, and two
+ * workers would race on the shared result buffer. */
+static void np_inline_manual(notepad *a, np_doc *d) {
+    if (a->ai_backend < 5 || a->ai_backend - 5 >= a->llm_prov_count) return;
+    if (a->inline_done != 0 || a->ai_done == 1) return;
+    a->inline_last_edit = time(NULL);
+    np_inline_start(a, d);
+}
+
 static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     /* Keep a little headroom so ordinary typing never hits the ceiling. */
     if ((size_t)d->len + 8192 > d->cap)
@@ -6887,7 +6906,18 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                                .variant = CUI_BUTTON_GHOST))
                     np_ai_quick(a, 5);
                 }
+                if (a->ai_backend >= 5 && a->ai_backend - 5 < a->llm_prov_count) {
+                    if (cui_button(ui, "补全", .size = CUI_SIZE_SM,
+                                   .variant = CUI_BUTTON_GHOST,
+                                   .tooltip = "在光标处请求 AI 行内续写"))
+                        np_inline_manual(a, d);
+                }
                 cui_spacer(ui);
+                if (cui_code_editor_ghost_active(a->ui, d->editor_id)) {
+                    cui_text(ui, "Tab 接受补全 · Esc 忽略", .size = 11,
+                             .color = CUI_COLOR_TEXT_MUTED);
+                    cui_spacer(ui);
+                }
                 if (cui_button(ui, "智能粘贴", .size = CUI_SIZE_SM,
                                .variant = CUI_BUTTON_GHOST,
                                .tooltip = "识别表格 / JSON / 日志，转换前可预览"))
@@ -6925,6 +6955,10 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                 np_ai_quick(a, 6);
             if (cui_menu_item(ui, "续写（光标处）", .icon = CUI_ICON_SPARKLES))
                 np_ai_quick(a, 5);
+            if (cui_menu_item(ui, "行内补全（光标处）", .icon = CUI_ICON_SPARKLES,
+                              .disabled = a->ai_backend < 5 ||
+                                          a->ai_backend - 5 >= a->llm_prov_count))
+                np_inline_manual(a, d);
             for (int i = 0; i < a->ai_action_count && i < 4; i++) {
                 char label[80];
                 snprintf(label, sizeof label, "%s（自定义）", a->ai_actions[i].name);
@@ -6969,20 +7003,18 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             a->inline_last_uid = d->uid;
             a->inline_last_cursor = r.cursor;
             a->inline_last_edit = time(NULL);
-            a->inline_ghost_shown = false;
         }
         if (a->inline_done == 2) {
             a->inline_done = 0;             /* the editor keeps its own ghost state */
-            if (a->inline_res_gen == a->inline_gen && a->inline_result[0]) {
+            if (a->inline_res_gen == a->inline_gen && a->inline_result[0])
                 cui_code_editor_ghost(a->ui, d->editor_id, a->inline_result);
-                a->inline_ghost_shown = true;
-            }
         } else if (a->inline_done == 3) {
             a->inline_done = 0;             /* failures stay silent: convenience feature */
         }
         if (a->ai_inline && r.focused && !d->is_hex && d->caret == d->anchor &&
-            a->inline_done == 0 && !a->inline_ghost_shown && a->ai_done == 0 &&
+            a->inline_done == 0 && a->ai_done == 0 &&
             a->ai_backend >= 5 && a->ai_backend - 5 < a->llm_prov_count &&
+            !cui_code_editor_ghost_active(a->ui, d->editor_id) &&
             time(NULL) - a->inline_last_edit >= 1) {
             np_inline_start(a, d);
         }
@@ -8273,7 +8305,7 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
         cui_text(ui, a->ai_ctx_summary, .size = 11,
                  .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
         cui_text(ui, a->ai_inline
-                 ? "行内补全：输入停顿约 1 秒后给出灰色续写建议，Tab 接受，Esc 关闭。"
+                 ? "行内补全：输入停顿约 1 秒后给出灰色续写建议，Tab 接受，Esc 忽略；也可点工具条「补全」或编辑器右键手动触发。"
                  : "行内补全已关闭。开启后输入停顿时 AI 在光标处给出续写建议（Tab 接受）。",
                  .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
         cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
