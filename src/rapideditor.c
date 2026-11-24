@@ -372,6 +372,7 @@ typedef struct notepad {
     bool dlg_confirm, dlg_replace, dlg_goto, dlg_help, dlg_about, dlg_lang;
     bool dlg_settings;                  /* appearance / theme style settings */
     bool dlg_latex_tpl;                 /* new LaTeX document from a template */
+    bool dlg_reload;                    /* reload from disk, discarding edits */
     int  latex_tpl_pick;
 
     /* Online LaTeX template library ----------------------------------- */
@@ -1604,6 +1605,44 @@ static void np_request_close(notepad *a, int idx) {
     else np_close_doc(a, idx);
 }
 
+/* Reload the current document from disk, keeping the caret/selection.
+ * This is the manual counterpart of the automatic reload in
+ * np_disk_check: it also covers hex documents and dirty ones (whose
+ * local changes are intentionally discarded by the user). */
+static void np_do_reload(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || !d->path[0]) return;
+    int c = d->caret, sel = d->anchor;
+    bool was_quiet = a->quiet;
+    a->quiet = true;
+    bool ok = d->is_hex ? np_load_binary(a, d, d->path)
+                        : np_load_into(a, d, d->path);
+    a->quiet = was_quiet;
+    if (ok) {
+        if (!d->is_hex) {
+            c = NP_MAX(0, NP_MIN(c, d->len));
+            sel = NP_MAX(0, NP_MIN(sel, d->len));
+            cui_code_editor_select(a->ui, d->editor_id, c, sel);
+        }
+        char msg[NP_PATH_CAP + 48];
+        snprintf(msg, sizeof msg, "%s（光标位置已保留）", np_base(d->path));
+        np_toast(a, "已从磁盘重新加载", msg, CUI_TONE_INFO);
+    } else {
+        np_toast(a, "重新加载失败", "文件可能已被删除或移动", CUI_TONE_DANGER);
+    }
+}
+
+static void np_request_reload(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || !d->path[0]) return;
+    if (d->dirty) {
+        snprintf(a->confirm_desc, sizeof a->confirm_desc, "%s", np_base(d->path));
+        a->dlg_reload = true;
+    } else {
+        np_do_reload(a);
+    }
+}
+
 static void np_request_quit(notepad *a) {
     int idx = np_first_dirty(a);
     if (idx >= 0) np_confirm(a, ACT_QUIT, idx);   /* one document at a time */
@@ -2787,6 +2826,22 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         }
     }
 
+    cui_dialog(ui, "从磁盘重新加载", &a->dlg_reload,
+               .description = a->confirm_desc, .width = 420) {
+        cui_text(ui, "当前文档有未保存的修改，重新加载将放弃这些修改、"
+                     "以磁盘上的内容为准。", .size = 13);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) {
+                a->dlg_reload = false;
+            }
+            if (cui_button(ui, "放弃修改并重新加载",
+                           .variant = CUI_BUTTON_PRIMARY)) {
+                a->dlg_reload = false;
+                np_do_reload(a);
+            }
+        }
+    }
+
     cui_dialog(ui, "查找和替换", &a->dlg_replace,
                .description = "在当前文档中替换文字", .width = 440) {
         cui_column(ui, .width = CUI_FILL, .gap = 10) {
@@ -3611,6 +3666,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "编辑器内：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Tab 缩进",
             "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、括号跳转",
             "Ctrl ,          外观设置（界面风格 / 深浅色 / 强调色 / 字号密度）",
+            "Ctrl R          从磁盘重新加载当前文件（有未保存修改时先确认）",
             "Alt \\           行内 AI 补全：光标处触发续写建议，Tab 接受 / Esc 忽略",
             "Ctrl Alt 1..6   Markdown 标题级别（仅 .md），Ctrl Alt 0 恢复正文",
             "Ctrl Alt B/I    Markdown 加粗 / 斜体（仅 .md）",
@@ -8885,6 +8941,9 @@ static void np_frame(cui_ctx *ui, void *user) {
             if (cd && !cd->is_hex) np_ai_quick(a, 5);
         }
 
+        /* Reload from disk (manual counterpart of np_disk_check). */
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_R)) np_request_reload(a);
+
         /* Workspace toggles, in the spirit of EditPlus's View menu. */
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) a->show_sidebar = !a->show_sidebar;
         if (cui_key_pressed(ui, CUI_KEY_F7)) a->show_output = !a->show_output;
@@ -8961,6 +9020,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, d->is_hex ? "以文本模式重新打开" : "以十六进制模式重新打开",
                                   .icon = CUI_ICON_CPU, .disabled = !d->path[0]))
                     np_hex_reopen(a, !d->is_hex);
+                if (cui_menu_item(ui, "从磁盘重新加载", .icon = CUI_ICON_REFRESH_CW,
+                                  .shortcut = "Ctrl R", .disabled = !d->path[0]))
+                    np_request_reload(a);
                 if (cui_menu_item(ui, "关闭当前标签", .icon = CUI_ICON_X, .shortcut = "Ctrl W"))
                     np_request_close(a, a->active);
                 if (a->recent_count) {

@@ -659,3 +659,20 @@ MSVC 构建通过；四组回归全绿。
   未处理的陈旧状态，保存/重载后自然消失。
 
 MSVC 构建通过；四组回归全绿。
+
+## 手动「从磁盘重新加载」（第二十二批）
+
+外部修改闭环的最后一环：dirty / hex 文档的外部变化只能警告，用户想放弃
+本地改动拿磁盘版本只能关标签重开。
+
+- 文件菜单「从磁盘重新加载」（有路径时可用，CUI_ICON_REFRESH_CW）+
+  `Ctrl R`（未占用；F5 已被插入时间戳占用）。
+- `np_request_reload`：clean 直接重载；dirty 弹专用确认框
+  （dlg_reload，复用 confirm_desc 显示文件名），确认后
+  `np_do_reload`。
+- `np_do_reload`：hex 走 np_load_binary、文本走 np_load_into（quiet
+  抑制内部 toast，改弹「已从磁盘重新加载」）；光标/选区恢复仅文本
+  模式（hex 的 caret 语义不同）；失败弹「重新加载失败」。
+- F1 帮助面板补 Ctrl+R 条目。
+
+MSVC 构建通过；四组回归全绿。
