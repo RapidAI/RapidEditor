@@ -1614,9 +1614,21 @@ static int np_replace_all(notepad *a) {
     }
     d->tmp[o] = 0;
     if (count) {
-        memcpy(d->text, d->tmp, o + 1);
+        /* Write through the editor as ONE undo step: a raw buffer copy here
+         * would leave CUI's delta history holding stale byte offsets, and
+         * the next Ctrl+Z would corrupt unrelated text. Ctrl+Z now reverts
+         * the whole replacement. */
+        int applied_len = (int)d->len;
+        if (!cui_code_editor_replace_external(a->ui, d->editor_id,
+                                              d->text, d->cap, d->len,
+                                              0, d->len, d->tmp, (int)o,
+                                              &applied_len)) {
+            np_toast(a, "写入编辑器失败", "替换未生效", CUI_TONE_WARNING);
+            return 0;
+        }
+        d->len = applied_len;
         np_text_changed(a, d);
-        int caret = NP_MIN(d->caret, (int)o);
+        int caret = NP_MIN(d->caret, applied_len);
         cui_code_editor_select(a->ui, d->editor_id, caret, caret);
     }
     return count;
@@ -1868,9 +1880,17 @@ static bool np_latex_tidy_apply(notepad *a) {
     if (nlen >= (size_t)len) {
         if (!np_ensure_cap(d, nlen + 1)) { free(tidied); np_toast(a, "文本已满", "无法整理", CUI_TONE_WARNING); return false; }
     }
-    memcpy(d->text, tidied, nlen + 1);
-    d->len = (int)nlen;
+    int applied_len = (int)d->len;
+    bool written = cui_code_editor_replace_external(a->ui, d->editor_id,
+                                                    d->text, d->cap, d->len,
+                                                    0, d->len, tidied, (int)nlen,
+                                                    &applied_len);
     free(tidied);
+    if (!written) {
+        np_toast(a, "文本已满", "无法写入整理结果", CUI_TONE_WARNING);
+        return false;
+    }
+    d->len = applied_len;
     np_text_changed(a, d);
     if (d->caret > d->len) d->caret = d->len;
     if (d->anchor > d->len) d->anchor = d->len;

@@ -490,3 +490,19 @@ MSVC 构建通过；三组回归全绿。改动为 v1.3.0 之后的常规提交�
   即丢弃；ghost 显示期间不再发新请求，Tab 接受后立即进入新一轮防抖。
 
 MSVC 构建通过；test_openai / test_maclaw / test_fence 三组回归全绿。
+
+## 全部替换 / LaTeX 整理纳入撤销栈
+
+排查 `memcpy(d->text` 时发现两个漏网的整缓冲裸写（与第九批 np_splice 同源）：
+
+- **全部替换**（`np_replace_all`）：原来 `memcpy(d->text, d->tmp, o+1)` 直接覆盖
+  整个缓冲，CUI 撤销栈里的 delta 全部变成过期偏移，Ctrl+Z 会改坏无关文本。
+  改走 `cui_code_editor_replace_external`（0..len 全区间、单步撤销）——现在
+  Ctrl+Z 一次性还原整个替换。
+- **LaTeX 整理**（`np_latex_tidy_apply`）：同样整缓冲裸写，同法修复。
+
+`np_doc_from_latex_template` 的 memcpy 是新建文档且随后 `np_bump_editor`，
+无旧撤销栈，无需处理。至此 `memmove(d->text` 与 `memcpy(d->text` 的非初始化
+路径全部清零：所有对既有文档正文的写入都经过编辑器撤销栈。
+
+MSVC 构建通过；三组回归全绿。
