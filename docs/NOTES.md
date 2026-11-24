@@ -618,3 +618,25 @@ AI 面板新增预览块：
   侧状态管理。
 
 MSVC 构建通过；四组回归全绿。
+
+## 外部文件修改检测（第二十批）
+
+编辑器此前对磁盘上的外部改动（git checkout、其他工具、构建生成）完全无
+感知，保存会静默覆盖外部内容。本批补齐：
+
+- `np_doc` 增加 `disk_mtime`（加载/保存时记录，含 hex 加载与文本保存的
+  两条路径）与 `disk_mtime_seen`（已处理过的外部 mtime）。
+- `np_file_mtime()`：UTF-8 路径的 mtime——**Windows 上 stat() 走 ANSI
+  代码页，中文路径会失败，必须 MultiByteToWideChar + _wstat**（与
+  np_fopen_utf8 同一套约定）。
+- `np_disk_check()` 每 2 秒轮询全部文档（挂在 np_frame 的 draft 节流块旁）：
+  - clean 文本文档 → 自动重载（quiet 抑制内部「已打开」toast，改弹
+    「已重新加载」），恢复光标与选区（editor_id 已换代，需
+    cui_code_editor_select 回写）；
+  - dirty 文档 → 警告「保存将覆盖外部内容」，不自动动作（本地修改是
+    用户的工作，删除与否由用户决定）；
+  - hex 文档 → 只警告不自动刷新（解析视图/模板状态不宜静默重置）；
+  - 文件被删除 → 警告一次。
+- mtime 去重：每次变化只处理一次（seen 记录），自己保存不触发自己。
+
+MSVC 构建通过；四组回归全绿。

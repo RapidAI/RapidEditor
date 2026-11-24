@@ -259,6 +259,8 @@ typedef struct np_doc {
     uint64_t matches_key;               /* cached find-match count */
     int match_count;
     char path[NP_PATH_CAP];
+    time_t disk_mtime;                  /* file mtime at load/save; 0 = unknown */
+    time_t disk_mtime_seen;             /* last externally-changed mtime handled */
     char tex_root[NP_PATH_CAP];         /* multi-file LaTeX: main .tex to compile */
     bool tex_root_manual;               /* user explicitly pinned a main file */
     bool tex_root_probed;               /* auto-detect already ran for this tab */
@@ -337,6 +339,7 @@ typedef struct notepad {
     int  count, active;
     unsigned next_uid;
     int  editor_generation;
+    time_t disk_check_at;               /* last external-change poll */
 
     char title[NP_PATH_CAP + 128];
     char confirm_desc[NP_PATH_CAP + 128];
@@ -991,6 +994,19 @@ static FILE *np_fopen_utf8(const char *path, const char *mode) {
 #endif
 }
 
+/* mtime of a UTF-8 path, 0 when the file cannot be stat'ed (or was deleted). */
+static time_t np_file_mtime(const char *path) {
+#ifdef _WIN32
+    wchar_t w[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048) <= 0) return 0;
+    struct _stat st;
+    return _wstat(w, &st) == 0 ? st.st_mtime : 0;
+#else
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_mtime : 0;
+#endif
+}
+
 #ifdef _WIN32
 static unsigned char *np_ansi_to_utf8(const unsigned char *src, size_t n, size_t *out_n) {
     int wl = MultiByteToWideChar(CP_ACP, 0, (const char *)src, (int)n, NULL, 0);
@@ -1189,6 +1205,7 @@ static bool np_load_into(notepad *a, np_doc *d, const char *path) {
     free(raw);
 
     snprintf(d->path, sizeof d->path, "%s", path);
+    d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
     d->dirty = false;
     d->is_hex = false;
     d->enc = enc;
@@ -1264,6 +1281,7 @@ static bool np_load_binary(notepad *a, np_doc *d, const char *path) {
     d->text[got] = 0;
     d->file_size = (size_t)n;
     snprintf(d->path, sizeof d->path, "%s", path);
+    d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
     d->is_hex = true;
     d->dirty = false;
     d->enc = ENC_UTF8;
@@ -1314,6 +1332,7 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
         bool renamed = strcmp(d->path, path) != 0;
         (void)renamed;
         snprintf(d->path, sizeof d->path, "%s", path);
+        d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
         d->dirty = false;
         d->file_size = n;
         np_add_recent(a, path);
@@ -1381,6 +1400,7 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
 
     bool renamed = strcmp(d->path, path) != 0;
     snprintf(d->path, sizeof d->path, "%s", path);
+    d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
     d->dirty = false;
     d->file_size = n;
     if (renamed && !d->lang_manual) d->lang = np_detect_lang(path, d->text);
@@ -1453,6 +1473,55 @@ static void np_save_all(notepad *a) {
     snprintf(msg, sizeof msg, "已保存 %d 个文档%s", saved,
              skipped ? "，未命名文档请用「另存为」" : "");
     np_toast(a, "全部保存", msg, saved ? CUI_TONE_SUCCESS : CUI_TONE_WARNING);
+}
+
+/* ---- external file change detection -------------------------------- */
+
+/* Every couple of seconds, stat each open document's file. Clean documents
+ * reload silently (with the caret kept), dirty ones warn instead - saving
+ * them would overwrite the external changes. */
+static void np_disk_check(notepad *a) {
+    time_t now = time(NULL);
+    if (now - a->disk_check_at < 2) return;
+    a->disk_check_at = now;
+    for (int i = 0; i < a->count; i++) {
+        np_doc *d = a->docs[i];
+        if (!d->path[0]) continue;
+        time_t mt = np_file_mtime(d->path);
+        if (mt == 0) {                  /* deleted or unreadable */
+            if (d->disk_mtime != 0 && d->disk_mtime_seen != 0) {
+                d->disk_mtime_seen = 0;
+                np_toast(a, "文件已从磁盘删除", d->path, CUI_TONE_WARNING);
+            }
+            continue;
+        }
+        if (mt == d->disk_mtime || mt == d->disk_mtime_seen) continue;
+        d->disk_mtime_seen = mt;        /* handle each change once */
+        if (d->dirty) {
+            np_toast(a, "文件已在磁盘上被修改",
+                     "当前有未保存修改：直接保存将覆盖外部内容；"
+                     "如需外部版本，请先「另存为」本地内容", CUI_TONE_WARNING);
+        } else if (d->is_hex) {
+            np_toast(a, "文件已在磁盘上被修改（十六进制视图未刷新）",
+                     d->path, CUI_TONE_WARNING);
+        } else {
+            int c = d->caret, sel = d->anchor;
+            /* quiet during the reload: the "loaded" toast below replaces
+             * np_load_into's own one */
+            bool was_quiet = a->quiet;
+            a->quiet = true;
+            bool ok = np_load_into(a, d, d->path);
+            a->quiet = was_quiet;
+            if (ok) {
+                c = NP_MAX(0, NP_MIN(c, d->len));
+                sel = NP_MAX(0, NP_MIN(sel, d->len));
+                cui_code_editor_select(a->ui, d->editor_id, c, sel);
+                char msg[NP_PATH_CAP + 48];
+                snprintf(msg, sizeof msg, "%s（光标位置已保留）", np_base(d->path));
+                np_toast(a, "文件已被外部修改，已重新加载", msg, CUI_TONE_INFO);
+            }
+        }
+    }
 }
 
 static bool np_blank_untitled(const np_doc *d) {
@@ -8680,6 +8749,9 @@ static void np_frame(cui_ctx *ui, void *user) {
             last_draft_save = now;
         }
     }
+
+    /* Detect files changed outside the editor (git, other tools, builds). */
+    np_disk_check(a);
 
     /* EditPlus-style "directory follows the active file". */
     if (a->follow_active && a->active != a->last_active) {
