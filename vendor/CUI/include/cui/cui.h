@@ -1796,6 +1796,10 @@ CUI_API bool cui_code_editor_replace_external(cui_ctx *ui, const char *id,
         const char *text, int n, int *out_len);
 /* Opens the find bar with query and selects the next match (NULL closes). */
 CUI_API void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query);
+/* Shows an inline completion suggestion (ghost text) right after the caret;
+ * NULL or "" clears it. The editor clears the suggestion automatically on any
+ * edit, caret move or Escape. Tab accepts it as one undoable edit. */
+CUI_API void cui_code_editor_ghost(cui_ctx *ui, const char *id, const char *text);
 #ifndef __cplusplus
 #define cui_code_editor(ui, id, buf, cap, ...) cui_code_editor_ex((ui), (id), (buf), (cap), CUI__OPTS(cui_code_editor_opts, __VA_ARGS__))
 #endif

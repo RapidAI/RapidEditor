@@ -53,6 +53,9 @@ typedef struct {
     const char *const *bs_kw;
     cui__ed_hist hist[CUI__ED_UNDO_MAX];
     int hist_count, hist_pos;
+    char *ghost;               /* inline suggestion shown after the caret (owned) */
+    int ghost_len;             /* 0 = no suggestion */
+    int ghost_cursor;          /* caret the suggestion belongs to; any move clears */
 } cui__ed_state;
 
 static void cui__ed_dtor(cui_ctx *ui, void *data) {
@@ -63,6 +66,7 @@ static void cui__ed_dtor(cui_ctx *ui, void *data) {
     }
     for (int i = 0; i < CUI__UNDO_MAX; i++) cui__free(ui, s->ed.undo[i]);
     cui__free(ui, s->li);
+    cui__free(ui, s->ghost);
 }
 
 /* One frame of editing: the caller's buffer and the line index. */
@@ -328,6 +332,10 @@ static bool cui__ed_hist_step(cui__ed *E, bool redo) {
 
 /* ---- editing -------------------------------------------------------- */
 
+static void cui__ed_ghost_clear(cui__ed_state *st) {
+    st->ghost_len = 0;          /* the buffer stays allocated for reuse */
+}
+
 static bool cui__ed_replace(cui__ed *E, int a, int b, const char *t, int n, int kind) {
     if (E->ro) return false;
     int m = 0;
@@ -342,6 +350,7 @@ static bool cui__ed_replace(cui__ed *E, int a, int b, const char *t, int n, int 
         t = clean;
     }
     cui_edit_state *e = &E->st->ed;
+    cui__ed_ghost_clear(E->st);         /* any edit invalidates the suggestion */
     cui__ed_hist_push(E, a, b, t, m, kind);
     cui__edit_delete(E->buf, &E->len, a, b);
     int got = cui__edit_insert(E->buf, &E->len, E->cap, a, t, m);
@@ -625,6 +634,8 @@ typedef struct {
     cui_color colors[CUI__TK_COUNT];
     cui_color num, num_on, band, sel, match, match_edge, brk, brk_edge, caret, muted, line, bar;
     int vc0, vc1;               /* columns in view */
+    const char *ghost;          /* inline suggestion drawn after the caret, or NULL */
+    int ghost_len;
 } cui__ed_paint;
 
 /* Draws s[a, b) starting xoff points from the line start. Tabs expand and
@@ -791,6 +802,9 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
         float y = r.y + CUI__ED_INSET + (float)((double)p->caret_line * p->lh - p->sy);
         float cx = x0 + p->caret_px;
         cui_draw_rect(ui, (cui_rect){ roundf(cx * ui->scale) / ui->scale - 0.75f, y + ty, 1.5f, fh }, CUI_CORNERS(0.75f), cui_alpha(p->caret, a));
+        /* inline suggestion (ghost text) right after the caret */
+        if (p->ghost && p->ghost_len > 0)
+            cui__draw_text_line(ui, CUI_FONT_MONO, p->size, cx + 3.0f, y + ty, p->muted, p->ghost, -1, true);
     }
     cui_pop_clip(ui);
     /* scrollbars */
@@ -839,6 +853,25 @@ void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query) {
     s->mode = 1;
     s->bar_focus = s->pend_find = true;
     ui->animating = true;
+}
+
+void cui_code_editor_ghost(cui_ctx *ui, const char *id, const char *text) {
+    cui__ed_state *s = cui__ed_get(ui, id);
+    if (!text || !*text) {
+        s->ghost_len = 0;
+        return;
+    }
+    const int cap = 2048;
+    if (!s->ghost) {
+        s->ghost = (char *)cui__alloc(ui, (size_t)cap + 1);
+        if (!s->ghost) return;
+    }
+    int n = 0;
+    while (text[n] && n < cap) n++;
+    memcpy(s->ghost, text, (size_t)n);
+    s->ghost[n] = 0;
+    s->ghost_len = n;
+    s->ghost_cursor = s->ed.cursor;
 }
 
 bool cui_code_editor_replace_external(cui_ctx *ui, const char *id,
@@ -1203,7 +1236,10 @@ static void cui__edf_edit_keys(cui__edf *f) {
     for (int rep = ui->kpressed[CUI_KEY_ENTER]; rep > 0 && !prim; rep--) cui__ed_newline(E, f->lang_kind);
     if (cui_key_pressed(ui, CUI_KEY_TAB) && !(f->mods & CUI_MOD_CTRL)) {
         s0 = CUI_MIN(e->cursor, e->anchor); s1 = CUI_MAX(e->cursor, e->anchor);
-        if (shift || s1 > s0) cui__ed_indent(E, shift);
+        if (st->ghost_len > 0 && s1 == s0) {
+            /* accept the inline suggestion as one undoable edit */
+            cui__ed_replace(E, s0, s0, st->ghost, st->ghost_len, 1);
+        } else if (shift || s1 > s0) cui__ed_indent(E, shift);
         else {
             int col = cui__ed_caret_col(E, s0), n = E->use_tabs ? 1 : E->tab - col % E->tab;
             char sp[17];
@@ -1242,10 +1278,12 @@ static void cui__edf_keys(cui__edf *f) {
     }
     if (!E->ro) cui__edf_edit_keys(f);
     if (cui_key_pressed(ui, CUI_KEY_ESCAPE)) {
-        if (st->mode) st->mode = 0;
+        if (st->ghost_len > 0) cui__ed_ghost_clear(st);
+        else if (st->mode) st->mode = 0;
         else if (e->cursor != e->anchor) e->anchor = e->cursor;
         else st->tab_free = true;   /* the next Tab leaves the editor */
     }
+    if (st->ghost_len > 0 && e->cursor != st->ghost_cursor) cui__ed_ghost_clear(st);
     if (e->cursor != before_c || e->anchor != before_a || E->changed) {
         ui->caret_time = ui->time;
         if (vmove == 0 && vpage == 0) st->pref_col = -1;
@@ -1431,6 +1469,8 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     p->vc0 = (int)floorf(st->sx / cw) - 1;
     p->vc1 = (int)ceilf((st->sx + f->code_w + CUI__ED_GAP) / cw) + 1;
     p->caret_phase = ui->time - ui->caret_time;
+    p->ghost = st->ghost_len > 0 ? st->ghost : NULL;
+    p->ghost_len = st->ghost_len;
     p->br_line[0] = p->br_line[1] = -1;
     if (e->cursor == e->anchor && p->show_line) {
         int ba, bb;

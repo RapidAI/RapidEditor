@@ -512,6 +512,22 @@ typedef struct notepad {
     volatile long ai_stream_len;        /* bytes received so far (streaming) */
     bool ai_hist_pushed;                /* result already copied into history */
 
+    /* Inline completion (ghost text after the caret). The editor renders and
+     * accepts it (Tab) on its own; here we only decide when to ask the model.
+     * Results are validated against the generation counter before showing. */
+    bool ai_inline;                     /* enabled from the AI panel */
+    volatile long inline_done;          /* 0 idle 1 running 2 ok 3 fail */
+    int  inline_gen;                    /* bumped on every edit / caret move */
+    int  inline_res_gen;                /* generation the pending result belongs to */
+    bool inline_ghost_shown;            /* a suggestion is on screen */
+    unsigned inline_last_uid;           /* doc the last activity happened in */
+    int  inline_last_cursor;            /* caret at last activity */
+    time_t inline_last_edit;            /* wall time of the last edit / caret move */
+    char inline_url[NP_LLM_PROV_URL_CAP], inline_key[NP_LLM_PROV_KEY_CAP],
+         inline_model[NP_LLM_PROV_MODEL_CAP];       /* worker's provider snapshot */
+    char inline_prompt[8192];
+    char inline_result[1024];           /* worker-owned until shown */
+
     /* maclaw official-service login (scan QR with phone) --------------- */
     bool dlg_maclaw;
     char maclaw_center[512];            /* active HubCenter base URL */
@@ -5849,6 +5865,7 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "ai_task")) { int v = atoi(val); if (v >= 0 && v <= 6 + NP_AI_ACTION_MAX) a->ai_task = v; }
         else if (!strcmp(key, "ai_ctx")) { int v = atoi(val); if (v >= 0 && v <= 1) a->ai_ctx = v; }
         else if (!strcmp(key, "ai_ctx_tabs")) a->ai_ctx_tabs = atoi(val) != 0;
+        else if (!strcmp(key, "ai_inline")) a->ai_inline = atoi(val) != 0;
         else if (!strcmp(key, "ai_ctx_finds")) a->ai_ctx_finds = atoi(val) != 0;
         else if (!strcmp(key, "ai_backend")) { int v = atoi(val); if (v >= 0 && v <= 12) a->ai_backend = v; }
         else if (!strncmp(key, "aiact", 5) && strchr(key + 5, '_')) {
@@ -5984,11 +6001,12 @@ static void np_config_save(notepad *a) {
             a->tidy_indent ? 1 : 0, a->tidy_join ? 1 : 0,
             a->tidy_trim ? 1 : 0, a->tidy_spaces);
     fprintf(f, "font_latin=%s\nfont_cjk=%s\n", a->font_latin_name, a->font_cjk_name);
-    fprintf(f, "ai_cmd=%s\nai_inst=%s\nai_task=%d\nai_ctx=%d\nai_backend=%d\nai_ctx_tabs=%d\nai_ctx_finds=%d\n",
+    fprintf(f, "ai_cmd=%s\nai_inst=%s\nai_task=%d\nai_ctx=%d\nai_backend=%d\nai_ctx_tabs=%d\nai_ctx_finds=%d\nai_inline=%d\n",
             np_cfg_one_line(a->ai_cmd, cfgline1, sizeof cfgline1),
             np_cfg_one_line(a->ai_inst, cfgline2, sizeof cfgline2),
             a->ai_task, a->ai_ctx, a->ai_backend,
-            a->ai_ctx_tabs ? 1 : 0, a->ai_ctx_finds ? 1 : 0);
+            a->ai_ctx_tabs ? 1 : 0, a->ai_ctx_finds ? 1 : 0,
+            a->ai_inline ? 1 : 0);
     for (int i = 0; i < a->ai_action_count && i < NP_AI_ACTION_MAX; i++) {
         const np_ai_action *act = &a->ai_actions[i];
         fprintf(f, "aiact%d_name=%s\naiact%d_inst=%s\n", i,
@@ -6757,6 +6775,68 @@ static void np_smart_paste_open(notepad *a) {
     a->dlg_smart_paste = true;
 }
 
+/* ---- inline completion (ghost text) --------------------------------- */
+
+static void np_inline_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    char out[1024] = {0}, err[256] = {0};
+    bool ok = np_openai_chat(a->inline_url, a->inline_key, a->inline_model,
+                             a->inline_prompt, out, sizeof out, err, sizeof err);
+    a->inline_result[0] = 0;
+    if (ok) {
+        char *s = out, *e = out + strlen(out);
+        while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+        while (e > s && (e[-1] == ' ' || e[-1] == '\t' ||
+                         e[-1] == '\r' || e[-1] == '\n')) e--;
+        *e = 0;
+        /* usable only when short enough to read at a glance */
+        if (*s && strlen(s) < 600) snprintf(a->inline_result, sizeof a->inline_result, "%s", s);
+    }
+    a->inline_done = ok ? 2 : 3;
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+/* Fire an inline continuation request from the current caret. Called from
+ * the editor pane when the user has been idle for a moment and no request
+ * is in flight. The provider snapshot lets the worker run without touching
+ * the provider list, which the user may edit concurrently. */
+static void np_inline_start(notepad *a, np_doc *d) {
+    const np_llm_provider *p = &a->llm_prov[a->ai_backend - 5];
+    if (!p->url[0] || !p->model[0]) return;
+    int s0 = NP_MIN(d->caret, d->len);
+    int before = 2000, after = 400;
+    int from = s0 > before ? s0 - before : 0;
+    int to = s0 + after < d->len ? s0 + after : d->len;
+    /* land on UTF-8 character boundaries so the model sees valid text */
+    while (from < s0 && ((unsigned char)d->text[from] & 0xC0) == 0x80) from++;
+    while (to < d->len && ((unsigned char)d->text[to] & 0xC0) == 0x80) to++;
+    char head[2100], tail[500];
+    int hn = s0 - from, tn = to - s0;
+    if (hn >= (int)sizeof head) hn = (int)sizeof head - 1;
+    if (tn >= (int)sizeof tail) tn = (int)sizeof tail - 1;
+    memcpy(head, d->text + from, (size_t)hn); head[hn] = 0;
+    memcpy(tail, d->text + s0, (size_t)tn); tail[tn] = 0;
+    snprintf(a->inline_prompt, sizeof a->inline_prompt,
+             "你正在文本/代码编辑器里为用户提供行内续写。文件类型：%s。\n"
+             "在 <CURSOR> 标记处续写。规则：\n"
+             "1. 只输出要插入的续写文字本身，不要解释，不要 Markdown 代码块。\n"
+             "2. 最多两行、不超过 200 字符，宁短勿长。\n"
+             "3. 不要重复 <CURSOR> 之后已有的内容。\n"
+             "4. 没有合理续写时只输出一个空行。\n"
+             "---<CURSOR> 之前---\n%s\n---<CURSOR>---\n%s\n---结束---",
+             NP_LANGS[d->lang].label, head, tail);
+    snprintf(a->inline_url, sizeof a->inline_url, "%s", p->url);
+    snprintf(a->inline_key, sizeof a->inline_key, "%s", p->api_key);
+    snprintf(a->inline_model, sizeof a->inline_model, "%s", p->model);
+    a->inline_res_gen = a->inline_gen;
+    a->inline_done = 1;
+    NP_BEGIN_THREAD(np_inline_worker, a);
+}
+
 static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     /* Keep a little headroom so ordinary typing never hits the ceiling. */
     if ((size_t)d->len + 8192 > d->cap)
@@ -6860,6 +6940,32 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
         d->find_matches = r.find_matches;
         d->find_index = r.find_index;
         d->editor_focused = r.focused;
+
+        /* ---- inline completion: debounce, fire, show ------------------- */
+        bool inline_activity = r.changed || a->inline_last_uid != d->uid ||
+                               a->inline_last_cursor != r.cursor;
+        if (inline_activity) {
+            a->inline_gen++;                /* invalidates in-flight results */
+            a->inline_last_uid = d->uid;
+            a->inline_last_cursor = r.cursor;
+            a->inline_last_edit = time(NULL);
+            a->inline_ghost_shown = false;
+        }
+        if (a->inline_done == 2) {
+            a->inline_done = 0;             /* the editor keeps its own ghost state */
+            if (a->inline_res_gen == a->inline_gen && a->inline_result[0]) {
+                cui_code_editor_ghost(a->ui, d->editor_id, a->inline_result);
+                a->inline_ghost_shown = true;
+            }
+        } else if (a->inline_done == 3) {
+            a->inline_done = 0;             /* failures stay silent: convenience feature */
+        }
+        if (a->ai_inline && r.focused && !d->is_hex && d->caret == d->anchor &&
+            a->inline_done == 0 && !a->inline_ghost_shown && a->ai_done == 0 &&
+            a->ai_backend >= 5 && a->ai_backend - 5 < a->llm_prov_count &&
+            time(NULL) - a->inline_last_edit >= 1) {
+            np_inline_start(a, d);
+        }
 
         /* Same id scope as the editor above: keep the other tabs' editor
          * states alive so their undo stacks and carets survive. */
@@ -8141,10 +8247,15 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
         cui_row(ui, .width = CUI_FILL, .gap = 12, .align = CUI_ALIGN_CENTER) {
             if (cui_checkbox(ui, "其他标签页", &a->ai_ctx_tabs)) np_ai_refresh_sources(a);
             if (cui_checkbox(ui, "查找结果", &a->ai_ctx_finds)) np_ai_refresh_sources(a);
+            cui_checkbox(ui, "行内补全", &a->ai_inline);
             cui_spacer(ui);
         }
         cui_text(ui, a->ai_ctx_summary, .size = 11,
                  .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+        cui_text(ui, a->ai_inline
+                 ? "行内补全：输入停顿约 1 秒后给出灰色续写建议，Tab 接受，Esc 关闭。"
+                 : "行内补全已关闭。开启后输入停顿时 AI 在光标处给出续写建议（Tab 接受）。",
+                 .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
         cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
             cui_text(ui, a->ai_action_count
                      ? "常用指令已保存为动作，切换任务即可复用。"

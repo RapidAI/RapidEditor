@@ -471,3 +471,22 @@ MSVC 构建通过；`test_fence`(12)、`test_maclaw`、`test_openai` 全绿。
   引用列表上方。防幻觉机制不变：跳转目标与行内原文始终从本地文件读回。
 
 MSVC 构建通过；三组回归全绿。改动为 v1.3.0 之后的常规提交，未打新 tag。
+
+## 行内补全（Copilot 式 ghost text）
+
+给 CUI 编辑器与编辑器面板加上 AI 行内续写建议：
+
+- **CUI 侧**（vendor，升级需保留）：`cui__ed_state` 新增 owned 的 ghost 缓冲与
+  `ghost_cursor`；公开 `cui_code_editor_ghost(ui, id, text)`。编辑器自动管理失效：
+  任何编辑（`cui__ed_replace` 内统一清除）、光标移动、Esc 都会清掉建议；Tab 在
+  `cui__edf_edit_keys` 中把建议作为一步撤销编辑插入（走既有撤销栈）；渲染在光标
+  绘制块中以 muted 色画在光标右侧（焦点内才显示）。
+- **应用侧**：AI 面板新增「行内补全」开关（默认关，配置键 `ai_inline`）。开启且
+  后端为 OpenAI 兼容服务商时：编辑/移动光标后静置 ≥1 秒且无选区、无在途请求时，
+  取光标前后各约 2000/400 字节（按 UTF-8 边界取整）构造续写提示词，worker 快照
+  provider 配置发起 `np_openai_chat`；结果按代次（gen）校验后设为 ghost。结果
+  >600 字节或失败一律静默丢弃，不打扰输入。
+- 失效与防错位：gen 在每次编辑/移动光标时递增，worker 结果带 gen 快照，不匹配
+  即丢弃；ghost 显示期间不再发新请求，Tab 接受后立即进入新一轮防抖。
+
+MSVC 构建通过；test_openai / test_maclaw / test_fence 三组回归全绿。
