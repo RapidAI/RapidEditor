@@ -140,21 +140,27 @@ void np_openai_set_params(float temperature, int max_tokens) {
 
 /* Append sampling params when configured. Must be called with extra body
  * headroom (>= 64 bytes) reserved by the caller. */
-static void write_params(char *body, size_t cap, size_t *used) {
+static void write_params_ex(char *body, size_t cap,
+                            float temperature, int max_tokens) {
     size_t o = strlen(body);
-    if (g_temperature > 0.f)
+    if (temperature > 0.f)
         o += (size_t)snprintf(body + o, cap - o, "\"temperature\":%.2f,",
-                              (double)g_temperature);
-    if (g_max_tokens > 0)
+                              (double)temperature);
+    if (max_tokens > 0)
         o += (size_t)snprintf(body + o, cap - o, "\"max_tokens\":%d,",
-                              g_max_tokens);
+                              max_tokens);
+}
+
+static void write_params(char *body, size_t cap, size_t *used) {
+    write_params_ex(body, cap, g_temperature, g_max_tokens);
     (void)used;
 }
 
-bool np_openai_chat(const char *base_url, const char *api_key,
-                    const char *model, const char *prompt,
-                    char *out, size_t out_cap,
-                    char *err, size_t err_cap) {
+bool np_openai_chat_ex(const char *base_url, const char *api_key,
+                       const char *model, const char *prompt,
+                       float temperature, int max_tokens, int timeout_sec,
+                       char *out, size_t out_cap,
+                       char *err, size_t err_cap) {
     if (out && out_cap) out[0] = 0;
     if (err && err_cap) err[0] = 0;
     if (!base_url || !model || !prompt || !out || !out_cap) {
@@ -183,7 +189,7 @@ bool np_openai_chat(const char *base_url, const char *api_key,
         return false;
     }
     snprintf(body, body_cap, "{\"model\":\"%s\",\"stream\":false,", model);
-    write_params(body, body_cap, NULL);
+    write_params_ex(body, body_cap, temperature, max_tokens);
     size_t bo = strlen(body);
     snprintf(body + bo, body_cap - bo,
              "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
@@ -196,7 +202,7 @@ bool np_openai_chat(const char *base_url, const char *api_key,
     np_net_opts opts;
     memset(&opts, 0, sizeof opts);
     if (err) { opts.err = err; opts.err_cap = err_cap; }
-    opts.timeout_sec = 120;
+    opts.timeout_sec = timeout_sec > 0 ? timeout_sec : 120;
     int status = 0;
     char *resp = np_net_post_json(url, api_key && api_key[0] ? api_key : NULL,
                                   body, &opts, &status);
@@ -211,6 +217,15 @@ bool np_openai_chat(const char *base_url, const char *api_key,
         snprintf(err, err_cap, "LLM 服务未返回文本内容（HTTP %d）", status);
     free(resp);
     return ok;
+}
+
+bool np_openai_chat(const char *base_url, const char *api_key,
+                    const char *model, const char *prompt,
+                    char *out, size_t out_cap,
+                    char *err, size_t err_cap) {
+    return np_openai_chat_ex(base_url, api_key, model, prompt,
+                             g_temperature, g_max_tokens, 120,
+                             out, out_cap, err, err_cap);
 }
 
 /* ---- Streaming SSE chat completions ---------------------------------- */

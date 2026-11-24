@@ -41,6 +41,17 @@ bool np_openai_chat(const char *base_url, const char *api_key,
                     char *out, size_t out_cap,
                     char *err, size_t err_cap);
 
+/* Variant with per-call sampling params and timeout: temperature/max_tokens
+ * follow the np_llm_provider convention (0 = omit the JSON field), while
+ * timeout_sec overrides the default 120s. Lets lightweight callers (inline
+ * completion) stay cheap and fail fast without touching the global params
+ * set via np_openai_set_params. */
+bool np_openai_chat_ex(const char *base_url, const char *api_key,
+                       const char *model, const char *prompt,
+                       float temperature, int max_tokens, int timeout_sec,
+                       char *out, size_t out_cap,
+                       char *err, size_t err_cap);
+
 /* Streaming chat completion for OpenAI-compatible SSE endpoints. `out` is
  * appended to as each `content` delta arrives; `on_delta` is invoked with the
  * decoded delta (may be NULL). Returning false from `on_delta` aborts. */

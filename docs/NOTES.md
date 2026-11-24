@@ -547,3 +547,21 @@ MSVC 构建通过；test_openai / test_maclaw / test_fence 三组回归全绿。
   / np_maclaw.c），多源文件不能带 /Fo。
 
 MSVC 构建通过；三组回归全绿。
+
+## 行内补全请求参数独立 + 连续失败提示（第十六批）
+
+- **np_openai_chat_ex**：`np_openai_chat` 的实现搬入新变体，增加
+  per-call 的 temperature / max_tokens / timeout_sec（沿用 0=省略字段的
+  约定，timeout<=0 回落 120s）；`np_openai_chat` 变成包装（全局参数 +
+  120s）。注意 `g_temperature/g_max_tokens` 是**全局静态**（非
+  thread-local，头文件旧注释有误导），所以轻量调用者必须走 chat_ex，
+  不能在线程里 set_params——那会污染之后所有请求。
+- **行内补全改走 chat_ex**：temperature 0（省略字段）、max_tokens 400
+  （提示词要求 ≤200 字，中文 1 字约 1~2 token）、timeout 30s 快速失败。
+  之前继承全局参数：用户若设 max_tokens=4096，一次续写又慢又贵。
+- **连续失败提示**：inline_fail_streak/notified——连续 3 次失败 toast
+  一次（配置检查提醒），成功即清零复位；日常偶发失败仍然静默。
+- test_openai.c 新增 5 个 chat_ex 用例（body 携带 max_tokens/temperature、
+  0 值省略字段）。
+
+MSVC 构建通过；四组回归全绿。

@@ -62,6 +62,21 @@ int main(void) {
     CHECK(strstr(g_body, "\"model\":\"deepseek-chat\"") != NULL, "chat carries model");
     CHECK(strstr(g_body, "say \\\"hi\\\"") != NULL, "chat escapes prompt");
 
+    /* chat_ex: per-call sampling params land in the body; zero temperature
+     * omits the field (provider default) like the global-param convention. */
+    g_status = 200;
+    g_response = "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+    CHECK(np_openai_chat_ex("https://api.example.com", "sk-1", "m", "hi",
+                            0.f, 400, 30, out, sizeof out, err, sizeof err),
+          "chat_ex succeeds");
+    CHECK(strstr(g_body, "\"max_tokens\":400,") != NULL, "chat_ex sends max_tokens");
+    CHECK(strstr(g_body, "\"temperature\"") == NULL, "chat_ex omits zero temperature");
+    CHECK(np_openai_chat_ex("https://api.example.com", "sk-1", "m", "hi",
+                            0.7f, 0, 0, out, sizeof out, err, sizeof err),
+          "chat_ex default timeout works");
+    CHECK(strstr(g_body, "\"temperature\":0.70,") != NULL, "chat_ex sends temperature");
+    CHECK(strstr(g_body, "\"max_tokens\"") == NULL, "chat_ex omits zero max_tokens");
+
     /* Error path: non-2xx. */
     g_status = 401;
     g_response = NULL;

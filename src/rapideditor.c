@@ -517,6 +517,8 @@ typedef struct notepad {
      * Results are validated against the generation counter before showing. */
     bool ai_inline;                     /* enabled from the AI panel */
     int  inline_delay;                  /* idle seconds before firing (1..5) */
+    int  inline_fail_streak;            /* consecutive failed completions */
+    bool inline_fail_notified;          /* already toasted about the streak */
     volatile long inline_done;          /* 0 idle 1 running 2 ok 3 fail */
     int  inline_gen;                    /* bumped on every edit / caret move */
     int  inline_res_gen;                /* generation the pending result belongs to */
@@ -6833,8 +6835,11 @@ static char *np_inline_clean(char *buf) {
 static void np_inline_worker(void *arg) {
     notepad *a = (notepad *)arg;
     char out[1024] = {0}, err[256] = {0};
-    bool ok = np_openai_chat(a->inline_url, a->inline_key, a->inline_model,
-                             a->inline_prompt, out, sizeof out, err, sizeof err);
+    /* per-call params: short suggestions with a fast timeout, independent
+     * of the (possibly expensive) global provider settings */
+    bool ok = np_openai_chat_ex(a->inline_url, a->inline_key, a->inline_model,
+                                a->inline_prompt, 0.f, 400, 30,
+                                out, sizeof out, err, sizeof err);
     a->inline_result[0] = 0;
     if (ok) {
         char *s = np_inline_clean(out);
@@ -7026,10 +7031,18 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
         }
         if (a->inline_done == 2) {
             a->inline_done = 0;             /* the editor keeps its own ghost state */
+            a->inline_fail_streak = 0;
+            a->inline_fail_notified = false;
             if (a->inline_res_gen == a->inline_gen && a->inline_result[0])
                 cui_code_editor_ghost(a->ui, d->editor_id, a->inline_result);
         } else if (a->inline_done == 3) {
             a->inline_done = 0;             /* failures stay silent: convenience feature */
+            if (++a->inline_fail_streak >= 3 && !a->inline_fail_notified) {
+                np_toast(a, "行内补全连续失败",
+                         "请检查 AI 服务商地址 / Key / 模型设置",
+                         CUI_TONE_WARNING);
+                a->inline_fail_notified = true;
+            }
         }
         if (a->ai_inline && r.focused && !d->is_hex && d->caret == d->anchor &&
             a->inline_done == 0 && a->ai_done == 0 &&
