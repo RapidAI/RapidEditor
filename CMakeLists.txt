@@ -5,13 +5,13 @@ cmake_minimum_required(VERSION 3.16)
 # "required internal CMake variable not set: CMAKE_OBJCXX_COMPILE_OBJECT".
 if(APPLE)
     project(RapidEditor
-        VERSION 1.2.12
+        VERSION 1.3.0
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX OBJCXX)
 else()
     project(RapidEditor
-        VERSION 1.2.12
+        VERSION 1.3.0
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX)
@@ -124,8 +124,9 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/webview2/include")
 
     # CommandLineToArgvW / LocalFree for UTF-8 command lines; ws2_32 for the
-    # built-in loopback HTTP server used by the HTML Web preview.
-    target_link_libraries(RapidEditor PRIVATE shell32 ws2_32 winhttp)
+    # built-in loopback HTTP server used by the HTML Web preview; crypt32 for
+    # DPAPI-encrypted LLM API keys in config.ini.
+    target_link_libraries(RapidEditor PRIVATE shell32 ws2_32 winhttp crypt32)
 
     # Copy the architecture-matching WebView2Loader.dll next to the exe so the
     # runtime loader can find it. Detect the target CPU from the toolchain or
