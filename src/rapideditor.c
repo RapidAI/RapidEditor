@@ -261,6 +261,7 @@ typedef struct np_doc {
     char path[NP_PATH_CAP];
     time_t disk_mtime;                  /* file mtime at load/save; 0 = unknown */
     time_t disk_mtime_seen;             /* last externally-changed mtime handled */
+    bool disk_missing;                  /* the backing file vanished from disk */
     char tex_root[NP_PATH_CAP];         /* multi-file LaTeX: main .tex to compile */
     bool tex_root_manual;               /* user explicitly pinned a main file */
     bool tex_root_probed;               /* auto-detect already ran for this tab */
@@ -760,10 +761,11 @@ static void np_toast(notepad *a, const char *title, const char *desc, cui_tone t
 static void np_update_title(notepad *a) {
     np_doc *d = np_cur(a);
     char title[NP_PATH_CAP + 128];
-    snprintf(title, sizeof title, "%s%s%s - RapidEditor",
+    snprintf(title, sizeof title, "%s%s%s%s - RapidEditor",
              d && d->dirty ? "*" : "",
              d && d->path[0] ? np_base(d->path) : "未命名",
-             d && d->is_hex ? " [十六进制]" : "");
+             d && d->is_hex ? " [十六进制]" : "",
+             d && d->disk_missing ? " [文件已删除]" : "");
     if (strcmp(title, a->title) != 0) {
         snprintf(a->title, sizeof a->title, "%s", title);
         cui_app_set_title(NULL, a->title);
@@ -1206,6 +1208,7 @@ static bool np_load_into(notepad *a, np_doc *d, const char *path) {
 
     snprintf(d->path, sizeof d->path, "%s", path);
     d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
+    d->disk_missing = false;
     d->dirty = false;
     d->is_hex = false;
     d->enc = enc;
@@ -1282,6 +1285,7 @@ static bool np_load_binary(notepad *a, np_doc *d, const char *path) {
     d->file_size = (size_t)n;
     snprintf(d->path, sizeof d->path, "%s", path);
     d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
+    d->disk_missing = false;
     d->is_hex = true;
     d->dirty = false;
     d->enc = ENC_UTF8;
@@ -1333,6 +1337,7 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
         (void)renamed;
         snprintf(d->path, sizeof d->path, "%s", path);
         d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
+    d->disk_missing = false;
         d->dirty = false;
         d->file_size = n;
         np_add_recent(a, path);
@@ -1401,6 +1406,7 @@ static bool np_save(notepad *a, np_doc *d, const char *path) {
     bool renamed = strcmp(d->path, path) != 0;
     snprintf(d->path, sizeof d->path, "%s", path);
     d->disk_mtime = d->disk_mtime_seen = np_file_mtime(path);
+    d->disk_missing = false;
     d->dirty = false;
     d->file_size = n;
     if (renamed && !d->lang_manual) d->lang = np_detect_lang(path, d->text);
@@ -1489,12 +1495,15 @@ static void np_disk_check(notepad *a) {
         if (!d->path[0]) continue;
         time_t mt = np_file_mtime(d->path);
         if (mt == 0) {                  /* deleted or unreadable */
+            d->disk_missing = true;
             if (d->disk_mtime != 0 && d->disk_mtime_seen != 0) {
                 d->disk_mtime_seen = 0;
-                np_toast(a, "文件已从磁盘删除", d->path, CUI_TONE_WARNING);
+                np_toast(a, "文件已从磁盘删除",
+                         "保存本文档将以当前内容重建该文件", CUI_TONE_WARNING);
             }
             continue;
         }
+        if (d->disk_missing) d->disk_missing = false;   /* file came back */
         if (mt == d->disk_mtime || mt == d->disk_mtime_seen) continue;
         d->disk_mtime_seen = mt;        /* handle each change once */
         if (d->dirty) {
@@ -8034,14 +8043,19 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
         for (int i = 0; i < a->count; i++) {
             np_doc *t = a->docs[i];
             const char *name = t->path[0] ? np_base(t->path) : "未命名";
-            snprintf(t->tab_title, sizeof t->tab_title, "%s###npdoc%u", name, t->uid);
+            snprintf(t->tab_title, sizeof t->tab_title, "%s%s###npdoc%u",
+                     t->disk_missing ? "⚠ " : "", name, t->uid);
             char sz[48];
             np_size_str(sz, sizeof sz, t->path[0] ? t->file_size : (size_t)t->len);
-            snprintf(t->tab_tip, sizeof t->tab_tip, "%s%s  ·  %s  ·  %s%s",
+            bool stale = t->disk_mtime_seen != 0 &&
+                         t->disk_mtime_seen != t->disk_mtime;
+            snprintf(t->tab_tip, sizeof t->tab_tip, "%s%s  ·  %s  ·  %s%s%s%s",
                      t->is_hex ? "[十六进制] " : "",
                      t->path[0] ? t->path : "尚未保存到文件", sz,
                      t->is_hex ? "二进制" : NP_LANGS[t->lang].label,
-                     t->dirty ? "  ·  未保存" : "");
+                     t->dirty ? "  ·  未保存" : "",
+                     stale ? "  ·  磁盘内容已变化" : "",
+                     t->disk_missing ? "  ·  磁盘文件已删除" : "");
             tabs[i] = (cui_doc_tab){ .title = t->tab_title,
                                      .icon = t->is_hex ? CUI_ICON_CPU : CUI_ICON_FILE_TEXT,
                                      .tooltip = t->tab_tip,
