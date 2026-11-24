@@ -239,6 +239,14 @@ char *np_net_get_json(const char *url, const char *bearer,
     net_err(o, "Android 不支持此操作");
     return NULL;
 }
+bool np_net_post_json_stream(const char *url, const char *bearer, const char *body,
+                             const np_net_opts *o, int *status_out,
+                             np_net_chunk_cb cb, void *user) {
+    (void)url; (void)bearer; (void)body; (void)cb; (void)user;
+    if (status_out) *status_out = 0;
+    net_err(o, "Android 不支持此操作");
+    return false;
+}
 
 #elif defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -247,7 +255,8 @@ char *np_net_get_json(const char *url, const char *bearer,
 #include <winhttp.h>
 static char *np_net_request_win(const char *url, const char *bearer,
                                 const char *method, const char *body,
-                                const np_net_opts *o, int *status_out) {
+                                const np_net_opts *o, int *status_out,
+                                np_net_chunk_cb cb, void *user) {
     char *result = NULL;
     HINTERNET hs = NULL, hc = NULL, hr = NULL;
     if (status_out) *status_out = 0;
@@ -320,27 +329,45 @@ static char *np_net_request_win(const char *url, const char *bearer,
         net_err(o, m); goto done;
     }
 
-    size_t cap = 4096, used = 0;
-    char *buf = (char *)malloc(cap);
-    if (!buf) { net_err(o, "内存不足"); goto done; }
+    size_t cap = cb ? 0 : 4096, used = 0;
+    char *buf = cb ? NULL : (char *)malloc(cap);
+    if (!cb && !buf) { net_err(o, "内存不足"); goto done; }
     for (;;) {
+        if (net_cancelled(o)) { net_err(o, "已取消"); if (status_out) *status_out = 0; goto done; }
         DWORD avail = 0;
         if (!WinHttpQueryDataAvailable(hr, &avail) || avail == 0) break;
-        if (used + avail + 1 > cap) {
+        if (!cb && used + avail + 1 > cap) {
             while (used + avail + 1 > cap) cap *= 2;
             char *nb = (char *)realloc(buf, cap);
-            if (!nb) { free(buf); net_err(o, "内存不足"); goto done; }
+            if (!nb) { net_err(o, "内存不足"); goto done; }  /* buf freed at done */
             buf = nb;
         }
+        char chunk[16384];
         DWORD read = 0;
-        if (!WinHttpReadData(hr, buf + used, avail, &read) || !read) break;
-        used += read;
+        if (!WinHttpReadData(hr, cb ? chunk : buf + used,
+                             avail < sizeof chunk ? avail : (DWORD)sizeof chunk,
+                             &read) || !read) break;
+        if (cb) {
+            if (!cb(chunk, read, user)) {
+                /* Callback false can mean "caller buffer full" (SSE output
+                 * cap) as well as cancel. Only report cancellation when the
+                 * cancel flag is actually set, so an overlong reply is not
+                 * mislabelled "已取消" and hides the real truncation error. */
+                if (net_cancelled(o)) net_err(o, "已停止");
+                if (status_out) *status_out = 0;
+                goto done;
+            }
+        } else {
+            used += read;
+        }
     }
-    buf[used] = 0;
-    result = buf;
+    if (buf) { buf[used] = 0; result = buf; }
     net_prog(o, 100);
 
 done:
+    /* buf is handed to the caller only on the success path (result == buf).
+     * Cancel / callback-false / alloc-failure paths must release it here. */
+    if (buf && result != buf) free(buf);
     if (hr) WinHttpCloseHandle(hr);
     if (hc) WinHttpCloseHandle(hc);
     if (hs) WinHttpCloseHandle(hs);
@@ -348,11 +375,18 @@ done:
 }
 char *np_net_post_json(const char *url, const char *bearer, const char *body,
                        const np_net_opts *o, int *status_out) {
-    return np_net_request_win(url, bearer, "POST", body, o, status_out);
+    return np_net_request_win(url, bearer, "POST", body, o, status_out, NULL, NULL);
 }
 char *np_net_get_json(const char *url, const char *bearer,
                       const np_net_opts *o, int *status_out) {
-    return np_net_request_win(url, bearer, "GET", NULL, o, status_out);
+    return np_net_request_win(url, bearer, "GET", NULL, o, status_out, NULL, NULL);
+}
+bool np_net_post_json_stream(const char *url, const char *bearer, const char *body,
+                             const np_net_opts *o, int *status_out,
+                             np_net_chunk_cb cb, void *user) {
+    char *r = np_net_request_win(url, bearer, "POST", body, o, status_out, cb, user);
+    free(r);
+    return status_out && *status_out >= 200 && *status_out < 300;
 }
 
 #else
@@ -371,5 +405,13 @@ char *np_net_get_json(const char *url, const char *bearer,
     net_err(o, "POSIX 平台请使用 curl CLI 版本");
     (void)bearer;
     return NULL;
+}
+bool np_net_post_json_stream(const char *url, const char *bearer, const char *body,
+                             const np_net_opts *o, int *status_out,
+                             np_net_chunk_cb cb, void *user) {
+    (void)url; (void)bearer; (void)body; (void)cb; (void)user;
+    if (status_out) *status_out = 0;
+    net_err(o, "POSIX 平台请使用 curl CLI 版本");
+    return false;
 }
 #endif

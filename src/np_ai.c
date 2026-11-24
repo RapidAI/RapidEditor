@@ -109,10 +109,16 @@ static void quote_path(const char *p, char *out, size_t cap) {
     out[j] = 0;
 }
 
-bool np_ai_exec_timeout(const char *tpl, const char *ctx_path, const char *out_path,
-                        const char *sys, int timeout_ms, char *err, size_t err_cap) {
+bool np_ai_exec_timeout_cancel(const char *tpl, const char *ctx_path,
+                               const char *out_path, const char *sys,
+                               int timeout_ms, volatile bool *cancel,
+                               char *err, size_t err_cap) {
     (void)sys;
     if (!tpl || !ctx_path || !out_path) return false;
+    if (cancel && *cancel) {
+        if (err && err_cap) snprintf(err, err_cap, "已停止");
+        return false;
+    }
     if (err && err_cap) err[0] = 0;
     char qfile[2048], qout[2048];
     quote_path(ctx_path, qfile, sizeof qfile);
@@ -151,12 +157,33 @@ bool np_ai_exec_timeout(const char *tpl, const char *ctx_path, const char *out_p
         if (CreateProcessW(NULL, wline, NULL, NULL, FALSE,
                            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
                            NULL, NULL, &si, &pi)) {
-            DWORD wait = WaitForSingleObject(pi.hProcess, (DWORD)timeout_ms);
-            if (wait == WAIT_TIMEOUT) {
-                TerminateProcess(pi.hProcess, 1);
-                WaitForSingleObject(pi.hProcess, 5000);
-                if (err && err_cap)
-                    snprintf(err, err_cap, "AI 命令超时（%d 秒）已终止", timeout_ms / 1000);
+            DWORD waited = 0;
+            bool stopped = false;
+            for (;;) {
+                DWORD slice = 100;
+                if (timeout_ms > 0 && waited + slice >= (DWORD)timeout_ms)
+                    slice = (DWORD)timeout_ms - waited;
+                if (slice == 0) break;
+                DWORD wait = WaitForSingleObject(pi.hProcess, slice);
+                if (wait == WAIT_OBJECT_0) break;
+                waited += slice;
+                if (cancel && *cancel) {
+                    TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, 5000);
+                    if (err && err_cap) snprintf(err, err_cap, "已停止");
+                    stopped = true;
+                    break;
+                }
+                if (timeout_ms > 0 && waited >= (DWORD)timeout_ms) {
+                    TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, 5000);
+                    if (err && err_cap)
+                        snprintf(err, err_cap, "AI 命令超时（%d 秒）已终止", timeout_ms / 1000);
+                    stopped = true;
+                    break;
+                }
+            }
+            if (stopped) {
                 CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
                 return false;
             }
@@ -172,7 +199,15 @@ bool np_ai_exec_timeout(const char *tpl, const char *ctx_path, const char *out_p
     /* POSIX: system() can't be timed out portably without signals/forks; the
      * agent CLI is expected to terminate on its own here. The Windows path
      * (the primary target) has a hard timeout above. */
+    if (cancel && *cancel) {
+        if (err && err_cap) snprintf(err, err_cap, "已停止");
+        return false;
+    }
     rc = system(cmd);
+    if (cancel && *cancel) {
+        if (err && err_cap) snprintf(err, err_cap, "已停止");
+        return false;
+    }
 #endif
     (void)rc;
     FILE *f = np_ai_fopen(out_path, "rb");
@@ -191,10 +226,22 @@ bool np_ai_exec_timeout(const char *tpl, const char *ctx_path, const char *out_p
     return true;
 }
 
+bool np_ai_exec_timeout(const char *tpl, const char *ctx_path, const char *out_path,
+                        const char *sys, int timeout_ms, char *err, size_t err_cap) {
+    return np_ai_exec_timeout_cancel(tpl, ctx_path, out_path, sys,
+                                     timeout_ms, NULL, err, err_cap);
+}
+
+bool np_ai_exec_cancel(const char *tpl, const char *ctx_path, const char *out_path,
+                       const char *sys, volatile bool *cancel,
+                       char *err, size_t err_cap) {
+    return np_ai_exec_timeout_cancel(tpl, ctx_path, out_path, sys,
+                                     NP_AI_TIMEOUT_MS, cancel, err, err_cap);
+}
+
 bool np_ai_exec(const char *tpl, const char *ctx_path, const char *out_path,
                 const char *sys, char *err, size_t err_cap) {
-    return np_ai_exec_timeout(tpl, ctx_path, out_path, sys,
-                              NP_AI_TIMEOUT_MS, err, err_cap);
+    return np_ai_exec_cancel(tpl, ctx_path, out_path, sys, NULL, err, err_cap);
 }
 
 long np_ai_read_result(const char *path, char *buf, size_t cap) {

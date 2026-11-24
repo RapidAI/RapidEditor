@@ -59,12 +59,36 @@ static void json_unescape(const char *src, size_t len, char *out, size_t cap) {
                     else if (c >= 'A' && c <= 'F') cp |= (unsigned)(c - 'A' + 10);
                 }
                 i += 4;
+                /* \uD83D\uDE00 is ONE code point. Encoding each surrogate as
+                 * a 3-byte sequence yields invalid UTF-8 (ED A0 BD ...) that
+                 * shows up as mojibake in the AI panel. Keep this in sync
+                 * with np_openai_json_get_string(). */
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < len &&
+                    src[i + 1] == '\\' && src[i + 2] == 'u') {
+                    unsigned lo = 0;
+                    for (int k = 3; k <= 6; k++) {
+                        char c = src[i + k];
+                        lo <<= 4;
+                        if (c >= '0' && c <= '9') lo |= (unsigned)(c - '0');
+                        else if (c >= 'a' && c <= 'f') lo |= (unsigned)(c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') lo |= (unsigned)(c - 'A' + 10);
+                    }
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 6;                 /* consume the low surrogate */
+                    }
+                }
                 if (cp < 0x80) out[o++] = (char)cp;
                 else if (cp < 0x800) {
                     out[o++] = (char)(0xC0 | (cp >> 6));
                     if (o + 1 < cap) out[o++] = (char)(0x80 | (cp & 0x3F));
-                } else {
+                } else if (cp < 0x10000) {
                     out[o++] = (char)(0xE0 | (cp >> 12));
+                    if (o + 1 < cap) out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    if (o + 1 < cap) out[o++] = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    out[o++] = (char)(0xF0 | (cp >> 18));
+                    if (o + 1 < cap) out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
                     if (o + 1 < cap) out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                     if (o + 1 < cap) out[o++] = (char)(0x80 | (cp & 0x3F));
                 }
@@ -149,6 +173,14 @@ bool np_maclaw_pick_center(const char *centers_csv, char *out, size_t cap,
         char *resp = np_net_get_json(url, NULL, &opts, &status);
         if (resp) {
             free(resp);
+            snprintf(out, cap, "%s", norm);
+            return true;
+        }
+        /* The JSON transport rejects 3xx outright, but a redirecting
+         * /healthz still means the center is alive. The actual API calls
+         * use absolute paths and work behind the redirect, so accept a
+         * 3xx status here instead of skipping a healthy center. */
+        if (status >= 300 && status < 400) {
             snprintf(out, cap, "%s", norm);
             return true;
         }

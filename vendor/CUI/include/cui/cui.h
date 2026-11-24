@@ -1785,6 +1785,15 @@ CUI_API cui_code_editor_result cui_code_editor_ex(cui_ctx *ui, const char *id, c
 CUI_API void cui_code_editor_goto(cui_ctx *ui, const char *id, int line, int column);
 /* On the next frame: select bytes anchor..cursor, focus and scroll there. */
 CUI_API void cui_code_editor_select(cui_ctx *ui, const char *id, int anchor, int cursor);
+/* Replace bytes [a, b) in the editor's own buffer with text (n bytes), as ONE
+ * undo step, so Ctrl+Z can reverse an application-driven change (e.g. an AI
+ * rewrite). `len` is the buffer's current byte length; on success *out_len
+ * receives the new length (CR bytes in text are ignored, as with typing).
+ * The buffer must be the same one passed to cui_code_editor_ex for `id`.
+ * Returns false (buffer untouched) if the result would not fit in cap. */
+CUI_API bool cui_code_editor_replace_external(cui_ctx *ui, const char *id,
+        char *buf, size_t cap, int len, int a, int b,
+        const char *text, int n, int *out_len);
 /* Opens the find bar with query and selects the next match (NULL closes). */
 CUI_API void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query);
 #ifndef __cplusplus

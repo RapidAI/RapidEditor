@@ -51,12 +51,36 @@ bool np_openai_json_get_string(const char *json, const char *key,
                     else if (c >= 'A' && c <= 'F') cp |= (unsigned)(c - 'A' + 10);
                 }
                 s += 4;
-                if (cp < 0x80) out[o++] = (char)cp;
-                else if (cp < 0x800) {
+                /* A surrogate pair (\uD83D\uDE00) is one code point, not two
+                 * 3-byte sequences. Combining it here avoids invalid UTF-8
+                 * when a provider serializes content with ensure_ascii. */
+                if (cp >= 0xD800 && cp <= 0xDBFF &&
+                    s + 6 < p && s[1] == '\\' && s[2] == 'u') {
+                    unsigned lo = 0;
+                    for (int k = 3; k <= 6 && s + k < p; k++) {
+                        char c = s[k];
+                        lo <<= 4;
+                        if (c >= '0' && c <= '9') lo |= (unsigned)(c - '0');
+                        else if (c >= 'a' && c <= 'f') lo |= (unsigned)(c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') lo |= (unsigned)(c - 'A' + 10);
+                    }
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        s += 6;                 /* consume the low surrogate */
+                    }
+                }
+                if (cp < 0x80) {
+                    out[o++] = (char)cp;
+                } else if (cp < 0x800) {
                     out[o++] = (char)(0xC0 | (cp >> 6));
                     if (o + 1 < cap) out[o++] = (char)(0x80 | (cp & 0x3F));
-                } else {
+                } else if (cp < 0x10000) {
                     out[o++] = (char)(0xE0 | (cp >> 12));
+                    if (o + 1 < cap) out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    if (o + 1 < cap) out[o++] = (char)(0x80 | (cp & 0x3F));
+                } else {
+                    out[o++] = (char)(0xF0 | (cp >> 18));
+                    if (o + 1 < cap) out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
                     if (o + 1 < cap) out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                     if (o + 1 < cap) out[o++] = (char)(0x80 | (cp & 0x3F));
                 }
@@ -165,6 +189,146 @@ bool np_openai_chat(const char *base_url, const char *api_key,
     return ok;
 }
 
+/* ---- Streaming SSE chat completions ---------------------------------- */
+
+typedef struct np_sse_state {
+    char *out;
+    size_t cap, used;
+    char line[16384];
+    size_t line_len;
+    volatile bool *cancel;
+    np_llm_delta_cb on_delta;
+    void *user;
+    bool done, truncated;
+} np_sse_state;
+
+static bool np_sse_append(np_sse_state *s, const char *text) {
+    size_t n = strlen(text);
+    if (!n) return true;
+    if (s->used + n + 1 > s->cap) {
+        n = s->cap > s->used + 1 ? s->cap - s->used - 1 : 0;
+        s->truncated = true;
+    }
+    if (!n) return false;
+    memcpy(s->out + s->used, text, n);
+    s->used += n;
+    s->out[s->used] = 0;
+    if (s->on_delta) return s->on_delta(text, n, s->user);
+    return true;
+}
+
+static bool np_sse_line(np_sse_state *s, const char *line) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!strncmp(p, "data:", 5)) {
+        p += 5;
+        while (*p == ' ' || *p == '\t') p++;
+    } else if (*p != '{') {
+        return true;                 /* comments / keepalive */
+    }
+    if (!strcmp(p, "[DONE]")) { s->done = true; return true; }
+    if (*p != '{') return true;
+    char delta[16384];
+    if (!np_openai_json_get_string(p, "content", delta, sizeof delta) || !delta[0])
+        return true;
+    return np_sse_append(s, delta);
+}
+
+static bool np_sse_chunk_cb(const char *chunk, size_t len, void *user) {
+    np_sse_state *s = (np_sse_state *)user;
+    for (size_t i = 0; i < len; i++) {
+        if (s->cancel && *s->cancel) return false;
+        char c = chunk[i];
+        if (c == '\n') {
+            s->line[s->line_len] = 0;
+            bool keep = np_sse_line(s, s->line);
+            s->line_len = 0;
+            if (!keep) return false;
+        } else if (c != '\r') {
+            if (s->line_len + 1 >= sizeof s->line) {
+                s->line_len = 0;      /* malformed oversized line: drop it */
+                s->truncated = true;
+            } else {
+                s->line[s->line_len++] = c;
+            }
+        }
+    }
+    return true;
+}
+
+bool np_openai_chat_stream(const char *base_url, const char *api_key,
+                           const char *model, const char *prompt,
+                           char *out, size_t out_cap,
+                           char *err, size_t err_cap,
+                           volatile bool *cancel,
+                           np_llm_delta_cb on_delta, void *user) {
+    if (out && out_cap) out[0] = 0;
+    if (err && err_cap) err[0] = 0;
+    if (!base_url || !model || !prompt || !out || !out_cap) {
+        if (err && err_cap) snprintf(err, err_cap, "参数缺失");
+        return false;
+    }
+    char base[512];
+    normalize_base(base_url, base, sizeof base);
+    if (!base[0]) {
+        if (err && err_cap) snprintf(err, err_cap, "服务地址无效");
+        return false;
+    }
+    size_t esc_cap = strlen(prompt) * 6 + 64;
+    char *escaped = (char *)malloc(esc_cap);
+    if (!escaped) {
+        if (err && err_cap) snprintf(err, err_cap, "内存不足");
+        return false;
+    }
+    json_escape(prompt, escaped, esc_cap);
+    size_t body_cap = strlen(escaped) + strlen(model) + 256;
+    char *body = (char *)malloc(body_cap);
+    if (!body) {
+        free(escaped);
+        if (err && err_cap) snprintf(err, err_cap, "内存不足");
+        return false;
+    }
+    snprintf(body, body_cap,
+             "{\"model\":\"%s\",\"stream\":true,"
+             "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
+             model, escaped);
+    free(escaped);
+
+    char url[1200];
+    snprintf(url, sizeof url, "%s/v1/chat/completions", base);
+    np_net_opts opts;
+    memset(&opts, 0, sizeof opts);
+    if (err) { opts.err = err; opts.err_cap = err_cap; }
+    opts.cancel = cancel;
+    opts.timeout_sec = 180;
+
+    np_sse_state st;
+    memset(&st, 0, sizeof st);
+    st.out = out; st.cap = out_cap;
+    st.cancel = cancel; st.on_delta = on_delta; st.user = user;
+
+    int status = 0;
+    bool ok = np_net_post_json_stream(url,
+                                      api_key && api_key[0] ? api_key : NULL,
+                                      body, &opts, &status, np_sse_chunk_cb, &st);
+    free(body);
+    /* Truncation must be reported before the generic failure branch: the
+     * partial text is valid, and calling it "cancelled" hides the real cause. */
+    if (st.truncated && err && err_cap)
+        snprintf(err, err_cap, "输出超过 %zu 字节，已保留前部内容", out_cap);
+    else if (!ok && err && err_cap && !err[0]) {
+        if (cancel && *cancel) snprintf(err, err_cap, "已停止");
+        else snprintf(err, err_cap, "LLM 服务请求失败（HTTP %d）", status);
+    }
+    if (!out[0] && ok && err && err_cap && !err[0])
+        snprintf(err, err_cap, "LLM 服务未返回文本内容（HTTP %d）", status);
+    /* A truncated stream still carries valid text: report it as a partial
+     * success so the UI offers the received content for review, with the
+     * truncation reason already written into err. A genuine cancel returns
+     * ok == false from the HTTP layer and is still reported as a failure. */
+    return ok && out[0];
+}
+
 int np_openai_list_models(const char *base_url, const char *api_key,
                           char *out_csv, size_t cap,
                           char *err, size_t err_cap) {
@@ -194,10 +358,13 @@ int np_openai_list_models(const char *base_url, const char *api_key,
             snprintf(err, err_cap, "获取模型列表失败（HTTP %d）", status);
         return -1;
     }
-    /* Collect every "id":"..." occurrence. */
+    /* Collect "id":"..." occurrences inside the "data" array only. Some
+     * gateways add a top-level "id" (request id) or metadata ids; scanning
+     * the whole response would offer fake model choices. */
     int count = 0;
     size_t o = 0;
-    const char *p = resp;
+    const char *p = strstr(resp, "\"data\"");
+    if (!p) p = resp;
     while ((p = strstr(p, "\"id\"")) != NULL) {
         char id[128];
         if (!np_openai_json_get_string(p, "id", id, sizeof id) || !id[0]) {

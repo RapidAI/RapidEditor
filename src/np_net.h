@@ -44,6 +44,15 @@ char *np_net_post_json(const char *url, const char *bearer, const char *json_bod
 char *np_net_get_json(const char *url, const char *bearer,
                       const np_net_opts *opts, int *status_out);
 
+/* Streaming variant of np_net_post_json. Each response chunk is handed to
+ * `cb` as it arrives; returning false aborts the request. Returns true on a
+ * complete 2xx response (the body is NOT accumulated). Intended for SSE
+ * chat-completion endpoints, called from a worker thread. */
+typedef bool (*np_net_chunk_cb)(const char *chunk, size_t len, void *user);
+bool np_net_post_json_stream(const char *url, const char *bearer,
+                             const char *json_body, const np_net_opts *opts,
+                             int *status_out, np_net_chunk_cb cb, void *user);
+
 #ifdef __cplusplus
 }
 #endif

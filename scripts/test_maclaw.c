@@ -64,6 +64,13 @@ int main(void) {
     CHECK((unsigned char)out[0] == 0xE6 && (unsigned char)out[1] == 0xB5 &&
           (unsigned char)out[2] == 0x8B, "unicode -> UTF-8 bytes");
 
+    /* UTF-16 surrogate pair (😀 U+1F600) must become ONE 4-byte sequence. */
+    CHECK(np_json_get_string("{\"name\":\"\\ud83d\\ude00\"}", "name", out, sizeof out),
+          "parse surrogate pair");
+    CHECK((unsigned char)out[0] == 0xF0 && (unsigned char)out[1] == 0x9F &&
+          (unsigned char)out[2] == 0x98 && (unsigned char)out[3] == 0x80 &&
+          out[4] == 0, "surrogate pair -> 4-byte UTF-8");
+
     /* Missing key. */
     out[0] = 'X';
     CHECK(!np_json_get_string("{\"a\":\"b\"}", "missing", out, sizeof out) && out[0] == 0,

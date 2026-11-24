@@ -841,6 +841,38 @@ void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query) {
     ui->animating = true;
 }
 
+bool cui_code_editor_replace_external(cui_ctx *ui, const char *id,
+        char *buf, size_t cap, int len, int a, int b,
+        const char *text, int n, int *out_len) {
+    if (!ui || !buf || cap == 0 || !text || n < 0) {
+        if (out_len) *out_len = len;
+        return false;
+    }
+    if (a < 0) a = 0;
+    if (b < a) b = a;
+    if (a > len) a = len;
+    if (b > len) b = len;
+    cui__ed_state *st = cui__ed_get(ui, id);
+    if (!st->init) {
+        /* No frame has run for this editor yet: create a fresh state without
+         * stealing focus, mirroring cui_code_editor_ex's one-time setup. */
+        st->init = true;
+        st->pref_col = -1;
+        cui__state_set_dtor(ui, cui_make_id(ui, id) ^ CUI__ED_SALT, cui__ed_dtor);
+    }
+    cui__ed E;
+    memset(&E, 0, sizeof E);
+    E.ui = ui; E.st = st; E.buf = buf; E.cap = cap;
+    E.len = len;
+    E.rev = 0;                  /* caller bumps its own revision afterwards */
+    E.tab = 4;
+    E.use_tabs = false;
+    if (out_len) *out_len = len;
+    if (!cui__ed_replace(&E, a, b, text, n, 3)) return false;
+    if (out_len) *out_len = E.len;
+    return true;
+}
+
 /* how Enter indents: 1 braces (C, C++, JavaScript, TypeScript, Rust, Go,
  * JSON), 2 colons (Python), 0 neither */
 static int cui__ed_lang_kind(const char *lang) {

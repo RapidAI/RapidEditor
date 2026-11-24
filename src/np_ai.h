@@ -31,6 +31,16 @@ bool np_ai_exec(const char *tpl, const char *ctx_path, const char *out_path,
 bool np_ai_exec_timeout(const char *tpl, const char *ctx_path, const char *out_path,
                         const char *sys, int timeout_ms, char *err, size_t err_cap);
 
+/* Variants that honour a UI-owned cancel flag. The Windows worker polls the
+ * flag while waiting for the child process; POSIX checks before/after system(). */
+bool np_ai_exec_cancel(const char *tpl, const char *ctx_path, const char *out_path,
+                       const char *sys, volatile bool *cancel,
+                       char *err, size_t err_cap);
+bool np_ai_exec_timeout_cancel(const char *tpl, const char *ctx_path,
+                               const char *out_path, const char *sys,
+                               int timeout_ms, volatile bool *cancel,
+                               char *err, size_t err_cap);
+
 /* Read the result file into `buf` (UTF-8). Returns bytes read, or -1. */
 long np_ai_read_result(const char *path, char *buf, size_t cap);
 

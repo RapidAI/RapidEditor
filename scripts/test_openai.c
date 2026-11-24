@@ -24,6 +24,15 @@ char *np_net_post_json(const char *url, const char *bearer, const char *body,
     return strdup(g_response);
 }
 
+/* Streaming transport stub: these tests never exercise the stream path. */
+bool np_net_post_json_stream(const char *url, const char *bearer, const char *body,
+                             const np_net_opts *o, int *status_out,
+                             bool (*chunk_cb)(const char *, size_t, void *), void *user) {
+    (void)url; (void)bearer; (void)body; (void)o; (void)chunk_cb; (void)user;
+    if (status_out) *status_out = 0;
+    return false;
+}
+
 char *np_net_get_json(const char *url, const char *bearer,
                       const np_net_opts *o, int *status_out) {
     (void)o;
@@ -74,6 +83,15 @@ int main(void) {
     CHECK(!strcmp(g_method, "GET"), "models uses GET");
     CHECK(!strcmp(g_url, "https://api.example.com/v1/models"), "models endpoint");
     CHECK(!strcmp(g_bearer, "sk-1"), "models sends api key");
+
+    /* A top-level "id" (request id) must not be offered as a model. */
+    g_status = 200;
+    g_response = "{\"id\":\"req-abc123\",\"object\":\"list\","
+                 "\"data\":[{\"id\":\"gpt-4o\",\"object\":\"model\"}]}";
+    n = np_openai_list_models("https://api.example.com", "sk-1",
+                              csv, sizeof csv, err, sizeof err);
+    CHECK(n == 1 && !strcmp(csv, "gpt-4o"),
+          "top-level request id is not a model");
 
     /* Empty list is an error. */
     g_status = 200;

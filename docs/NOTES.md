@@ -208,3 +208,219 @@ F1 现在绑定帮助对话框（顶栏和欢迎页都提示了它）。
 验证：临时 headless 程序链接 `libcui.a` 调用两个新 API + 字体 bundle，5 款字体全部
 解压/加载/切换/恢复成功，`cui_measure_text` 对含中文的文本返回有效宽度；`python3` 逐字节
 校验 5 个 DEFLATE 流解压后与源 TTF 完全一致。启动冒烟无崩溃、中文无乱码。
+
+## AI 编辑流增强
+
+- **文件类型自适应**：`np_ai_context_label()` 把当前文档标成 LaTeX / Markdown / 代码 /
+  JSON / 纯文本，三种后端 worker 共用该标签；`np_ai_default_inst(task, doc)` 按类型返回
+  默认指令，不再把通用文档当成 LaTeX。
+- **流式与停止**：`np_net_post_json_stream()` 在 WinHTTP 层逐块回调，
+  `np_openai_chat_stream()` 解析 SSE `data:` 帧并把 `delta.content` 追加到结果；
+  UI 在生成过程中显示部分内容。`np_ai_exec_cancel()` 让本地 CLI 每 100 ms 检查一次取消，
+  Maclaw 在响应返回后检查。取消状态用 `ai_done == 5` 与 `ai_cancel` 表示，可重试。
+  POSIX 的 JSON POST 仍走原有非流式兼容路径。
+- **逐处 Diff**：`ai_staged` 保存“准备写入”的文本。`cui_diff_compute()` 给出 hunk 后，
+  接受会把 staged 向 AI 结果推进，拒绝会把结果向 staged 回退；最终写入的是 staged，
+  而不是整个 AI 回答。
+- **选区工具条**：编辑区在检测到选区时显示一行 AI 快捷按钮，复用原来的
+  `np_ai_quick()`，不需要先打开右侧面板。
+- **文档级历史**：每个 `np_doc` 保存最近 4 条 AI 结果、原上下文和目标区间，可在
+  AI 面板恢复；历史是会话级的，不写入 config.ini。
+- **草稿恢复**：`np_save_drafts()` 每 60 秒及退出时把未保存文本写入配置目录的
+  `draftN.txt`，`config.ini` 记录原路径 / 编码 / CRLF。启动时 `draft:N` 会调用
+  `np_restore_draft()` 恢复为未保存文档；十六进制文档不参与文本草稿。
+
+MSVC / Ninja 配置（`build-msvc`）已编译通过；编译时需让 `cl.exe` 能看到 MSVC 与
+Windows SDK 的 `INCLUDE` / `LIB`（通常在 Visual Studio 开发者环境中完成）。
+
+## AI 编辑流增强 · 第二批
+
+- **编译错误修复**：`np_ai_fix_compile()` 在 LaTeX 预览失败的面板中提供「让 AI 分析编译错误」，
+  把 `tex_job.log` 写入 `ai_extra`，用 `np_ai_build_prompt()` 统一拼进三种后端（本地 CLI、
+  Maclaw、OpenAI 兼容）的提示词。任务设为 4（自定义指令、Diff 展示）并强制全文上下文，
+  修复结果仍需逐处接受才写入。`ai_extra` 在 AI 面板可查看和手动移除，重试时保留。
+- **自定义 AI 动作**：`np_ai_action`（名称 + 指令，最多 8 条）持久化到 `config.ini` 的
+  `aiact<N>_name` / `aiact<N>_inst`。任务下拉索引 >= 7 即动作序号，右键菜单也列出前 4 条。
+  `np_ai_default_inst()` 接受 notepad 指针以读取动作指令；回答类结果新增「插入到光标处」
+  （`np_ai_insert_here()`，与原文目标区间隔离，避免误替换全文）与「复制结果」。
+- **智能粘贴**：`np_smart_paste_open()` 从剪贴板取内容，按首字符和逐行分隔符计数判定
+  JSON / 表格（Tab/CSV/分号）/ 日志 / 纯文本，转换结果写入 `sp_out` 供对话框预览。
+  表格按当前文档类型生成 Markdown 或 LaTeX 三线表；日志提取含 ERROR/WARN/FATAL/异常
+  关键词的行并去重（最多 40 行）。「转换并插入」与「原样粘贴」都在 `np_smart_paste_insert()`
+  里按光标位置插入并刷新行索引，不自动改写剪贴板内容。
+- 新增 `np_ai_prompt_size()` / `np_ai_build_prompt()` 统一三种后端的提示词拼装，
+  避免为附加上下文重复修改多处 worker。
+
+构建陷阱：对话框函数在前、实现在后时必须加前向声明，否则 MSVC 按隐式 `int` 推断，
+链接前的编译即报 `C2371 redefinition; different basic types`。链接时若旧 exe 正在运行，
+`LNK1104 cannot open file` 需先结束占用进程。MSVC 构建命令同上一节。
+
+## 可控上下文引用 · 第三批
+
+- **来源开关**：`ai_ctx_tabs` / `ai_ctx_finds` 两个布尔值（持久化到 `config.ini`），
+  在 AI 面板以复选框呈现。默认均为 false，即和以前一样只发选区 / 全文，不会把
+  其他标签页或搜索结果悄悄上传。
+- **统一拼装**：`np_ai_refresh_sources()` 在 UI 线程把勾选的来源拼进 `ai_ctx_sources`
+  （16 KB 上限），单个标签页只取前 4000 字节，查找结果最多 40 条，截断时置 `cut`
+  并在摘要里显示「过长内容已截取」。`np_ai_prompt_size()` / `np_ai_build_prompt()`
+  把该块和编译日志一起送进三种后端，worker 侧无需感知来源差异。
+- **发送前预览**：`ai_ctx_summary` 显示「本次发送：选区 + 其他标签页(3) + 查找结果(12)
+  + 编译日志 · 约 N KB」。勾选变化或切换标签时刷新；`np_ai_start()` 在发请求前再
+  快照一次，保证预览和实际发送一致。`ai_ctx_src_doc` 记录预览对应的标签索引。
+- **隔离**：`np_ai_quick()`（选区内联 / 右键一键操作）和 `np_ai_fix_compile()`
+  会重置两个开关，避免快捷操作意外带上无关标签页或搜索结果。
+
+## 工作区语义搜索 · 第四批
+
+- **入口**：「在文件中查找」对话框 footer 的「AI 语义搜索」，用 `ff_query` 作为自然语言描述，
+  复用 `ff_dir` / `ff_pattern` 和 `np_ff_run` 的 BFS 扫描规则（NP_FF_SKIP 目录、
+  文件数 / 扫描数上限）。
+- **提示词**：`np_sem_build_prompt()` 扫描候选文件并把每个文件按编号 + 路径 + 前 6 行摘录
+  写进 `sem_prompt`（32 KB 上限），要求 AI 只返回 `编号|行号|理由`，最多 12 条。
+- **防幻觉**：`np_sem_apply()` 只信任 AI 给的文件编号和行号，展示的原文片段由
+  `np_sem_line_text()` 从本地文件第 N 行真实读回；编号越界 / 二进制文件不会产生结果。
+  结果写入既有 `ff_hits` / `ff_paths`，复用「文件搜索」面板和 `np_open_fhit()` 跳转，
+  因此每条命中都有文件名、原文行和行号。
+- **worker**：`np_sem_worker()` 复用三种后端（本地 CLI / MaClaw / OpenAI 兼容），
+  与 AI 面板状态完全隔离（独立 `sem_*` 字段与临时文件路径），支持 `sem_cancel` 停止。
+- **状态卫生**：普通关键词搜索和清空「文件搜索」面板都会重置 `sem_done`，避免旧的
+  AI 语义结果状态残留；输出面板在 `sem_done` 变化时只 apply 一次。
+
+MSVC 构建通过（显式 INCLUDE/LIB 环境，命令同上一节）。
+
+## 隐私与配置体验 · 第五批
+
+- **API Key 遮罩**：`cui_input(..., .password = true)`，眼睛按钮可临时查看。
+- **DPAPI 加密存储**：`np_secret_save()` / `np_secret_load()` 用 `CryptProtectData` +
+  `CryptBinaryToStringA` 把密钥写成 `llm_p<N>_key=dpapi:<base64>`；读取时无前缀的值按
+  旧明文处理，解密失败（换用户 / 换机器 / 配置被篡改）则留空要求重新输入。
+  `CRYPTPROTECT_UI_FORBIDDEN` 避免后台弹 UI，明文缓冲区在释放前 `SecureZeroMemory`。
+  CMake 的 WIN32 分支新增 `crypt32` 链接；非 Windows 构建降级为明文并在 README 注明。
+  临时测试程序验证：密文不含明文、往返解密一致、旧明文兼容、损坏密文返回空。
+- **.aiignore**：`np_ignore_load()` 从扫描根目录读取，`np_ignore_check()` 匹配；
+  支持 `#` 注释、末尾 `/` 表示仅目录、`*.ext` 后缀、`*`/`?` 通配符与含 `/` 的相对路径
+  （裸名字任意层级匹配）。接入 `np_ff_run()`、`np_sem_build_prompt()` 与
+  `np_ai_refresh_sources()` 的「其他标签页」；摘要分别显示「.aiignore 已生效」和
+  「.aiignore 排除 N」。缓存按加载根目录失效。
+- **构建陷阱（复发）**：`np_ai_refresh_sources()` 调用的 ignore helper 定义在文件后部，
+  未加前向声明被 MSVC 隐式推断为 `int`，报 `C2371 redefinition; different basic types`。
+  已在该函数前补 `static` 前向声明——这是本项目第二次踩同一坑。
+
+MSVC 构建通过（显式 INCLUDE/LIB 环境，命令同上一节）。
+
+## 代码审查修复 · 第六批
+
+这一轮没有新增功能，而是审查前五批实现后修复的真实缺陷：
+
+- **AI 写入错文档 / 版本冲突（严重）**：`np_ai_apply()` 原来靠 `ai_target_path` 匹配文档，
+  但所有未命名标签的 `path` 都是 `""`，两个未命名标签会互相错写；且注释声称检查长度
+  未变，实际只 clamp 偏移。现在用 `np_doc.uid` 定位发起请求时的文档（新增
+  `ai_target_uid` / `ai_target_rev` / `ai_target_len`），要求仍是当前标签且
+  `content_rev` 与长度均未变，否则 toast 拒绝写入。AI 历史也按 uid 归属并记录快照。
+- **.aiignore 在 Windows 多级目录失效**：`np_dir_join` 产生反斜杠，与规则里的 `/`
+  比较失败；且大小写策略不一致。新增 `np_ignore_norm()` 把路径和规则统一为小写 +
+  正斜杠，所有比较分支一致不敏感。缓存失效改为按 `.aiignore` 的 `st_mtime`，原地
+  编辑后下次扫描即生效。
+- **语义搜索编号错配**：`np_sem_apply()` 原来用共享 `ff_paths` 解析 AI 返回的编号，
+  若期间跑过关键词搜索，编号会指向别的文件。新增 `sem_paths` / `sem_count` 快照，
+  结果解析前把文件表恢复为该快照，并把「搜索」按钮在语义搜索运行时禁用。
+- **流式输出边界**：SSE 缓冲满时回调返回 false 被 `np_net.c` 统一报「已取消」，
+  掩盖了真正的截断原因。现在只有 cancel 标志置位才报「已停止」，截断提示在
+  通用失败分支之前写出。`np_openai.c` 的 `\uXXXX` 解码新增 UTF-16 代理对合并，
+  `\ud83d\ude00` 现在生成合法的 4 字节 `F0 9F 98 80`，不再是非法 UTF-8。
+  临时测试程序链接 np_openai.c.obj 验证：emoji 与 BMP 字符解码均通过。
+
+MSVC 构建通过（显式 INCLUDE/LIB 环境，命令同上一节）。
+
+## 稳定性与边界修复 · 第七批
+
+沿用第六批的「先审查、逐条核实、再动手」流程；子代理报的 15 条里先对关键项
+逐字读源码确认，剔除 3 条夸大的/非问题项后再修：
+
+- **大文件 AI 结果删尾（数据丢失，严重）**：`np_ai_start()` 把 `ai_orig` 硬截到 64 KB，
+  但 `ai_target_e` 仍记完整 `d->len`；对超过 64 KB 的文档/选区做改写，接受 Diff 会把
+  AI 根本没看到的那部分正文删掉。现在截断时把 `ai_target_e` 收紧到实际发送的末尾
+  （选区 `s0+n`、全文 `n`），并弹提示「仅发送前 64 KB，其余内容保留」。
+- **补全续写插错位置**：任务 5 原来用选区起点 `s0` 作为插入点，反向/正向选中后再
+  续写会把结果插到选区前端。改为用真正的光标 `d->caret`，上下文也围绕光标取
+  （前 3000 / 后 1000 字节），不再依赖选区两端。
+- **线程句柄泄漏**：Windows 下 `NP_BEGIN_THREAD` 丢弃 `_beginthreadex` 的返回值，
+  每次 AI / 语义搜索 / 模型列表请求都漏一个内核 HANDLE。宏改为创建后立即
+  `CloseHandle`（线程自身 `_endthreadex` 不会释放句柄），POSIX 分支不变。
+- **停止 / 截断被误报为失败**：`np_ai_finish()` 原来只认 `strcmp(err,"已停止")`，
+  WinHTTP 层写的「已取消」会显示成红色「AI 调用失败」；`np_openai_chat_stream()`
+  在缓冲满时 `return ok && out[0] && !truncated`，把「部分内容有效」判成失败。
+  现在两种停止措辞都归到 `ai_done=5`，截断返回部分成功并在完成态顶部显示原因。
+- **maclaw 后端 emoji 乱码**：`np_maclaw.c` 的 `json_unescape()` 未合并 UTF-16 代理对，
+  `\ud83d\ude00` 被编成非法的 `ED A0 BD`。补齐与 `np_openai.c` 一致的高/低代理项
+  合并与 4 字节编码。`scripts/test_maclaw.c` 新增代理对回归断言，MSVC 编译运行
+  `ALL TESTS PASSED`。
+- **服务商配置跨线程写**：`np_llm_models_worker` / `np_llm_test_worker` 原来直接读写
+  `llm_prov[idx]`（URL/key/model/models），请求未返回时编辑或删除服务商会把结果写进
+  已被 `memmove` 复用的槽位。现在 start 时在 UI 线程快照到专用字段，worker 只读快照；
+  新增 `llm_prov_gen` 代次，表单 / 列表一变动就递增，worker 完成时丢弃过期结果。
+  顺带把「测试连接」的耗时从 `clock()`（CPU 时间）改为 `difftime()`（墙钟时间）。
+- **密钥解密失败无提示**：`dpapi:` 值在换账户 / 换机器后静默变空，用户只看到 401。
+  配置加载时标记 `secret_load_failed`，「LLM 服务」对话框给出明确提示，重新保存后清除。
+
+MSVC 构建通过（显式 INCLUDE/LIB 环境，命令同上一节）。
+
+## 数据完整性与撤销 · 第八批
+
+同样先只读审查、逐条核实，剔除了「ai_result strlen 竞态」等夸大项，修复 6 条真实缺陷：
+
+- **配置保存字段互相覆盖（严重，长期存在）**：`np_cfg_one_line()` 返回它写入的 buffer
+  指针，而 `np_config_save()` 在同一个 `fprintf` 里把 `cfgline1`/`cfgline2` 各用了两次
+  （maclaw_centers 与 maclaw_token、llm 的 name 与 model、url 与 models）。C 的实参都在
+  调用前求值完，两个 `%s` 拿到同一指针 → 都打印最后一次写入的值。**每次退出保存都在
+  损坏配置**：重启后中心地址变成 token、服务商 URL 变成模型串。改为每个字段一条
+  `fprintf`、各用独立 buffer；`replace=`/`workdir=` 也补上换行折叠。
+- **AI 改写无法撤销且污染撤销栈（严重）**：CUI 的 delta 撤销用绝对字节偏移，而
+  `np_ai_apply()` / `np_ai_insert_here()` 直接 `memmove` 正文、只 bump revision；AI 改写
+  改变长度后，下一次 Ctrl+Z 会拿过期偏移改错字节。给 vendor/CUI 新增公开 API
+  `cui_code_editor_replace_external()`，复用内部 `cui__ed_replace` 把外部改写记为一次
+  正常撤销步骤；两处 AI 写入改走该 API。用户现在可 Ctrl+Z 撤销 AI 改写，偏移一致，
+  帧结果 `r.changed` 仍会把 `d->len`/`content_rev` 同步回来。注意：改了 CUI 头文件触发
+  全库重编，只有既有 warning。
+- **草稿崩溃恢复元数据错配（中）**：`np_save_drafts()` 每 60 秒写快照，却只在退出时写
+  config.ini；异常退出后新快照配旧 path/enc，显式保存可能覆盖错误文件。每次快照同时
+  写 `draft<N>.meta`（path/enc/crlf），`np_restore_draft()` 优先读 meta，与字节同生共死。
+- **模型列表混入假条目（低）**：`np_openai_list_models()` 对整段响应搜 `"id"`，会把网关
+  的顶层 request id 当模型。改为只在 `"data"` 之后扫描。`scripts/test_openai.c` 补回归
+  断言（顺带补 `np_net_post_json_stream` 桩）。
+- **healthz 重定向误判（中）**：`np_net_get_json` 把 3xx 判失败，导致会跳转到 https 的
+  中心被跳过。`np_maclaw_pick_center` 在 resp 为空但 status 是 3xx 时仍视为可达。
+- **取消路径内存泄漏（低）**：`np_net_request_win` 在取消 / 回调 false / realloc 失败时
+  `goto done` 没有释放 `buf`。done 处统一 `if (buf && result != buf) free(buf)`。
+
+`scripts/test_maclaw.c`、`scripts/test_openai.c` 均 `ALL TESTS PASSED`；MSVC 构建通过。
+注意 CUI vendor 此次被修改（新增一个 API），升级 vendor 时需保留该函数。
+
+## 逐处 Diff 与撤销完整性 · 第九批
+
+继续只读审查 + 逐条核实（剔除了夸大项），修复 4 条真实缺陷并清理 1 个死配置：
+
+- **逐处 Diff 整体失效（严重，第一批引入）**：`np_ai_finish()` 把 `ai_staged` 初始化成了
+  `ai_result`，而 diff 视图比较的正是 staged vs result——两边相同，`dr.changes == 0`，
+  「接受当前处 / 拒绝当前处」永远禁用，「逐处确认后才写入」名存实亡（点「全部应用」直接
+  写整段）。按设计意图（历史恢复路径 `np_ai_restore_history` 正是把 staged 设为原文
+  `h->orig`），改为 `ai_staged = ai_orig`。
+- **智能粘贴污染撤销栈（高）**：`np_smart_paste_insert()` 裸 `memmove` 插入正文，与第八批
+  修复前的 AI 写入同源——Ctrl+Z 会拿过期字节偏移改错位置。改走
+  `cui_code_editor_replace_external()`（空区间替换 = 插入），粘贴成为一次可撤销的编辑步骤。
+- **逐处 hunk >128 时越界读（中）**：`cui_diff_compute()` 返回真实 hunk 总数但只填充前
+  `NP_AI_HUNK_MAX`(128) 项，`np_ai_hunk_decision()` 的 `idx` 却 clamp 到 `n-1`；经历史恢复
+  入口制造 >128 个 hunk 再点选后面的项，会读到未初始化栈内存并传给补丁函数。改为 clamp 到
+  `min(n, 128) - 1`。
+- **语义搜索「清空」引发并发 worker（中）**：输出面板垃圾桶在 `sem_done==1` 时直接把状态机
+  清零，旧 worker（detach、外部进程耗时）仍在写共享的 `sem_ctx_path/sem_out_path` 与
+  `sem_result`，此时可再启动一轮搜索——两轮交错写坏临时文件，旧结果还会配上新一轮路径
+  快照。改为运行中点清空只置 `sem_cancel` 并清显示文本，保留运行状态；结束后再点才真正清零。
+- **死配置 `ai_show_diff` 清理**：该字段只在配置读写与「清空对话」置 false 中出现，从未被
+  读取控制任何行为。删除字段与相关读写。
+
+MSVC 构建通过；`scripts/test_maclaw.c`、`scripts/test_openai.c` 均 `ALL TESTS PASSED`。
+
+## 版本 1.3.0
+
+九批累计改动（AI 全流程、可靠性、撤销完整性、配置/草稿安全）发布为 v1.3.0。

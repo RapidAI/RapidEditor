@@ -64,6 +64,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <wchar.h>
+#include <wincrypt.h>       /* DPAPI: encrypt saved LLM API keys */
 #endif
 
 #ifdef __ANDROID__
@@ -92,6 +93,9 @@
 #define NP_FF_BYTES    (2 * 1024 * 1024)               /* per-file scan limit */
 #define NP_FF_ROW_MAX  512                             /* entries read per directory */
 #define NP_TL_MAX      8192                            /* lines per text transform */
+#define NP_AI_HUNK_MAX 128                             /* diff decisions per result */
+#define NP_AI_HISTORY_MAX 4                            /* AI results kept per document */
+#define NP_AI_SNIP_CAP 8192                            /* per-document AI text snapshot */
 
 /* CUI stores an editor's caret/selection/undo history in its state table under
  * cui_make_id(id) ^ CUI__ED_SALT (see CUI/src/cui_editor.c). States untouched
@@ -213,6 +217,35 @@ static int np_detect_lang(const char *path, const char *text) {
 /* Application state                                                   */
 /* ------------------------------------------------------------------ */
 
+/* One AI result kept alongside a document. Enough context to restore it into
+ * the side panel later, including the exact range it was generated for. */
+typedef struct np_ai_history {
+    char result[NP_AI_SNIP_CAP];
+    char orig[NP_AI_SNIP_CAP];
+    char inst[256];
+    char target_path[NP_PATH_CAP];
+    unsigned target_uid;                /* stable document identity */
+    uint64_t target_rev;                /* content_rev at generation time */
+    int  target_len;                    /* length at generation time */
+    int  task;
+    int  target_s, target_e;
+} np_ai_history;
+
+/* A user-saved AI instruction. Tasks >= 7 index into this array. */
+#define NP_AI_ACTION_MAX 8
+typedef struct np_ai_action {
+    char name[48];
+    char inst[512];
+} np_ai_action;
+
+/* Unsaved document snapshot written on exit / periodic autosave. */
+typedef struct np_draft_entry {
+    char path[NP_PATH_CAP];             /* original file, empty for untitled */
+    char file[NP_PATH_CAP];             /* UTF-8 snapshot in the config dir */
+    int  enc;
+    bool crlf;
+} np_draft_entry;
+
 typedef struct np_doc {
     char *text;                         /* dynamically sized, NUL terminated */
     size_t cap;                         /* allocated bytes for text */
@@ -253,6 +286,9 @@ typedef struct np_doc {
     int caret, anchor, line, column, line_count;
     int chars, words, find_matches, find_index;
     bool editor_focused;
+    /* Per-document AI result history (session-scoped). */
+    np_ai_history ai_hist[NP_AI_HISTORY_MAX];
+    int  ai_hist_count, ai_hist_sel;
 } np_doc;
 
 typedef struct np_hit {
@@ -309,6 +345,8 @@ typedef struct notepad {
     char startup_bt[64];                /* --bt=<builtin> applied to opened hex docs */
     char recent[NP_RECENT_MAX][NP_PATH_CAP];
     int  recent_count;
+    np_draft_entry drafts[NP_DOC_MAX];  /* recoverable unsaved buffers */
+    int  draft_count;
 
     bool boot_done, fonts_ready, dark, line_numbers, show_status, default_crlf;
     bool quiet;                         /* no "opened" toasts while loading startup files */
@@ -442,7 +480,36 @@ typedef struct notepad {
     char ai_orig[65536];                /* original text that was sent (for diff) */
     int  ai_target_s, ai_target_e;      /* byte range in the doc to apply a rewrite */
     char ai_target_path[NP_PATH_CAP];   /* doc path the range refers to */
-    bool ai_show_diff;
+    unsigned ai_target_uid;             /* stable doc identity: untitled docs share path="" */
+    uint64_t ai_target_rev;             /* doc content_rev captured at request time */
+    int  ai_target_len;                 /* doc length captured at request time */
+    char ai_ctx_label[64];              /* "LaTeX 源码" / "Python 源码" / ... */
+    char ai_extra[8192];                /* extra context: compile log, etc. */
+    /* Controllable context: the user opts in to each extra source. All
+     * sources are assembled on the UI thread so the panel can preview them. */
+    bool ai_ctx_tabs;                   /* include other open tabs */
+    bool ai_ctx_finds;                  /* include current / in-files results */
+    char ai_ctx_sources[16384];         /* assembled optional context block */
+    char ai_ctx_summary[256];           /* pre-send "what will be included" */
+    int  ai_ctx_src_doc;                /* doc index the preview was built for */
+    np_ai_action ai_actions[NP_AI_ACTION_MAX];
+    int  ai_action_count;
+    bool dlg_ai_actions;
+    int  ai_action_edit;                /* -1 = new, >=0 = index being edited */
+    char ai_act_name[48], ai_act_inst[512];
+
+    /* Smart paste: clipboard is detected before insertion, never silently
+     * rewritten. The user chooses converted or raw at confirm time. */
+    bool dlg_smart_paste;
+    char sp_src[32768], sp_out[32768];
+    char sp_kind[48];
+    int  sp_mode;                       /* 0 table 1 JSON 2 log 3 plain */
+
+    char ai_staged[65536];              /* accepted/rejected hunks start here */
+    int  ai_diff_current;               /* selected change in the diff view */
+    volatile bool ai_cancel;            /* UI sets this to stop a worker */
+    volatile long ai_stream_len;        /* bytes received so far (streaming) */
+    bool ai_hist_pushed;                /* result already copied into history */
 
     /* maclaw official-service login (scan QR with phone) --------------- */
     bool dlg_maclaw;
@@ -464,11 +531,22 @@ typedef struct notepad {
     int  llm_prov_count;
     bool dlg_llm_prov;
     int  llm_prov_edit;                 /* index being edited, -1 = adding */
+    int  llm_prov_gen;                  /* bumped whenever the list/form changes */
+    bool secret_load_failed;            /* dpapi: value could not be decrypted */
     char llm_prov_err[256];
     volatile long llm_models_done;      /* 0 idle 1 fetching 2 ok 3 fail */
     int  llm_models_prov;               /* provider the fetch targets */
+    int  llm_models_gen;                /* generation captured when started */
+    /* UI-thread snapshots: workers never read the editable provider slots,
+     * so typing in the form cannot change a request mid-flight. */
+    char llm_models_url[NP_LLM_PROV_URL_CAP];
+    char llm_models_key[NP_LLM_PROV_KEY_CAP];
     volatile long llm_test_done;        /* 0 idle 1 testing 2 ok 3 fail */
     int  llm_test_prov;                 /* provider the test targets */
+    int  llm_test_gen;
+    char llm_test_url[NP_LLM_PROV_URL_CAP];
+    char llm_test_key[NP_LLM_PROV_KEY_CAP];
+    char llm_test_model[NP_LLM_PROV_MODEL_CAP];
     char llm_test_result[192];          /* success summary: latency + reply */
     char llm_test_err[256];
 
@@ -484,6 +562,25 @@ typedef struct notepad {
     int  ff_dirs_seen;              /* directories visited in the last run */
     np_fhit ff_hits[NP_FF_MAX];
     int  ff_hit_count;
+
+    /* AI semantic workspace search: natural-language query over the same
+     * directory/pattern as find-in-files, results reuse ff_hits so every hit
+     * keeps a filename, a source snippet and a jump-to-line target. */
+    char sem_prompt[32768];
+    /* Snapshot of the candidate table used to build the prompt. A later
+     * keyword search rewrites ff_paths; AI result ids must resolve against
+     * this frozen copy, otherwise "file 1" points at an unrelated file. */
+    char sem_paths[NP_FF_FILE_MAX][NP_PATH_CAP];
+    int  sem_count;
+    char sem_result[16384];             /* worker-owned: "id | source line" */
+    char sem_error[512];
+    volatile long sem_done;             /* 0 idle 1 running 2 ok 3 fail */
+    volatile bool sem_cancel;
+    char sem_ctx_path[NP_PATH_CAP], sem_out_path[NP_PATH_CAP];
+    char sem_summary[256];
+    int  sem_backend;                   /* snapshot taken when search starts */
+    np_llm_provider sem_prov;           /* provider snapshot for the worker */
+    int  sem_last_state;                /* UI: apply results once when done */
 
     /* Unified preview panel -------------------------------------------- */
     bool show_preview;             /* right-hand preview visible */
@@ -586,7 +683,11 @@ static bool np_ai_apply(notepad *a);
 static void np_llm_models_start(notepad *a, int prov_idx);
 static void np_llm_test_start(notepad *a, int prov_idx);
 static void np_ai_quick(notepad *a, int task);
+static void np_ai_fix_compile(notepad *a);
+static void np_sem_start(notepad *a);
 static void np_config_save(notepad *a);
+static bool np_smart_paste_insert(notepad *a, const char *text);
+static void np_smart_paste_open(notepad *a);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
@@ -594,7 +695,7 @@ static bool np_any_dialog(const notepad *a) {
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
            a->dlg_math_preview || a->dlg_maclaw ||
-           a->dlg_llm_prov;
+           a->dlg_llm_prov || a->dlg_ai_actions || a->dlg_smart_paste;
 }
 
 /* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
@@ -2421,8 +2522,114 @@ static void np_install_close_hook(void) {
 /* Dialogs                                                             */
 /* ------------------------------------------------------------------ */
 
+/* User-saved AI instructions. They are persisted immediately so a saved
+ * action survives even if the app is closed without a clean exit. */
+static void np_ai_actions_dialog(cui_ctx *ui, notepad *a) {
+    cui_dialog(ui, "自定义 AI 动作", &a->dlg_ai_actions,
+               .description = "保存常用指令，之后在 AI 面板的「任务」中一键调用",
+               .width = 640, .resizable = true, .draggable = true) {
+        cui_column(ui, .width = CUI_FILL, .gap = 8) {
+            cui_text(ui, "已保存的动作", .size = 13, .font = CUI_FONT_MEDIUM);
+            if (a->ai_action_count == 0)
+                cui_text(ui, "还没有动作。填好下面的名称与指令，点「新建」即可。",
+                         .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            for (int i = 0; i < a->ai_action_count; i++) {
+                char line[192];
+                snprintf(line, sizeof line, "%d. %s — %.60s", i + 1,
+                         a->ai_actions[i].name, a->ai_actions[i].inst);
+                cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                    cui_text(ui, line, .size = 11, .nowrap = false);
+                    if (cui_button(ui, "编辑", .size = CUI_SIZE_SM,
+                                   .variant = CUI_BUTTON_GHOST)) {
+                        a->ai_action_edit = i;
+                        snprintf(a->ai_act_name, sizeof a->ai_act_name, "%s",
+                                 a->ai_actions[i].name);
+                        snprintf(a->ai_act_inst, sizeof a->ai_act_inst, "%s",
+                                 a->ai_actions[i].inst);
+                    }
+                    if (cui_button(ui, "删除", .size = CUI_SIZE_SM,
+                                   .variant = CUI_BUTTON_GHOST)) {
+                        if (i + 1 < a->ai_action_count)
+                            memmove(&a->ai_actions[i], &a->ai_actions[i + 1],
+                                    (size_t)(a->ai_action_count - i - 1) *
+                                    sizeof a->ai_actions[0]);
+                        a->ai_action_count--;
+                        if (a->ai_action_edit >= a->ai_action_count) a->ai_action_edit = -1;
+                        if (a->ai_task >= 7 + a->ai_action_count) a->ai_task = 6;
+                        np_config_save(a);
+                    }
+                }
+            }
+            cui_separator(ui);
+            cui_input(ui, "ai-act-name", a->ai_act_name, sizeof a->ai_act_name,
+                      .label = "动作名称", .placeholder = "例如：整理成周报",
+                      .width = CUI_FILL);
+            cui_textarea(ui, "ai-act-inst", a->ai_act_inst, sizeof a->ai_act_inst,
+                         .label = "指令（当前选区或全文会附在指令之后）", .height = 90);
+            cui_text(ui, "动作只回答不改正文；结果可在 AI 面板插入光标处或复制。",
+                     .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "新建", .variant = CUI_BUTTON_GHOST)) {
+                a->ai_action_edit = -1;
+                a->ai_act_name[0] = 0;
+                a->ai_act_inst[0] = 0;
+            }
+            if (cui_button(ui, "保存动作", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->ai_act_name[0] || !a->ai_act_inst[0] ||
+                                       (a->ai_action_count >= NP_AI_ACTION_MAX &&
+                                        a->ai_action_edit < 0))) {
+                int idx = a->ai_action_edit;
+                if (idx < 0 || idx >= a->ai_action_count) idx = a->ai_action_count++;
+                snprintf(a->ai_actions[idx].name, sizeof a->ai_actions[idx].name,
+                         "%s", a->ai_act_name);
+                snprintf(a->ai_actions[idx].inst, sizeof a->ai_actions[idx].inst,
+                         "%s", a->ai_act_inst);
+                a->ai_action_edit = -1;
+                np_config_save(a);
+                np_toast(a, "已保存", "动作已加入 AI 面板的「任务」列表",
+                         CUI_TONE_SUCCESS);
+            }
+            if (cui_button(ui, "关闭")) a->dlg_ai_actions = false;
+        }
+    }
+}
+
+/* Preview before insertion. Raw paste stays one click away. */
+static void np_smart_paste_dialog(cui_ctx *ui, notepad *a) {
+    cui_dialog(ui, "智能粘贴", &a->dlg_smart_paste,
+               .description = a->sp_kind, .width = 680,
+               .resizable = true, .draggable = true) {
+        cui_column(ui, .width = CUI_FILL, .gap = 8) {
+            cui_text(ui, "转换预览", .size = 13, .font = CUI_FONT_MEDIUM);
+            cui_text(ui, "内容将插入到光标处；选「原样粘贴」则完全不转换。",
+                     .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            cui_textarea(ui, "sp-preview", a->sp_out, sizeof a->sp_out,
+                         .height = 220, .read_only = true);
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) a->dlg_smart_paste = false;
+            if (cui_button(ui, "原样粘贴", .variant = CUI_BUTTON_GHOST)) {
+                if (np_smart_paste_insert(a, a->sp_src)) {
+                    a->dlg_smart_paste = false;
+                    np_toast(a, "已粘贴", "剪贴板内容已原样插入", CUI_TONE_INFO);
+                }
+            }
+            if (cui_button(ui, "转换并插入", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->sp_out[0])) {
+                if (np_smart_paste_insert(a, a->sp_out)) {
+                    a->dlg_smart_paste = false;
+                    np_toast(a, "已粘贴", "转换后的内容已插入光标处", CUI_TONE_SUCCESS);
+                }
+            }
+        }
+    }
+}
+
 static void np_dialogs(notepad *a, cui_ctx *ui) {
     np_settings_dialog(ui, a);
+    np_ai_actions_dialog(ui, a);
+    np_smart_paste_dialog(ui, a);
 
     cui_dialog(ui, "有未保存的修改", &a->dlg_confirm,
                .description = a->confirm_desc, .width = 420) {
@@ -2509,11 +2716,20 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             cui_checkbox(ui, "区分大小写", &a->ff_case);
             cui_text(ui, "自动跳过 .git、node_modules、build 等构建目录。",
                      .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_text(ui, "想用自然语言找文件？填好上面的描述、目录和文件类型后，点「AI 语义搜索」；返回的是真实文件名、原文行和可跳转位置。",
+                     .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
         }
         cui_dialog_footer(ui) {
             if (cui_button(ui, "取消")) a->dlg_find_files = false;
+            if (cui_button(ui, a->sem_done == 1 ? "AI 搜索中…" : "AI 语义搜索",
+                           .variant = CUI_BUTTON_GHOST,
+                           .disabled = !a->ff_query[0] || a->sem_done == 1)) {
+                np_sem_start(a);
+            }
             if (cui_button(ui, "搜索", .variant = CUI_BUTTON_PRIMARY,
-                           .disabled = !a->ff_query[0])) {
+                           .disabled = !a->ff_query[0] || a->sem_done == 1)) {
+                a->sem_done = 0; a->sem_last_state = 0; a->sem_cancel = false;
+                a->sem_result[0] = 0; a->sem_summary[0] = 0;
                 np_ff_run(a);
                 a->show_output = true;
                 a->out_tab = 2;
@@ -2681,7 +2897,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
      * OpenAI-compatible providers; the AI dialog's backend select switches
      * between them. */
     cui_dialog(ui, "LLM 服务", &a->dlg_llm_prov,
-               .description = "管理 maclaw 官方服务与自定义 LLM 服务商；在 AI 助手的「后端」下拉中切换",
+               .description = "管理 maclaw 官方服务与自定义 LLM 服务商；API Key 以圆点显示，Windows 下用系统加密保存",
                .width = 660) {
         /* --- maclaw official service --- */
         cui_text(ui, "maclaw 官方服务", .size = 13, .font = CUI_FONT_MEDIUM);
@@ -2718,12 +2934,14 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             cui_row(ui, .width = CUI_FILL, .gap = 6) {
                 cui_text(ui, line, .size = 12);
                 if (cui_button(ui, "编辑")) {
+                    a->llm_prov_gen++;          /* invalidate in-flight tasks */
                     a->llm_prov_edit = i;
                     a->llm_test_done = 0;
                     a->llm_test_result[0] = 0;
                     a->llm_test_err[0] = 0;
                 }
                 if (cui_button(ui, "删除")) {
+                    a->llm_prov_gen++;
                     for (int j = i; j < a->llm_prov_count - 1; j++)
                         a->llm_prov[j] = a->llm_prov[j + 1];
                     a->llm_prov_count--;
@@ -2737,6 +2955,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                      .size = 12, .color = CUI_COLOR_TEXT_MUTED);
         if (a->llm_prov_count < 8 && a->llm_prov_edit < 0) {
             if (cui_button(ui, "添加服务商")) {
+                a->llm_prov_gen++;
                 int idx = a->llm_prov_count;
                 memset(&a->llm_prov[idx], 0, sizeof(np_llm_provider));
                 a->llm_prov_edit = idx;
@@ -2760,7 +2979,12 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                       .label = "服务地址", .placeholder = "例如 https://api.deepseek.com",
                       .width = CUI_FILL);
             cui_input(ui, "llm-pkey", p->api_key, sizeof p->api_key,
-                      .label = "API Key", .width = CUI_FILL);
+                      .label = "API Key", .password = true, .width = CUI_FILL);
+            cui_text(ui, "Windows 下密钥加密后仅本机当前账户可用；换机器需重新填写。",
+                     .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+            if (a->secret_load_failed)
+                cui_text(ui, "有已保存的密钥无法在本机解密（换了账户或配置文件被移动），请重新填写。",
+                         .size = 11, .color = CUI_COLOR_WARNING, .nowrap = false);
             cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
                 cui_input(ui, "llm-pmodel", p->model, sizeof p->model,
                           .label = "模型", .placeholder = "例如 deepseek-chat（可手动输入，或在下方点选）",
@@ -2805,14 +3029,19 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             if (a->llm_test_done == 3 && a->llm_test_err[0])
                 cui_text(ui, a->llm_test_err, .size = 11, .color = CUI_COLOR_DANGER);
             cui_dialog_footer(ui) {
-                if (cui_button(ui, "取消")) a->llm_prov_edit = -1;
+                if (cui_button(ui, "取消")) {
+                    a->llm_prov_gen++;
+                    a->llm_prov_edit = -1;
+                }
                 if (cui_button(ui, "保存", .variant = CUI_BUTTON_PRIMARY,
                                .disabled = !p->url[0] || !p->model[0])) {
                     if (!p->name[0])
                         snprintf(p->name, sizeof p->name, "服务商 %d", idx + 1);
+                    a->llm_prov_gen++;
                     if (is_new) a->llm_prov_count++;
                     a->llm_prov_edit = -1;
                     a->llm_models_done = 0;
+                    a->secret_load_failed = false;   /* user acknowledged/re-entered */
                 }
             }
         }
@@ -3565,8 +3794,14 @@ static void np_import_latex_zip(notepad *a) {
 
 #ifdef _WIN32
 #include <process.h>
-#define NP_BEGIN_THREAD(fn, arg) _beginthreadex(NULL, 0, \
-    (unsigned (__stdcall *)(void *))(fn), (arg), 0, NULL)
+/* _beginthreadex returns a handle that must be closed by the creator; the
+ * worker itself only calls _endthreadex, which does NOT release the handle.
+ * Closing right after creation is safe — the thread keeps running. */
+#define NP_BEGIN_THREAD(fn, arg) do { \
+    HANDLE _th = (HANDLE)_beginthreadex(NULL, 0, \
+        (unsigned (__stdcall *)(void *))(fn), (arg), 0, NULL); \
+    if (_th) CloseHandle(_th); \
+} while (0)
 #else
 #define NP_BEGIN_THREAD(fn, arg) ({ pthread_t _t; \
     pthread_create(&_t, NULL, (void *(*)(void *))(fn), (arg)); \
@@ -3637,32 +3872,205 @@ static void np_tt_install_worker(void *arg) {
 #endif
 }
 
+/* Shared completion bookkeeping: stage the result for hunk decisions and
+ * publish it to the UI thread via the volatile state flag. */
+static void np_ai_finish(notepad *a, bool ok) {
+    if (ok) {
+        /* The staged buffer starts as the ORIGINAL text sent to the model:
+         * the diff view compares staged vs result, and each accepted hunk
+         * advances staged toward the result. Seeding it with the result
+         * would make the two sides identical and the hunk buttons dead. */
+        snprintf(a->ai_staged, sizeof a->ai_staged, "%s", a->ai_orig);
+        a->ai_done = 2;
+    } else {
+        /* Different layers word cancellation differently ("已停止" in the
+         * stream decoder, "已取消" in the HTTP layer). Treat both as a user
+         * stop; only an empty error means a plain failure. */
+        bool stopped = a->ai_cancel &&
+            (!a->ai_error[0] || !strcmp(a->ai_error, "已停止") ||
+             !strcmp(a->ai_error, "已取消"));
+        a->ai_done = stopped ? 5 : 3;
+    }
+}
+
+static bool np_ai_is_rewrite(int task) {
+    return task == 0 || task == 1 || task == 4;
+}
+
+/* Short human-readable context label used in every AI prompt. Keeping this
+ * out of the workers means all three backends describe the same content. */
+static void np_ai_context_label(const np_doc *d, char *out, size_t cap) {
+    if (!d) { snprintf(out, cap, "文本"); return; }
+    if (np_doc_is_latex(d)) snprintf(out, cap, "LaTeX 源码");
+    else if (np_doc_is_markdown(d)) snprintf(out, cap, "Markdown 文档");
+    else if (d->lang == np_lang_index("json")) snprintf(out, cap, "JSON 数据");
+    else if (d->lang == np_lang_index("sql")) snprintf(out, cap, "SQL 代码");
+    else if (d->lang > NP_LANG_TEXT && d->lang < NP_LANG_COUNT)
+        snprintf(out, cap, "%s 代码", NP_LANGS[d->lang].label);
+    else snprintf(out, cap, "文本");
+}
+
+/* Streaming callback: the OpenAI helper has already appended the delta to
+ * ai_result; publish its length so the panel can show partial output. */
+static bool np_ai_delta_cb(const char *delta, size_t len, void *user) {
+    notepad *a = (notepad *)user;
+    (void)delta; (void)len;
+    a->ai_stream_len = (long)strlen(a->ai_result);
+    return !(a->ai_cancel);
+}
+
+/* ---- controllable context ----------------------------------------- */
+/* Append into a fixed buffer, always leaving room for the NUL. */
+static size_t np_ctx_app(char *out, size_t cap, size_t o, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(out + o, cap - o, fmt, ap);
+    va_end(ap);
+    if (w < 0) return o;
+    return (o + (size_t)w >= cap) ? cap - 1 : o + (size_t)w;
+}
+
+/* Forward declarations: defined with the file-scan helpers below, but needed
+ * here when assembling the opt-in context on the UI thread. */
+static void np_ignore_load(const char *root);
+static bool np_ignore_check(const char *root, const char *dir,
+                            const char *name, bool is_dir);
+
+/* Assemble every opt-in source into one block. Runs on the UI thread so the
+ * preview and the request use exactly the same bytes. Long tabs and result
+ * lists are capped; the summary tells the user where content was cut. */
+static void np_ai_refresh_sources(notepad *a) {
+    if (!a) return;
+    np_doc *cur = np_cur(a);
+    size_t o = 0;
+    int ntabs = 0, nfinds = 0, nign = 0;
+    bool cut = false;
+    const char *ign_root = a->side_dir[0] ? a->side_dir : ".";
+    np_ignore_load(ign_root);
+
+    if (a->ai_ctx_tabs) {
+        o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                       "--- 其他已打开标签页 ---\n");
+        for (int i = 0; i < a->count; i++) {
+            np_doc *t = a->docs[i];
+            if (!t || t == cur || t->is_hex || !t->text) continue;
+            if (t->path[0] && np_ignore_check(ign_root, "", np_base(t->path), false)) {
+                nign++;              /* private file: never send it to the AI */
+                continue;
+            }
+            const char *name = t->path[0] ? t->path : t->tab_title;
+            size_t n = strlen(t->text);
+            if (n > 4000) { n = 4000; cut = true; }
+            o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                           "【%s】(前 %zu 字节)\n%.*s\n", name, n, (int)n, t->text);
+            ntabs++;
+            if (o >= sizeof a->ai_ctx_sources - 256) { cut = true; break; }
+        }
+    }
+    if (a->ai_ctx_finds) {
+        o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                       "%s--- 查找结果 ---\n", o ? "\n" : "");
+        if (a->hit_count > 0 && a->find_query[0]) {
+            nfinds = a->hit_count;
+            o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                           "当前文件「%s」共 %d 处，附前 40 处：\n",
+                           a->find_query, a->hit_count);
+            for (int i = 0; i < a->hit_count && i < 40; i++)
+                o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                               "第%d行: %s\n", a->hits[i].line, a->hits[i].text);
+            if (a->hit_count > 40) cut = true;
+        } else if (a->ff_hit_count > 0) {
+            nfinds = a->ff_hit_count;
+            o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                           "目录搜索「%s」共 %d 处，附前 40 处：\n",
+                           a->ff_query, a->ff_hit_count);
+            for (int i = 0; i < a->ff_hit_count && i < 40; i++) {
+                const np_fhit *h = &a->ff_hits[i];
+                const char *p = (h->file >= 0 && h->file < a->ff_count)
+                                    ? a->ff_paths[h->file] : "";
+                o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                               "%s:%d: %s\n", p, h->line, h->text);
+            }
+            if (a->ff_hit_count > 40) cut = true;
+        }
+    }
+    if (o >= sizeof a->ai_ctx_sources - 256) cut = true;
+    a->ai_ctx_sources[o] = 0;
+
+    /* Pre-send summary: what is included, roughly how big, where cut. */
+    size_t main_len = 0;
+    const char *main_label = "全文";
+    if (cur) {
+        int s0 = NP_MIN(cur->caret, cur->anchor), s1 = NP_MAX(cur->caret, cur->anchor);
+        s0 = NP_MAX(0, NP_MIN(s0, cur->len));
+        s1 = NP_MAX(s0, NP_MIN(s1, cur->len));
+        if (a->ai_task == 5) { main_label = "光标附近"; main_len = (size_t)cur->len; }
+        else if (a->ai_ctx == 0 && s1 > s0) {
+            main_label = "当前选区"; main_len = (size_t)(s1 - s0);
+        } else main_len = (size_t)cur->len;
+    }
+    size_t total = main_len + strlen(a->ai_ctx_sources) + strlen(a->ai_extra) +
+                   strlen(a->ai_inst) + strlen(a->ai_prev);
+    size_t so = np_ctx_app(a->ai_ctx_summary, sizeof a->ai_ctx_summary, 0,
+                           "本次发送：%s", main_label);
+    if (ntabs) so = np_ctx_app(a->ai_ctx_summary, sizeof a->ai_ctx_summary, so,
+                               " + 其他标签页(%d)", ntabs);
+    if (nign) so = np_ctx_app(a->ai_ctx_summary, sizeof a->ai_ctx_summary, so,
+                              " [.aiignore 排除 %d]", nign);
+    if (nfinds) so = np_ctx_app(a->ai_ctx_summary, sizeof a->ai_ctx_summary, so,
+                                " + 查找结果(%d)", nfinds);
+    if (a->ai_extra[0]) so = np_ctx_app(a->ai_ctx_summary, sizeof a->ai_ctx_summary, so,
+                                        " + 编译日志");
+    np_ctx_app(a->ai_ctx_summary, sizeof a->ai_ctx_summary, so,
+               " · 约 %zu KB%s", (total + 1023) / 1024,
+               cut ? "（过长内容已截取）" : "");
+    a->ai_ctx_src_doc = a->active;
+}
+
+/* One prompt builder shared by all three backends, so an extra context
+ * block (compiler log, search results, opted-in sources) reaches every
+ * agent unchanged. */
+static size_t np_ai_prompt_size(const notepad *a) {
+    return strlen(a->ai_prev) + strlen(a->ai_inst) + strlen(a->ai_extra) +
+           strlen(a->ai_ctx_sources) + strlen(a->ai_orig) + 256;
+}
+static void np_ai_build_prompt(const notepad *a, char *out, size_t cap) {
+    const char *prev  = a->ai_prev[0]  ? a->ai_prev  : "";
+    const char *extra = a->ai_extra[0] ? a->ai_extra : "";
+    const char *srcs  = a->ai_ctx_sources[0] ? a->ai_ctx_sources : "";
+    snprintf(out, cap, "%s%s%s%s%s%s%s\n\n--- 待处理内容（%s）---\n%s\n",
+             prev, prev[0] ? "\n" : "",
+             a->ai_inst[0] ? a->ai_inst : "请处理以下内容",
+             extra[0] ? "\n\n" : "", extra,
+             srcs[0] ? "\n\n" : "", srcs,
+             a->ai_ctx_label[0] ? a->ai_ctx_label : "文本", a->ai_orig);
+}
+
 /* AI worker: build the prompt file from the instruction + captured context,
  * run the user's agent command, read back its answer. Touches only worker-
  * owned paths and the shared volatile done flag; never CUI state. */
 static void np_ai_worker(void *arg) {
     notepad *a = (notepad *)arg;
     /* prompt = instruction + context, all in one file the agent reads. */
-    size_t need = strlen(a->ai_prev) + strlen(a->ai_inst) + strlen(a->ai_orig) + 96;
+    size_t need = np_ai_prompt_size(a);
     char *prompt = (char *)malloc(need);
     if (!prompt) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "内存不足"); goto done; }
-    {
-        const char *prev = a->ai_prev[0] ? a->ai_prev : "";
-        snprintf(prompt, need, "%s%s%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
-                 prev, prev[0] ? "\n" : "",
-                 a->ai_inst[0] ? a->ai_inst : "请处理以下内容", a->ai_orig);
-    }
+    np_ai_build_prompt(a, prompt, need);
     bool wrote = np_ai_write_context(a->ai_ctx_path, prompt);
     free(prompt);
     if (!wrote) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "无法写入临时提示文件"); goto done; }
-    if (!np_ai_exec(a->ai_cmd, a->ai_ctx_path, a->ai_out_path, NULL,
-                    a->ai_error, sizeof a->ai_error)) {
-        a->ai_done = 3;
+    if (!np_ai_exec_cancel(a->ai_cmd, a->ai_ctx_path, a->ai_out_path, NULL,
+                           &a->ai_cancel, a->ai_error, sizeof a->ai_error)) {
+        np_ai_finish(a, false);
         goto done;
     }
     long n = np_ai_read_result(a->ai_out_path, a->ai_result, sizeof a->ai_result);
-    if (n < 0) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "无法读取 AI 输出"); goto done; }
-    a->ai_done = 2;
+    if (n < 0) {
+        snprintf(a->ai_error, sizeof a->ai_error, "无法读取 AI 输出");
+        np_ai_finish(a, false);
+        goto done;
+    }
+    np_ai_finish(a, true);
 done:
 #ifdef _WIN32
     _endthreadex(0);
@@ -3681,22 +4089,23 @@ static void np_ai_maclaw_worker(void *arg) {
                  "请先在「maclaw 官方服务」中扫码登录");
         goto done;
     }
-    const char *inst = a->ai_inst[0] ? a->ai_inst : "请处理以下内容";
-    const char *prev = a->ai_prev[0] ? a->ai_prev : "";
-    size_t prompt_cap = strlen(prev) + strlen(inst) + strlen(a->ai_orig) + 160;
+    size_t prompt_cap = np_ai_prompt_size(a);
     char *prompt = (char *)malloc(prompt_cap);
     if (!prompt) {
         a->ai_done = 3;
         snprintf(a->ai_error, sizeof a->ai_error, "内存不足");
         goto done;
     }
-    snprintf(prompt, prompt_cap, "%s%s%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
-             prev, prev[0] ? "\n" : "", inst, a->ai_orig);
+    np_ai_build_prompt(a, prompt, prompt_cap);
     bool ok = np_maclaw_llm_chat(a->maclaw_hub, a->maclaw_token, prompt,
                                  a->ai_result, sizeof a->ai_result,
                                  a->ai_error, sizeof a->ai_error);
     free(prompt);
-    a->ai_done = ok ? 2 : 3;
+    if (a->ai_cancel && ok) {
+        snprintf(a->ai_error, sizeof a->ai_error, "已停止");
+        ok = false;
+    }
+    np_ai_finish(a, ok);
 done:
 #ifdef _WIN32
     _endthreadex(0);
@@ -3837,22 +4246,33 @@ static void np_ai_openai_worker(void *arg) {
         goto done;
     }
     const np_llm_provider *p = &a->llm_prov[idx];
-    const char *inst = a->ai_inst[0] ? a->ai_inst : "请处理以下内容";
-    const char *prev = a->ai_prev[0] ? a->ai_prev : "";
-    size_t prompt_cap = strlen(prev) + strlen(inst) + strlen(a->ai_orig) + 160;
+    size_t prompt_cap = np_ai_prompt_size(a);
     char *prompt = (char *)malloc(prompt_cap);
     if (!prompt) {
         snprintf(a->ai_error, sizeof a->ai_error, "内存不足");
         a->ai_done = 3;
         goto done;
     }
-    snprintf(prompt, prompt_cap, "%s%s%s\n\n--- 待处理内容（LaTeX 源码）---\n%s\n",
-             prev, prev[0] ? "\n" : "", inst, a->ai_orig);
-    bool ok = np_openai_chat(p->url, p->api_key, p->model, prompt,
-                             a->ai_result, sizeof a->ai_result,
-                             a->ai_error, sizeof a->ai_error);
+    np_ai_build_prompt(a, prompt, prompt_cap);
+    bool ok = np_openai_chat_stream(p->url, p->api_key, p->model, prompt,
+                                    a->ai_result, sizeof a->ai_result,
+                                    a->ai_error, sizeof a->ai_error,
+                                    &a->ai_cancel, np_ai_delta_cb, a);
+    /* Non-Windows builds currently have no streaming POST transport; keep the
+     * original non-streaming path working there. */
+    if (!ok && !a->ai_cancel && !a->ai_result[0] &&
+        (strstr(a->ai_error, "curl CLI") || strstr(a->ai_error, "Android"))) {
+        a->ai_error[0] = 0;
+        ok = np_openai_chat(p->url, p->api_key, p->model, prompt,
+                            a->ai_result, sizeof a->ai_result,
+                            a->ai_error, sizeof a->ai_error);
+    }
     free(prompt);
-    a->ai_done = ok ? 2 : 3;
+    if (a->ai_cancel && !a->ai_result[0]) {
+        snprintf(a->ai_error, sizeof a->ai_error, "已停止");
+        ok = false;
+    }
+    np_ai_finish(a, ok);
 done:
 #ifdef _WIN32
     _endthreadex(0);
@@ -3866,18 +4286,23 @@ done:
 static void np_llm_models_worker(void *arg) {
     notepad *a = (notepad *)arg;
     int idx = a->llm_models_prov;
+    int gen = a->llm_models_gen;
     char csv[NP_LLM_PROV_MODELS_CAP] = {0}, err[256] = {0};
     int n = -1;
-    /* idx == count is the "being added right now" entry; the slot exists. */
+    /* Read only the UI-thread snapshot, never the editable provider slot. */
     if (idx >= 0 && idx < 8) {
-        n = np_openai_list_models(a->llm_prov[idx].url, a->llm_prov[idx].api_key,
+        n = np_openai_list_models(a->llm_models_url, a->llm_models_key,
                                   csv, sizeof csv, err, sizeof err);
     }
-    if (n > 0 && idx >= 0 && idx < 8)
+    /* The dialog may have deleted or re-opened the provider while we waited.
+     * A stale result must not land in an unrelated slot. idx == count is the
+     * "being added right now" entry, which still has a valid slot. */
+    bool stale = (a->llm_prov_gen != gen);
+    if (!stale && n > 0 && idx >= 0 && idx <= a->llm_prov_count)
         snprintf(a->llm_prov[idx].models, sizeof a->llm_prov[idx].models, "%s", csv);
-    if (n < 0 && err[0])
+    if (!stale && n < 0 && err[0])
         snprintf(a->llm_prov_err, sizeof a->llm_prov_err, "%s", err);
-    a->llm_models_done = (n > 0) ? 2 : 3;
+    a->llm_models_done = stale ? 0 : ((n > 0) ? 2 : 3);
 #ifdef _WIN32
     _endthreadex(0);
 #else
@@ -3888,7 +4313,11 @@ static void np_llm_models_worker(void *arg) {
 static void np_llm_models_start(notepad *a, int prov_idx) {
     if (a->llm_models_done == 1) return;
     if (prov_idx < 0 || prov_idx >= 8) return;
+    const np_llm_provider *p = &a->llm_prov[prov_idx];
+    snprintf(a->llm_models_url, sizeof a->llm_models_url, "%s", p->url);
+    snprintf(a->llm_models_key, sizeof a->llm_models_key, "%s", p->api_key);
     a->llm_models_prov = prov_idx;
+    a->llm_models_gen = a->llm_prov_gen;
     a->llm_prov_err[0] = 0;
     a->llm_models_done = 1;
     NP_BEGIN_THREAD(np_llm_models_worker, a);
@@ -3898,29 +4327,33 @@ static void np_llm_models_start(notepad *a, int prov_idx) {
  * url + key + model actually work before saving. */
 static void np_llm_test_worker(void *arg) {
     notepad *a = (notepad *)arg;
-    int idx = a->llm_test_prov;
+    int gen = a->llm_test_gen;
     char reply[96] = {0}, err[256] = {0};
     bool ok = false;
-    if (idx >= 0 && idx < 8) {
-        np_llm_provider *p = &a->llm_prov[idx];
-        if (p->url[0] && p->model[0]) {
-            clock_t t0 = clock();
-            ok = np_openai_chat(p->url, p->api_key, p->model,
-                                "请只回复两个字：正常",
-                                reply, sizeof reply, err, sizeof err);
-            double sec = (double)(clock() - t0) / CLOCKS_PER_SEC;
-            if (ok)
-                snprintf(a->llm_test_result, sizeof a->llm_test_result,
-                         "连接正常 · %.1fs · 回复：%.60s", sec, reply);
-            else if (!err[0])
-                snprintf(err, sizeof err, "请求失败");
-        } else {
-            snprintf(err, sizeof err, "请先填写服务地址与模型");
-        }
+    if (a->llm_test_url[0] && a->llm_test_model[0]) {
+        /* clock() measures CPU time; a network wait needs wall-clock time. */
+        time_t t0 = time(NULL);
+        ok = np_openai_chat(a->llm_test_url, a->llm_test_key, a->llm_test_model,
+                            "请只回复两个字：正常",
+                            reply, sizeof reply, err, sizeof err);
+        double sec = difftime(time(NULL), t0);
+        if (ok)
+            snprintf(a->llm_test_result, sizeof a->llm_test_result,
+                     "连接正常 · %.1fs · 回复：%.60s", sec, reply);
+        else if (!err[0])
+            snprintf(err, sizeof err, "请求失败");
+    } else {
+        snprintf(err, sizeof err, "请先填写服务地址与模型");
     }
-    if (ok) a->llm_test_err[0] = 0;
-    else snprintf(a->llm_test_err, sizeof a->llm_test_err, "%s", err);
-    a->llm_test_done = ok ? 2 : 3;
+    /* Discard results from a form that is no longer being shown. */
+    bool stale = (a->llm_prov_gen != gen);
+    if (!stale) {
+        if (ok) a->llm_test_err[0] = 0;
+        else snprintf(a->llm_test_err, sizeof a->llm_test_err, "%s", err);
+        a->llm_test_done = ok ? 2 : 3;
+    } else {
+        a->llm_test_done = 0;
+    }
 #ifdef _WIN32
     _endthreadex(0);
 #else
@@ -3931,7 +4364,12 @@ static void np_llm_test_worker(void *arg) {
 static void np_llm_test_start(notepad *a, int prov_idx) {
     if (a->llm_test_done == 1) return;
     if (prov_idx < 0 || prov_idx >= 8) return;
+    const np_llm_provider *p = &a->llm_prov[prov_idx];
+    snprintf(a->llm_test_url, sizeof a->llm_test_url, "%s", p->url);
+    snprintf(a->llm_test_key, sizeof a->llm_test_key, "%s", p->api_key);
+    snprintf(a->llm_test_model, sizeof a->llm_test_model, "%s", p->model);
     a->llm_test_prov = prov_idx;
+    a->llm_test_gen = a->llm_prov_gen;
     a->llm_test_result[0] = 0;
     a->llm_test_err[0] = 0;
     a->llm_test_done = 1;
@@ -3943,31 +4381,53 @@ static void np_ai_start(notepad *a) {
     if (a->ai_done == 1) return;                 /* already running */
     np_doc *d = np_cur(a);
     if (!d || d->is_hex) return;
+    a->ai_cancel = false;
+    a->ai_stream_len = 0;
+    a->ai_staged[0] = 0;
+    a->ai_diff_current = 0;
+    a->ai_hist_pushed = false;
+    a->ai_error[0] = 0;
+    np_ai_context_label(d, a->ai_ctx_label, sizeof a->ai_ctx_label);
     int s0 = NP_MIN(d->caret, d->anchor), s1 = NP_MAX(d->caret, d->anchor);
     s0 = NP_MAX(0, NP_MIN(s0, d->len)); s1 = NP_MAX(s0, NP_MIN(s1, d->len));
+    bool src_truncated = false;
     if (a->ai_task == 5) {
-        /* Completion: feed the text around the caret; the result is
-         * inserted at the caret (empty target range in np_ai_apply). */
+        /* Completion: feed the text around the caret, and insert the result
+         * AT THE CARET. Using s0 here would insert at the selection's start
+         * when the user selected backwards/forwards and then asked to
+         * continue writing — the visible caret is the intended position. */
+        int c = NP_MAX(0, NP_MIN(d->caret, d->len));
         int before = 3000, after = 1000;
-        int from = s0 > before ? s0 - before : 0;
-        int to = s1 + after < d->len ? s1 + after : d->len;
-        if (to < s1) to = s1;
+        int from = c > before ? c - before : 0;
+        int to = c + after < d->len ? c + after : d->len;
         size_t n = (size_t)(to - from);
-        if (n >= sizeof a->ai_orig) n = sizeof a->ai_orig - 1;
+        if (n >= sizeof a->ai_orig) { n = sizeof a->ai_orig - 1; src_truncated = true; }
         memcpy(a->ai_orig, d->text + from, n); a->ai_orig[n] = 0;
-        a->ai_target_s = s0; a->ai_target_e = s0;
+        a->ai_target_s = c; a->ai_target_e = c;      /* empty range = insert */
     } else if (a->ai_ctx == 0 && s1 > s0) {
         size_t n = (size_t)(s1 - s0);
-        if (n >= sizeof a->ai_orig) n = sizeof a->ai_orig - 1;
+        if (n >= sizeof a->ai_orig) { n = sizeof a->ai_orig - 1; src_truncated = true; }
         memcpy(a->ai_orig, d->text + s0, n); a->ai_orig[n] = 0;
-        a->ai_target_s = s0; a->ai_target_e = s1;
+        a->ai_target_s = s0;
+        /* Only claim the range actually shown to the AI. Otherwise a result
+         * based on the first 64 KB would delete the unseen tail on accept. */
+        a->ai_target_e = src_truncated ? s0 + (int)n : s1;
     } else {
         size_t n = (size_t)d->len;
-        if (n >= sizeof a->ai_orig) n = sizeof a->ai_orig - 1;
+        if (n >= sizeof a->ai_orig) { n = sizeof a->ai_orig - 1; src_truncated = true; }
         memcpy(a->ai_orig, d->text, n); a->ai_orig[n] = 0;
-        a->ai_target_s = 0; a->ai_target_e = d->len;
+        a->ai_target_s = 0;
+        a->ai_target_e = src_truncated ? (int)n : d->len;
     }
+    if (src_truncated)
+        np_toast(a, "内容超过 64 KB",
+                 "仅发送前 64 KB；结果只会替换已发送的部分，其余内容保留。建议缩小选区。",
+                 CUI_TONE_WARNING);
     snprintf(a->ai_target_path, sizeof a->ai_target_path, "%s", d->path);
+    a->ai_target_uid = d->uid;
+    a->ai_target_rev = d->content_rev;
+    a->ai_target_len = d->len;
+    np_ai_refresh_sources(a);            /* snapshot exactly what we send */
 
     /* Multi-turn: carry the previous Q&A into this prompt when enabled. */
     if (a->ai_followup && a->ai_result[0]) {
@@ -4040,29 +4500,49 @@ static void np_ai_start(notepad *a) {
     NP_BEGIN_THREAD(np_ai_worker, a);
 }
 
-/* Apply the AI rewrite: replace the captured range in the target document
- * with the agent's answer. Only allowed when the same document is still open
- * and its length is unchanged (so the byte range is still valid). */
+/* Apply the AI rewrite: replace the captured range in the document the
+ * request was made for. Identity is the stable uid, not the path (every
+ * untitled tab has path="", so a path compare can write into the wrong tab).
+ * The range is only valid if the document has not changed since capture;
+ * otherwise refuse instead of silently corrupting text. */
 static bool np_ai_apply(notepad *a) {
     if (a->ai_done != 2 || !a->ai_result[0]) return false;
-    np_doc *d = np_cur(a);
-    if (!d || d->is_hex) return false;
-    if (strcmp(a->ai_target_path, d->path) != 0) {
+    np_doc *d = NULL;
+    for (int i = 0; i < a->count; i++) {
+        if (a->docs[i] && a->docs[i]->uid == a->ai_target_uid) { d = a->docs[i]; break; }
+    }
+    if (!d || d->is_hex || d != np_cur(a)) {
         np_toast(a, "文档已切换", "AI 结果对应的文档不再是当前标签，已取消写入", CUI_TONE_WARNING);
+        return false;
+    }
+    if (d->content_rev != a->ai_target_rev || d->len != a->ai_target_len) {
+        np_toast(a, "文档已改动", "生成结果后正文发生变化，为避免写错位置已取消；请重新生成", CUI_TONE_WARNING);
         return false;
     }
     int s0 = NP_MAX(0, NP_MIN(a->ai_target_s, d->len));
     int s1 = NP_MAX(s0, NP_MIN(a->ai_target_e, d->len));
-    size_t rl = strlen(a->ai_result);
+    const char *src = np_ai_is_rewrite(a->ai_task) ? a->ai_staged : a->ai_result;
+    if (!src[0]) src = a->ai_result;
+    size_t rl = strlen(src);
     int len = d->len;
     int newlen = len - (s1 - s0) + (int)rl;
     if (!np_ensure_cap(d, (size_t)newlen + 1)) {
         np_toast(a, "文本已满", "无法写入 AI 结果", CUI_TONE_WARNING);
         return false;
     }
-    memmove(d->text + s0 + rl, d->text + s1, (size_t)(len - s1) + 1);
-    memcpy(d->text + s0, a->ai_result, rl);
-    d->len = newlen;
+    /* Write through the editor so this becomes ONE undo step. A plain
+     * memmove here leaves CUI's delta history holding stale byte offsets;
+     * the next Ctrl+Z would then edit unrelated text. On failure the buffer
+     * is untouched. */
+    int applied_len = len;
+    if (!cui_code_editor_replace_external(a->ui, d->editor_id,
+                                          d->text, d->cap, d->len,
+                                          s0, s1, src, (int)rl, &applied_len) ||
+        applied_len != newlen) {
+        np_toast(a, "文本已满", "无法写入 AI 结果", CUI_TONE_WARNING);
+        return false;
+    }
+    d->len = applied_len;
     np_text_changed(a, d);
     int caret = s0 + (int)rl;
     if (caret > d->len) caret = d->len;
@@ -4230,6 +4710,110 @@ static bool np_pattern_match(const char *pats, const char *name) {
     return false;
 }
 
+/* ---- .aiignore ----------------------------------------------------- */
+/* A small ignore file in the scanned workspace root keeps private files out
+ * of AI-bound scans (semantic search, find-in-files) and out of the opt-in
+ * "other tabs" context. Supported syntax: # comments, a trailing / to mark a
+ * directory-only rule, *.ext, and * / ? wildcards. A bare name matches at any
+ * depth, which is what most people expect from a compact ignore file. */
+#define NP_IGNORE_MAX 160
+typedef struct {
+    char pat[256];
+    bool dir_only;
+} np_ignore_rule;
+
+static np_ignore_rule ai_ignore[NP_IGNORE_MAX];
+static int ai_ignore_count;
+static char ai_ignore_root[NP_PATH_CAP];
+static time_t ai_ignore_mtime;          /* reload if .aiignore is edited in place */
+
+/* Normalize path separators to '/' and lowercase so Windows and POSIX scans
+ * match the same rules; rules are written with '/' in .aiignore by convention. */
+static void np_ignore_norm(char *s) {
+    for (; *s; s++) {
+        if (*s == '\\') *s = '/';
+        else *s = (char)tolower((unsigned char)*s);
+    }
+}
+
+static const char *np_rel_path(const char *root, const char *full) {
+    size_t n = root ? strlen(root) : 0;
+    if (n && full && !strncmp(full, root, n) &&
+        (full[n] == '/' || full[n] == '\\')) {
+        const char *p = full + n;
+        while (*p == '/' || *p == '\\') p++;
+        return p;
+    }
+    return full ? full : "";
+}
+
+static void np_ignore_load(const char *root) {
+    if (!root || !*root) root = ".";
+    char path[NP_PATH_CAP];
+    np_dir_join(path, sizeof path, root, ".aiignore");
+    struct stat st;
+    time_t mt = stat(path, &st) == 0 ? st.st_mtime : 0;
+    /* Reload when the workspace changes OR the ignore file is edited. */
+    if (ai_ignore_root[0] && !strcmp(ai_ignore_root, root) &&
+        ai_ignore_mtime == mt) return;
+    snprintf(ai_ignore_root, sizeof ai_ignore_root, "%s", root);
+    ai_ignore_mtime = mt;
+    ai_ignore_count = 0;
+    FILE *f = np_fopen_utf8(path, "rb");
+    if (!f) return;
+    char line[600];
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        while (n && (line[0] == ' ' || line[0] == '\t')) {
+            memmove(line, line + 1, n);
+            n--;
+        }
+        if (!n || line[0] == '#') continue;
+        bool dir_only = false;
+        if (line[n - 1] == '/') { line[--n] = 0; dir_only = true; }
+        if (!n || ai_ignore_count >= NP_IGNORE_MAX) continue;
+        np_ignore_rule *r = &ai_ignore[ai_ignore_count++];
+        snprintf(r->pat, sizeof r->pat, "%s", line);
+        np_ignore_norm(r->pat);
+        r->dir_only = dir_only;
+    }
+    fclose(f);
+}
+
+static bool np_ignore_check(const char *root, const char *dir,
+                            const char *name, bool is_dir) {
+    if (!ai_ignore_count || !name) return false;
+    char rel[NP_PATH_CAP];
+    const char *rd = np_rel_path(root, dir ? dir : "");
+    if (rd[0]) snprintf(rel, sizeof rel, "%s/%s", rd, name);
+    else snprintf(rel, sizeof rel, "%s", name);
+    np_ignore_norm(rel);
+    char lname[NP_PATH_CAP];
+    snprintf(lname, sizeof lname, "%s", name);
+    np_ignore_norm(lname);
+
+    for (int i = 0; i < ai_ignore_count; i++) {
+        const np_ignore_rule *r = &ai_ignore[i];
+        if (r->dir_only && !is_dir) continue;
+        const char *p = r->pat;
+        if (p[0] == '*' && p[1] == '.') {
+            size_t ext = strlen(p + 1), nl = strlen(lname);
+            if (nl >= ext && !strcmp(lname + nl - ext, p + 1)) return true;
+        } else if (strchr(p, '/')) {
+            size_t pl = strlen(p), rl = strlen(rel);
+            if (!strcmp(rel, p)) return true;
+            if (rl > pl && rel[rl - pl - 1] == '/' && !strcmp(rel + rl - pl, p)) return true;
+        } else if (strchr(p, '*') || strchr(p, '?')) {
+            /* np_wild is already case-insensitive; rules are lowercased. */
+            if (np_wild(p, lname) || np_wild(p, rel)) return true;
+        } else if (!strcmp(lname, p)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Directories whose contents are skipped during a find-in-files sweep. */
 static const char *NP_FF_SKIP[] = {
     ".git", ".svn", ".hg", ".idea", ".vs", "node_modules", "__pycache__",
@@ -4293,9 +4877,11 @@ static void np_ff_run(notepad *a) {
     a->ff_files_seen = 0;
     a->ff_dirs_seen = 0;
     if (!a->ff_query[0]) return;
+    const char *root = a->ff_dir[0] ? a->ff_dir : ".";
+    np_ignore_load(root);
 
     char dirs[NP_FF_DIR_MAX][NP_PATH_CAP];
-    snprintf(dirs[0], NP_PATH_CAP, "%s", a->ff_dir[0] ? a->ff_dir : ".");
+    snprintf(dirs[0], NP_PATH_CAP, "%s", root);
     int nd = 1, head = 0;
 
     while (head < nd && a->ff_hit_count < NP_FF_MAX &&
@@ -4316,11 +4902,12 @@ static void np_ff_run(notepad *a) {
                 bool skip = false;
                 for (int k = 0; NP_FF_SKIP[k]; k++)
                     if (strcmp(ents[i].name, NP_FF_SKIP[k]) == 0) { skip = true; break; }
-                if (skip) continue;
+                if (skip || np_ignore_check(root, dir, ents[i].name, true)) continue;
                 if (nd < NP_FF_DIR_MAX)
                     np_dir_join(dirs[nd++], NP_PATH_CAP, dir, ents[i].name);
                 continue;
             }
+            if (np_ignore_check(root, dir, ents[i].name, false)) continue;
             if (!np_pattern_match(a->ff_pattern, ents[i].name)) continue;
             a->ff_files_seen++;
             np_ff_scan_file(a, dir, ents[i].name);
@@ -4337,6 +4924,273 @@ static void np_open_fhit(notepad *a, int idx) {
     if (!np_open_path(a, a->ff_paths[h->file], true)) return;
     np_doc *d = np_cur(a);
     if (d) cui_code_editor_goto(a->ui, d->editor_id, h->line, h->col);
+}
+
+/* ---- AI semantic workspace search --------------------------------- */
+/* Collect a bounded file list using the same BFS rules as find-in-files,
+ * then build a prompt that shows every candidate by number with a short
+ * content excerpt. The AI only returns numbers + line numbers; the source
+ * snippet shown to the user is always read back from the real file, so a
+ * hallucinated snippet can never end up in the results. */
+static void np_sem_build_prompt(notepad *a) {
+    a->ff_count = 0;
+    a->ff_files_seen = 0;
+    a->ff_dirs_seen = 0;
+    a->ff_hit_count = 0;
+    a->sem_prompt[0] = 0;
+    if (!a->ff_query[0]) return;
+    const char *root = a->ff_dir[0] ? a->ff_dir : ".";
+    np_ignore_load(root);
+
+    size_t po = np_ctx_app(a->sem_prompt, sizeof a->sem_prompt, 0,
+        "你在帮用户做代码与文档检索。用户想找：%s\n"
+        "下面是工作区里的文本文件，每个都有编号、路径和开头几行内容。\n"
+        "请选出与用户需求最相关的文件，最多 12 个。严格按每行一条输出，格式：\n"
+        "编号|行号|一句话理由\n"
+        "编号必须取自清单，行号填最相关的代码所在行（不确定就填 1）。\n"
+        "不要输出标题、代码块或其它文字。没有相关文件就输出：无\n\n文件清单：\n",
+        a->ff_query);
+
+    char dirs[NP_FF_DIR_MAX][NP_PATH_CAP];
+    snprintf(dirs[0], NP_PATH_CAP, "%s", root);
+    int nd = 1, head = 0;
+    while (head < nd && a->ff_files_seen < NP_FF_SCAN_MAX &&
+           a->ff_count < NP_FF_FILE_MAX && po < sizeof(a->sem_prompt) - 512) {
+        char dir[NP_PATH_CAP];
+        snprintf(dir, sizeof dir, "%s", dirs[head++]);
+        a->ff_dirs_seen++;
+
+        cui_file_entry ents[NP_FF_ROW_MAX];
+        static char names[NP_FF_ROW_MAX * 256];
+        int n = cui_fs_list(NULL, dir, ents, NP_FF_ROW_MAX,
+                            names, sizeof names, false);
+        if (n < 0) continue;
+        for (int i = 0; i < n; i++) {
+            if (a->ff_count >= NP_FF_FILE_MAX ||
+                a->ff_files_seen >= NP_FF_SCAN_MAX) break;
+            if (ents[i].dir) {
+                bool skip = false;
+                for (int k = 0; NP_FF_SKIP[k]; k++)
+                    if (strcmp(ents[i].name, NP_FF_SKIP[k]) == 0) { skip = true; break; }
+                if (skip || np_ignore_check(root, dir, ents[i].name, true)) continue;
+                if (nd < NP_FF_DIR_MAX)
+                    np_dir_join(dirs[nd++], NP_PATH_CAP, dir, ents[i].name);
+                continue;
+            }
+            if (np_ignore_check(root, dir, ents[i].name, false)) continue;
+            if (!np_pattern_match(a->ff_pattern, ents[i].name)) continue;
+            a->ff_files_seen++;
+            char full[NP_PATH_CAP];
+            np_dir_join(full, sizeof full, dir, ents[i].name);
+            FILE *f = np_fopen_utf8(full, "rb");
+            if (!f) continue;
+            char buf[8192];
+            size_t nb = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            buf[nb] = 0;
+            if (memchr(buf, 0, nb)) continue;      /* binary: skip silently */
+
+            int idx = a->ff_count++;
+            snprintf(a->ff_paths[idx], NP_PATH_CAP, "%s", full);
+            po = np_ctx_app(a->sem_prompt, sizeof a->sem_prompt, po,
+                            "[%d] %s\n", idx + 1, a->ff_paths[idx]);
+            int shown = 0;
+            char *p = buf;
+            while (*p && shown < 6 && po < sizeof(a->sem_prompt) - 256) {
+                char *e = strchr(p, '\n');
+                if (e) *e = 0;
+                char *s = p;
+                while (*s == ' ' || *s == '\t' || *s == '\r') s++;
+                if (*s && s[0] != '\n') {
+                    if (strlen(s) > 160) s[160] = 0;
+                    po = np_ctx_app(a->sem_prompt, sizeof a->sem_prompt, po,
+                                    "    %s\n", s);
+                    shown++;
+                }
+                if (!e) break;
+                p = e + 1;
+            }
+            po = np_ctx_app(a->sem_prompt, sizeof a->sem_prompt, po, "\n");
+        }
+    }
+    /* Freeze the candidate table for result parsing (ff_paths is shared with
+     * keyword search and may be rebuilt before this worker finishes). */
+    a->sem_count = a->ff_count;
+    for (int i = 0; i < a->ff_count && i < NP_FF_FILE_MAX; i++)
+        snprintf(a->sem_paths[i], NP_PATH_CAP, "%s", a->ff_paths[i]);
+    snprintf(a->sem_summary, sizeof a->sem_summary,
+             "扫描 %d 个目录 / %d 个文件，送入 %d 个候选文件%s",
+             a->ff_dirs_seen, a->ff_files_seen, a->ff_count,
+             ai_ignore_count ? " · .aiignore 已生效" : "");
+}
+
+/* Read the real text of line N from a candidate file (1-based). */
+static void np_sem_line_text(const char *path, int line, char *out, size_t cap) {
+    out[0] = 0;
+    if (!path[0] || line < 1) return;
+    static char *buf;                   /* reused, UI thread only */
+    if (!buf) buf = (char *)malloc(2 * 1024 * 1024 + 1);
+    if (!buf) return;
+    FILE *f = np_fopen_utf8(path, "rb");
+    if (!f) return;
+    size_t nb = fread(buf, 1, 2 * 1024 * 1024, f);
+    fclose(f);
+    buf[nb] = 0;
+    if (memchr(buf, 0, nb)) return;      /* binary */
+    int cur = 1;
+    char *p = buf;
+    while (*p && cur < line) { if (*p == '\n') cur++; p++; }
+    if (cur != line) return;
+    char *e = strchr(p, '\n');
+    if (e) *e = 0;
+    size_t s = 0;
+    while (p[s] == ' ' || p[s] == '\t' || p[s] == '\r') s++;
+    snprintf(out, cap, "%s", p + s);
+}
+
+/* Semantic search worker: three backends, no CUI calls. */
+static void np_sem_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    bool ok = false;
+    if (a->sem_backend == 4) {
+        if (!a->maclaw_token[0]) {
+            snprintf(a->sem_error, sizeof a->sem_error, "请先登录 MaClaw");
+            goto done;
+        }
+        ok = np_maclaw_llm_chat(a->maclaw_hub, a->maclaw_token, a->sem_prompt,
+                                a->sem_result, sizeof a->sem_result,
+                                a->sem_error, sizeof a->sem_error);
+    } else if (a->sem_backend >= 5) {
+        const np_llm_provider *p = &a->sem_prov;
+        ok = np_openai_chat(p->url, p->api_key, p->model, a->sem_prompt,
+                            a->sem_result, sizeof a->sem_result,
+                            a->sem_error, sizeof a->sem_error);
+    } else {
+        if (!np_ai_write_context(a->sem_ctx_path, a->sem_prompt)) {
+            snprintf(a->sem_error, sizeof a->sem_error, "无法写入临时提示文件");
+            goto done;
+        }
+        ok = np_ai_exec_cancel(a->ai_cmd, a->sem_ctx_path, a->sem_out_path, NULL,
+                               &a->sem_cancel, a->sem_error, sizeof a->sem_error);
+        if (ok && np_ai_read_result(a->sem_out_path, a->sem_result,
+                                    sizeof a->sem_result) < 0) {
+            snprintf(a->sem_error, sizeof a->sem_error, "无法读取 AI 输出");
+            ok = false;
+        }
+    }
+    if (a->sem_cancel && ok) {
+        snprintf(a->sem_error, sizeof a->sem_error, "已停止");
+        ok = false;
+    }
+done:
+    a->sem_done = ok ? 2 : 3;
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    return;
+#endif
+}
+
+/* Parse "id|line|reason" lines into ff_hits. The displayed snippet comes
+ * from np_sem_line_text(), never from the AI answer. */
+static void np_sem_apply(notepad *a) {
+    /* Rebuild the file table from the frozen snapshot and point ff_hits at it
+     * so filenames, snippets and jump targets stay consistent even if a
+     * keyword search ran while the AI worker was in flight. */
+    a->ff_count = a->sem_count;
+    for (int i = 0; i < a->sem_count && i < NP_FF_FILE_MAX; i++)
+        snprintf(a->ff_paths[i], NP_PATH_CAP, "%s", a->sem_paths[i]);
+    a->ff_hit_count = 0;
+    char *p = a->sem_result;
+    while (*p && a->ff_hit_count < NP_FF_MAX) {
+        char *e = strchr(p, '\n');
+        if (e) *e = 0;
+        char *s = p;
+        while (*s == ' ' || *s == '\t' || *s == '\r') s++;
+        char *bar1 = strchr(s, '|');
+        if (bar1 && s != bar1) {
+            int id = atoi(s);
+            int line = atoi(bar1 + 1);
+            if (id >= 1 && id <= a->sem_count && line >= 1) {
+                np_fhit *h = &a->ff_hits[a->ff_hit_count++];
+                h->file = id - 1;
+                h->line = line;
+                h->col = 1;
+                np_sem_line_text(a->ff_paths[id - 1], line,
+                                 h->text, sizeof h->text);
+                if (!h->text[0])
+                    snprintf(h->text, sizeof h->text, "%s（第 %d 行）",
+                             np_base(a->ff_paths[id - 1]), line);
+            }
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    snprintf(a->sem_summary, sizeof a->sem_summary,
+             "语义搜索 “%s”：%d 个相关位置（基于 %d 个候选文件）",
+             a->ff_query, a->ff_hit_count, a->sem_count);
+    np_logf(a, "%s", a->sem_summary);
+    np_toast(a, a->ff_hit_count ? "语义搜索完成" : "没有相关结果", a->sem_summary,
+             a->ff_hit_count ? CUI_TONE_SUCCESS : CUI_TONE_WARNING);
+}
+
+/* UI entry: validate backend, snapshot config, launch the worker. */
+static void np_sem_start(notepad *a) {
+    if (a->sem_done == 1 || !a->ff_query[0]) return;
+    np_sem_build_prompt(a);
+    if (!a->ff_count) {
+        np_toast(a, "没有可搜索的文件", "请检查目录和文件类型设置", CUI_TONE_WARNING);
+        return;
+    }
+    int backend = a->ai_backend;
+    if (backend == 4 && !a->maclaw_token[0]) {
+        np_toast(a, "尚未登录 MaClaw", "请先在「LLM 服务」中扫码授权", CUI_TONE_WARNING);
+        return;
+    }
+    if (backend >= 5) {
+        int idx = backend - 5;
+        if (idx < 0 || idx >= a->llm_prov_count ||
+            !a->llm_prov[idx].url[0] || !a->llm_prov[idx].model[0]) {
+            np_toast(a, "服务商未配置完整", "请在「LLM 服务」中设置地址和模型", CUI_TONE_WARNING);
+            return;
+        }
+        a->sem_prov = a->llm_prov[idx];
+    } else if (backend < 3 && !a->ai_cmd[0]) {
+        bool claude = np_ai_has_tool("claude");
+        bool codex = np_ai_has_tool("codex");
+        if (!a->ai_cmd[0]) {
+            if (claude)
+                snprintf(a->ai_cmd, sizeof a->ai_cmd,
+                         "claude -p \"Read {file} and follow its instructions. Output ONLY the result, no explanation.\" > {out}");
+            else if (codex)
+                snprintf(a->ai_cmd, sizeof a->ai_cmd,
+                         "codex exec \"Read {file} and follow its instructions. Output ONLY the result, no explanation.\" > {out}");
+        }
+        if (!a->ai_cmd[0]) {
+            np_toast(a, "未配置 AI 后端",
+                     "请在「LLM 服务」中登录或添加服务商", CUI_TONE_WARNING);
+            return;
+        }
+    }
+    a->sem_backend = backend;
+    a->sem_cancel = false;
+    a->sem_result[0] = 0; a->sem_error[0] = 0;
+    a->ff_hit_count = 0;
+    const char *dir = a->side_dir[0] ? a->side_dir : ".";
+#ifdef _WIN32
+    snprintf(a->sem_ctx_path, sizeof a->sem_ctx_path, "%s\\rapideditor-sem-ctx.txt", dir);
+    snprintf(a->sem_out_path, sizeof a->sem_out_path, "%s\\rapideditor-sem-out.txt", dir);
+#else
+    snprintf(a->sem_ctx_path, sizeof a->sem_ctx_path, "%s/rapideditor-sem-ctx.txt", dir);
+    snprintf(a->sem_out_path, sizeof a->sem_out_path, "%s/rapideditor-sem-out.txt", dir);
+#endif
+    a->sem_done = 1;
+    a->sem_last_state = 1;
+    a->show_output = true;
+    a->out_tab = 2;
+    a->dlg_find_files = false;
+    NP_BEGIN_THREAD(np_sem_worker, a);
+    np_logf(a, "AI 语义搜索  “%s”  ·  %s", a->ff_query, a->sem_summary);
 }
 
 /* ---- text transforms ---------------------------------------------- */
@@ -4599,6 +5453,133 @@ static void np_config_path(char *out, size_t cap) {
 #endif
 }
 
+/* Snapshot files live next to config.ini. Keeping them as plain UTF-8 makes
+ * recovery possible even when the original file was never saved. */
+static void np_draft_path(char *out, size_t cap, int idx) {
+    char dir[NP_PATH_CAP];
+    np_config_dir(dir, sizeof dir);
+#ifdef _WIN32
+    snprintf(out, cap, "%s\\draft%d.txt", dir, idx);
+#else
+    snprintf(out, cap, "%s/draft%d.txt", dir, idx);
+#endif
+}
+
+/* Metadata sidecar written together with every snapshot. The periodic
+ * crash-net saves drafts but cannot rewrite config.ini, so without this the
+ * next startup pairs fresh snapshot bytes with stale path/encoding fields —
+ * an explicit save could then overwrite the WRONG file. */
+static void np_draft_meta_path(char *out, size_t cap, int idx) {
+    char dir[NP_PATH_CAP];
+    np_config_dir(dir, sizeof dir);
+#ifdef _WIN32
+    snprintf(out, cap, "%s\\draft%d.meta", dir, idx);
+#else
+    snprintf(out, cap, "%s/draft%d.meta", dir, idx);
+#endif
+}
+
+/* Write every dirty text buffer to the config directory. Hex documents are
+ * skipped: their bytes can contain NUL and are not valid UTF-8 text. */
+static void np_save_drafts(notepad *a) {
+    a->draft_count = 0;
+    for (int i = 0; i < a->count && a->draft_count < NP_DOC_MAX; i++) {
+        np_doc *d = a->docs[i];
+        if (!d->dirty || d->is_hex || d->len <= 0) continue;
+        np_draft_entry *e = &a->drafts[a->draft_count];
+        np_draft_path(e->file, sizeof e->file, a->draft_count);
+        FILE *f = np_fopen_utf8(e->file, "wb");
+        if (!f) continue;
+        size_t n = (size_t)d->len;
+        bool ok = fwrite(d->text, 1, n, f) == n;
+        fclose(f);
+        if (!ok) continue;
+        snprintf(e->path, sizeof e->path, "%s", d->path);
+        e->enc = d->enc;
+        e->crlf = d->crlf;
+        /* Sidecar keeps the metadata next to the bytes it describes. A
+         * periodic save then cannot desync them even on a hard crash. */
+        {
+            char metapath[NP_PATH_CAP];
+            np_draft_meta_path(metapath, sizeof metapath, a->draft_count);
+            FILE *mf = np_fopen_utf8(metapath, "wb");
+            if (mf) {
+                fprintf(mf, "path=%s\nenc=%d\ncrlf=%d\n",
+                        e->path, e->enc, e->crlf ? 1 : 0);
+                fclose(mf);
+            }
+        }
+        a->draft_count++;
+    }
+}
+
+/* Restore one snapshot into a fresh tab. The document keeps its original
+ * path and stays dirty, so an explicit save is still required. */
+static void np_restore_draft(notepad *a, int idx) {
+    if (idx < 0 || idx >= a->draft_count) return;
+    np_draft_entry *e = &a->drafts[idx];
+    /* Metadata from the sidecar is authoritative: config.ini may be older
+     * than the snapshot if the process exited without a clean shutdown. */
+    {
+        char metapath[NP_PATH_CAP];
+        np_draft_meta_path(metapath, sizeof metapath, idx);
+        FILE *mf = np_fopen_utf8(metapath, "rb");
+        if (mf) {
+            char line[NP_PATH_CAP + 64];
+            while (fgets(line, sizeof line, mf)) {
+                size_t ln = strlen(line);
+                while (ln && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) line[--ln] = 0;
+                if (!strncmp(line, "path=", 5))
+                    snprintf(e->path, sizeof e->path, "%s", line + 5);
+                else if (!strncmp(line, "enc=", 4)) {
+                    int v = atoi(line + 4);
+                    if (v >= 0 && v < 3) e->enc = v;   /* UTF8 / UTF8-BOM / ANSI */
+                } else if (!strncmp(line, "crlf=", 5))
+                    e->crlf = atoi(line + 5) != 0;
+            }
+            fclose(mf);
+        }
+    }
+    FILE *f = np_fopen_utf8(e->file, "rb");
+    if (!f) return;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return; }
+    size_t n = (size_t)sz;
+    if (n >= NP_LOAD_MAX) { fclose(f); return; }
+    np_doc *d = NULL;
+    int tab = -1;
+    if (a->count == 1 && np_blank_untitled(a->docs[0])) {
+        d = a->docs[0]; tab = 0;
+    } else {
+        d = np_doc_new(a); tab = a->count - 1;
+    }
+    if (!d || !np_ensure_cap(d, n + 1024)) {
+        fclose(f);
+        if (tab >= 0 && a->count > 1) np_close_doc(a, tab);
+        return;
+    }
+    size_t got = fread(d->text, 1, n, f);
+    fclose(f);
+    d->text[got] = 0;
+    d->len = (int)got;
+    d->rev++;
+    d->content_rev++;
+    d->dirty = true;
+    d->is_hex = false;
+    d->enc = e->enc;
+    d->crlf = e->crlf;
+    snprintf(d->path, sizeof d->path, "%s", e->path);
+    d->lang = np_detect_lang(e->path, d->text);
+    d->lang_manual = false;
+    d->file_size = 0;
+    np_bump_editor(a, d);
+    np_activate(a, tab, false);
+    np_logf(a, "恢复未保存草稿  %s", e->path[0] ? np_base(e->path) : "未命名文档");
+    np_toast(a, "已恢复草稿", e->path[0] ? np_base(e->path) : "未命名文档",
+             CUI_TONE_SUCCESS);
+}
+
 /* Collapse CR/LF/TAB to spaces so a value stays on one config line. */
 static const char *np_cfg_one_line(const char *s, char *buf, size_t cap) {
     size_t o = 0;
@@ -4607,6 +5588,81 @@ static const char *np_cfg_one_line(const char *s, char *buf, size_t cap) {
         buf[o++] = (*s == '\n' || *s == '\r' || *s == '\t') ? ' ' : *s;
     buf[o] = 0;
     return buf;
+}
+
+/* ---- API key storage ----------------------------------------------- */
+/* Windows: DPAPI encrypts the key under the current user account before it
+ * touches config.ini, so the plaintext key never sits on disk. Values are
+ * stored as "dpapi:<base64>"; anything without the prefix is legacy plaintext
+ * and keeps working. Other platforms fall back to plaintext (documented in
+ * README) because there is no equivalent per-user keystore in this build. */
+#define NP_SECRET_PREFIX "dpapi:"
+
+static void np_secret_save(const char *plain, char *out, size_t cap) {
+    out[0] = 0;
+    if (!plain || !*plain || cap < 16) return;
+#ifdef _WIN32
+    DATA_BLOB in, enc;
+    in.pbData = (BYTE *)(uintptr_t)plain;
+    in.cbData = (DWORD)strlen(plain);
+    enc.pbData = NULL;
+    enc.cbData = 0;
+    if (CryptProtectData(&in, L"RapidEditor LLM API Key", NULL, NULL, NULL,
+                         CRYPTPROTECT_UI_FORBIDDEN, &enc) && enc.pbData) {
+        DWORD n = 0;
+        if (CryptBinaryToStringA(enc.pbData, enc.cbData,
+                                 CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                                 NULL, &n) && n > 0 &&
+            n + sizeof(NP_SECRET_PREFIX) < cap) {
+            char *b64 = (char *)malloc(n);
+            if (b64 && CryptBinaryToStringA(enc.pbData, enc.cbData,
+                        CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64, &n)) {
+                snprintf(out, cap, NP_SECRET_PREFIX "%s", b64);
+            }
+            free(b64);
+        }
+        SecureZeroMemory(enc.pbData, enc.cbData);
+        LocalFree(enc.pbData);
+    }
+#endif
+    if (!out[0]) snprintf(out, cap, "%s", plain);  /* non-Windows / fallback */
+}
+
+static void np_secret_load(const char *stored, char *out, size_t cap) {
+    out[0] = 0;
+    if (!stored || !*stored || cap == 0) return;
+    size_t plen = strlen(NP_SECRET_PREFIX);
+    if (strncmp(stored, NP_SECRET_PREFIX, plen) != 0) {
+        snprintf(out, cap, "%s", stored);          /* legacy plaintext */
+        return;
+    }
+#ifdef _WIN32
+    const char *b64 = stored + plen;
+    DWORD n = 0;
+    if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, NULL, &n, NULL, NULL) ||
+        n == 0) return;
+    BYTE *bin = (BYTE *)malloc(n);
+    if (!bin) return;
+    if (CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, bin, &n, NULL, NULL)) {
+        DATA_BLOB in, dec;
+        in.pbData = bin;
+        in.cbData = n;
+        dec.pbData = NULL;
+        dec.cbData = 0;
+        if (CryptUnprotectData(&in, NULL, NULL, NULL, NULL,
+                               CRYPTPROTECT_UI_FORBIDDEN, &dec) && dec.pbData) {
+            size_t len = NP_MIN((size_t)dec.cbData, cap - 1);
+            memcpy(out, dec.pbData, len);
+            out[len] = 0;
+            SecureZeroMemory(dec.pbData, dec.cbData);
+            LocalFree(dec.pbData);
+        }
+    }
+    SecureZeroMemory(bin, n);
+    free(bin);
+#endif
+    /* A dpapi: value on another platform / user account cannot be decrypted:
+     * leave the field empty so the user is asked to re-enter the key. */
 }
 
 static void np_config_load(notepad *a) {
@@ -4677,10 +5733,23 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "font_cjk")) snprintf(a->font_cjk_name, sizeof a->font_cjk_name, "%s", val);
         else if (!strcmp(key, "ai_cmd")) snprintf(a->ai_cmd, sizeof a->ai_cmd, "%s", val);
         else if (!strcmp(key, "ai_inst")) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", val);
-        else if (!strcmp(key, "ai_task")) { int v = atoi(val); if (v >= 0 && v <= 4) a->ai_task = v; }
+        else if (!strcmp(key, "ai_task")) { int v = atoi(val); if (v >= 0 && v <= 6 + NP_AI_ACTION_MAX) a->ai_task = v; }
         else if (!strcmp(key, "ai_ctx")) { int v = atoi(val); if (v >= 0 && v <= 1) a->ai_ctx = v; }
+        else if (!strcmp(key, "ai_ctx_tabs")) a->ai_ctx_tabs = atoi(val) != 0;
+        else if (!strcmp(key, "ai_ctx_finds")) a->ai_ctx_finds = atoi(val) != 0;
         else if (!strcmp(key, "ai_backend")) { int v = atoi(val); if (v >= 0 && v <= 12) a->ai_backend = v; }
-        else if (!strcmp(key, "ai_show_diff")) a->ai_show_diff = atoi(val) != 0;
+        else if (!strncmp(key, "aiact", 5) && strchr(key + 5, '_')) {
+            int idx = atoi(key + 5);
+            const char *field = strchr(key + 5, '_') + 1;
+            if (idx >= 0 && idx < NP_AI_ACTION_MAX) {
+                if (!strcmp(field, "name"))
+                    snprintf(a->ai_actions[idx].name, sizeof a->ai_actions[idx].name, "%s", val);
+                else if (!strcmp(field, "inst"))
+                    snprintf(a->ai_actions[idx].inst, sizeof a->ai_actions[idx].inst, "%s", val);
+                if (a->ai_actions[idx].name[0] && idx + 1 > a->ai_action_count)
+                    a->ai_action_count = idx + 1;
+            }
+        }
         else if (!strcmp(key, "maclaw_centers")) snprintf(a->maclaw_centers, sizeof a->maclaw_centers, "%s", val);
         else if (!strcmp(key, "maclaw_center")) snprintf(a->maclaw_center, sizeof a->maclaw_center, "%s", val);
         else if (!strncmp(key, "llm_p", 5) && strchr(key + 5, '_')) {
@@ -4691,7 +5760,13 @@ static void np_config_load(notepad *a) {
                 np_llm_provider *p = &a->llm_prov[idx];
                 if (!strcmp(field, "name")) snprintf(p->name, sizeof p->name, "%s", val);
                 else if (!strcmp(field, "url")) snprintf(p->url, sizeof p->url, "%s", val);
-                else if (!strcmp(field, "key")) snprintf(p->api_key, sizeof p->api_key, "%s", val);
+                else if (!strcmp(field, "key")) {
+                    np_secret_load(val, p->api_key, sizeof p->api_key);
+                    /* dpapi: value that cannot be decrypted leaves the field
+                     * empty — tell the user instead of silent 401s. */
+                    if (!strncmp(val, NP_SECRET_PREFIX, strlen(NP_SECRET_PREFIX)) &&
+                        !p->api_key[0]) a->secret_load_failed = true;
+                }
                 else if (!strcmp(field, "model")) snprintf(p->model, sizeof p->model, "%s", val);
                 else if (!strcmp(field, "models")) snprintf(p->models, sizeof p->models, "%s", val);
                 if (idx + 1 > a->llm_prov_count) a->llm_prov_count = idx + 1;
@@ -4715,12 +5790,29 @@ static void np_config_load(notepad *a) {
                 snprintf(a->session[i], NP_PATH_CAP, "%s", val);
                 if (i + 1 > a->session_count) a->session_count = i + 1;
             }
+        } else if (!strncmp(key, "draft_path", 10)) {
+            int i = atoi(key + 10);
+            if (i >= 0 && i < NP_DOC_MAX) {
+                snprintf(a->drafts[i].path, NP_PATH_CAP, "%s", val);
+                if (i + 1 > a->draft_count) a->draft_count = i + 1;
+            }
+        } else if (!strncmp(key, "draft_file", 10)) {
+            int i = atoi(key + 10);
+            if (i >= 0 && i < NP_DOC_MAX)
+                snprintf(a->drafts[i].file, NP_PATH_CAP, "%s", val);
+        } else if (!strncmp(key, "draft_enc", 9)) {
+            int i = atoi(key + 9);
+            if (i >= 0 && i < NP_DOC_MAX) a->drafts[i].enc = atoi(val);
+        } else if (!strncmp(key, "draft_crlf", 10)) {
+            int i = atoi(key + 10);
+            if (i >= 0 && i < NP_DOC_MAX) a->drafts[i].crlf = atoi(val) != 0;
         }
     }
     fclose(f);
     /* 迁移：已保存 maclaw token 但后端仍是「自动检测」的旧配置，自动切到
      * MaClaw官方——否则会走本机并不存在的 claude/codex CLI 而失败。 */
     if (a->maclaw_token[0] && a->ai_backend == 0) a->ai_backend = 4;
+    if (a->ai_task >= 7 && a->ai_task - 7 >= a->ai_action_count) a->ai_task = 6;
 }
 
 /* Called once when the app loop exits (any exit path: menu, window close). */
@@ -4730,6 +5822,7 @@ static void np_config_save(notepad *a) {
     np_config_path(path, sizeof path);
     FILE *f = np_fopen_utf8(path, "wb");
     if (!f) return;
+    np_save_drafts(a);
     a->session_count = 0;
     for (int i = 0; i < a->count && a->session_count < NP_SESSION_MAX; i++) {
         np_doc *d = a->docs[i];
@@ -4751,9 +5844,12 @@ static void np_config_save(notepad *a) {
             a->match_case ? 1 : 0, a->dark_valid ? 0 : 1);
     fprintf(f, "editor_font=%s\neditor_font_path=%s\n",
             a->font_ident[0] ? a->font_ident : "default", a->font_custom_path);
-    fprintf(f, "find=%s\nreplace=%s\nworkdir=%s\n",
-            np_cfg_one_line(a->find_query, cfgline1, sizeof cfgline1),
-            a->replace_with, a->side_dir);
+    fprintf(f, "find=%s\n",
+            np_cfg_one_line(a->find_query, cfgline1, sizeof cfgline1));
+    fprintf(f, "replace=%s\n",
+            np_cfg_one_line(a->replace_with, cfgline2, sizeof cfgline2));
+    fprintf(f, "workdir=%s\n",
+            np_cfg_one_line(a->side_dir, cfgline3, sizeof cfgline3));
     /* LaTeX / AI settings added for the TeXora-inspired feature set. */
     fprintf(f, "lt_align=%s\nlt_style=%d\nlt_header=%d\nlt_long=%d\nlt_resize=%d\nlt_width=%.4f\n",
             a->ltable_align[0] ? a->ltable_align : "lcr", a->ltable_style,
@@ -4763,29 +5859,53 @@ static void np_config_save(notepad *a) {
             a->tidy_indent ? 1 : 0, a->tidy_join ? 1 : 0,
             a->tidy_trim ? 1 : 0, a->tidy_spaces);
     fprintf(f, "font_latin=%s\nfont_cjk=%s\n", a->font_latin_name, a->font_cjk_name);
-    fprintf(f, "ai_cmd=%s\nai_inst=%s\nai_task=%d\nai_ctx=%d\nai_backend=%d\nai_show_diff=%d\n",
+    fprintf(f, "ai_cmd=%s\nai_inst=%s\nai_task=%d\nai_ctx=%d\nai_backend=%d\nai_ctx_tabs=%d\nai_ctx_finds=%d\n",
             np_cfg_one_line(a->ai_cmd, cfgline1, sizeof cfgline1),
             np_cfg_one_line(a->ai_inst, cfgline2, sizeof cfgline2),
-            a->ai_task, a->ai_ctx, a->ai_backend, a->ai_show_diff ? 1 : 0);
-    fprintf(f, "maclaw_centers=%s\nmaclaw_center=%s\nmaclaw_hub=%s\nmaclaw_token=%s\nmaclaw_email=%s\n",
-            np_cfg_one_line(a->maclaw_centers, cfgline1, sizeof cfgline1),
-            np_cfg_one_line(a->maclaw_center, cfgline2, sizeof cfgline2),
-            np_cfg_one_line(a->maclaw_hub, cfgline3, sizeof cfgline3),
-            np_cfg_one_line(a->maclaw_token, cfgline1, sizeof cfgline1),
+            a->ai_task, a->ai_ctx, a->ai_backend,
+            a->ai_ctx_tabs ? 1 : 0, a->ai_ctx_finds ? 1 : 0);
+    for (int i = 0; i < a->ai_action_count && i < NP_AI_ACTION_MAX; i++) {
+        const np_ai_action *act = &a->ai_actions[i];
+        fprintf(f, "aiact%d_name=%s\naiact%d_inst=%s\n", i,
+                np_cfg_one_line(act->name, cfgline1, sizeof cfgline1), i,
+                np_cfg_one_line(act->inst, cfgline2, sizeof cfgline2));
+    }
+    /* IMPORTANT: np_cfg_one_line returns the buffer it writes into. Reusing
+     * the same buffer for two %s arguments of ONE fprintf makes both print
+     * the LAST value written (argument evaluation order does not help — all
+     * args are evaluated before the call). Use a fresh buffer per field. */
+    fprintf(f, "maclaw_centers=%s\n",
+            np_cfg_one_line(a->maclaw_centers, cfgline1, sizeof cfgline1));
+    fprintf(f, "maclaw_center=%s\n",
+            np_cfg_one_line(a->maclaw_center, cfgline2, sizeof cfgline2));
+    fprintf(f, "maclaw_hub=%s\n",
+            np_cfg_one_line(a->maclaw_hub, cfgline3, sizeof cfgline3));
+    fprintf(f, "maclaw_token=%s\n",
+            np_cfg_one_line(a->maclaw_token, cfgline1, sizeof cfgline1));
+    fprintf(f, "maclaw_email=%s\n",
             np_cfg_one_line(a->maclaw_email, cfgline2, sizeof cfgline2));
     for (int i = 0; i < a->llm_prov_count && i < 8; i++) {
         const np_llm_provider *p = &a->llm_prov[i];
-        fprintf(f, "llm_p%d_name=%s\nllm_p%d_url=%s\nllm_p%d_key=%s\nllm_p%d_model=%s\nllm_p%d_models=%s\n",
-                i, np_cfg_one_line(p->name, cfgline1, sizeof cfgline1),
-                i, np_cfg_one_line(p->url, cfgline2, sizeof cfgline2),
-                i, np_cfg_one_line(p->api_key, cfgline3, sizeof cfgline3),
-                i, np_cfg_one_line(p->model, cfgline1, sizeof cfgline1),
-                i, np_cfg_one_line(p->models, cfgline2, sizeof cfgline2));
+        np_secret_save(p->api_key, cfgline3, sizeof cfgline3);
+        fprintf(f, "llm_p%d_name=%s\n", i,
+                np_cfg_one_line(p->name, cfgline1, sizeof cfgline1));
+        fprintf(f, "llm_p%d_url=%s\n", i,
+                np_cfg_one_line(p->url, cfgline2, sizeof cfgline2));
+        fprintf(f, "llm_p%d_key=%s\n", i, cfgline3);
+        fprintf(f, "llm_p%d_model=%s\n", i,
+                np_cfg_one_line(p->model, cfgline1, sizeof cfgline1));
+        fprintf(f, "llm_p%d_models=%s\n", i,
+                np_cfg_one_line(p->models, cfgline2, sizeof cfgline2));
     }
     for (int i = 0; i < a->recent_count; i++)
         fprintf(f, "recent%d=%s\n", i, a->recent[i]);
     for (int i = 0; i < a->session_count; i++)
         fprintf(f, "session%d=%s\n", i, a->session[i]);
+    for (int i = 0; i < a->draft_count; i++) {
+        const np_draft_entry *e = &a->drafts[i];
+        fprintf(f, "draft_path%d=%s\ndraft_file%d=%s\ndraft_enc%d=%d\ndraft_crlf%d=%d\n",
+                i, e->path, i, e->file, i, e->enc, i, e->crlf ? 1 : 0);
+    }
     fclose(f);
 }
 
@@ -5027,6 +6147,12 @@ static void np_build_hits(notepad *a, np_doc *d) {
 static void np_output_panel(cui_ctx *ui, notepad *a) {
     np_doc *d = np_cur(a);
     if (a->out_tab == 0) np_build_hits(a, d);
+    /* Apply semantic results exactly once when the worker finishes. */
+    if (a->sem_done != a->sem_last_state) {
+        if (a->sem_done == 2) np_sem_apply(a);
+        a->sem_last_state = a->sem_done;
+        cui_request_redraw(ui);
+    }
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
                .bg = CUI_COLOR_SURFACE_MUTED, .gap = 0, .pad = 0) {
@@ -5056,7 +6182,8 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                 snprintf(info, sizeof info, "“%s”  %d 处",
                          a->find_query[0] ? a->find_query : "未设置查找词", a->hit_count);
             else if (a->out_tab == 2)
-                snprintf(info, sizeof info, "“%s”  %d 处  ·  %d 个文件 / %d 个目录",
+                snprintf(info, sizeof info, "%s“%s”  %d 处  ·  %d 个文件 / %d 个目录",
+                         a->sem_done == 2 ? "AI 语义  " : "",
                          a->ff_query[0] ? a->ff_query : "未设置查找词",
                          a->ff_hit_count, a->ff_files_seen, a->ff_dirs_seen);
             else
@@ -5066,7 +6193,21 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
             if (cui_icon_button(ui, CUI_ICON_TRASH_2, .size = CUI_SIZE_SM,
                                 .variant = CUI_BUTTON_GHOST, .tooltip = "清空")) {
                 if (a->out_tab == 1) a->msg_count = 0;
-                else if (a->out_tab == 2) { a->ff_hit_count = 0; a->ff_count = 0; }
+                else if (a->out_tab == 2) {
+                    a->ff_hit_count = 0; a->ff_count = 0;
+                    if (a->sem_done == 1) {
+                        /* A search worker is still running: only request a
+                         * cancel and clear the shown text. Resetting the
+                         * state machine here would let a second search run
+                         * concurrently on the same temp files and result
+                         * buffers, corrupting both. */
+                        a->sem_cancel = true;
+                        a->sem_result[0] = 0;
+                    } else {
+                        a->sem_done = 0; a->sem_last_state = 0;
+                        a->sem_result[0] = 0;
+                    }
+                }
                 else { a->hit_count = 0; a->hits_rev = 0; }
             }
             if (cui_icon_button(ui, CUI_ICON_X, .size = CUI_SIZE_SM,
@@ -5099,11 +6240,29 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                     }
                 }
             } else if (a->out_tab == 2) {
-                if (!a->ff_query[0]) {
-                    cui_text(ui, "用「搜索 → 在文件中查找…」(Ctrl+Shift+F) 在整个目录里搜索文字。",
+                if (a->sem_done == 1) {
+                    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                        cui_spinner(ui, 14);
+                        cui_text(ui, "AI 正在理解查询并筛选文件…", .size = 12,
+                                 .color = CUI_COLOR_TEXT_MUTED);
+                        if (cui_button(ui, "停止", .size = CUI_SIZE_SM,
+                                       .variant = CUI_BUTTON_GHOST))
+                            a->sem_cancel = true;
+                    }
+                    cui_text(ui, a->sem_summary, .size = 11,
+                             .color = CUI_COLOR_TEXT_MUTED);
+                } else if (a->sem_done == 3) {
+                    cui_text(ui, "AI 语义搜索失败", .size = 13,
+                             .font = CUI_FONT_MEDIUM, .color = CUI_COLOR_DANGER);
+                    cui_text(ui, a->sem_error[0] ? a->sem_error : "未知错误",
+                             .size = 12, .nowrap = false);
+                } else if (!a->ff_query[0]) {
+                    cui_text(ui, "用「搜索 → 在文件中查找…」(Ctrl+Shift+F) 搜索文字，或点「AI 语义搜索」用自然语言找文件。",
                              .size = 12, .color = CUI_COLOR_TEXT_MUTED);
                 } else if (!a->ff_hit_count) {
-                    cui_text(ui, "没有找到匹配行。", .size = 12,
+                    cui_text(ui, a->sem_done == 2
+                             ? "AI 未找到相关文件，可换一种描述或放宽文件类型。"
+                             : "没有找到匹配行。", .size = 12,
                              .color = CUI_COLOR_TEXT_MUTED);
                 } else {
                     for (int i = 0; i < a->ff_hit_count; i++) {
@@ -5206,6 +6365,245 @@ static void np_welcome_pane(cui_ctx *ui, notepad *a) {
     }
 }
 
+/* ---- smart paste --------------------------------------------------- */
+/* Clipboard content is classified before insertion; the user always gets
+ * a preview plus a raw-paste option, so no conversion happens silently. */
+
+static size_t np_sp_app(char *out, size_t cap, size_t o, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(out + o, cap - o, fmt, ap);
+    va_end(ap);
+    if (w < 0) return o;
+    return (o + (size_t)w >= cap) ? cap - 1 : o + (size_t)w;
+}
+
+static int np_sp_split(char *line, char delim, char **f, int max) {
+    int n = 0;
+    if (!line || max < 1) return 0;
+    f[n++] = line;
+    for (char *p = line; *p; p++) {
+        if (*p == delim) {
+            *p = 0;
+            if (n < max) f[n++] = p + 1;
+            else *p = delim;
+        }
+    }
+    return n;
+}
+
+static int np_sp_detect(const char *s, char *kind, size_t cap, char *delim_out) {
+    const char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '{' || *p == '[') {
+        snprintf(kind, cap, "JSON · 将重新缩进，键与值更清晰");
+        *delim_out = 0;
+        return 1;
+    }
+    char buf[16384];
+    size_t n = strlen(p);
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    memcpy(buf, p, n); buf[n] = 0;
+    int lines = 0, tabs = 0, commas = 0, sems = 0, logs = 0;
+    char *cur = buf;
+    while (*cur) {
+        char *end = strchr(cur, '\n');
+        if (end) *end = 0;
+        if (*cur) {
+            lines++;
+            if (strchr(cur, '\t')) tabs++;
+            if (strchr(cur, ',')) commas++;
+            if (strchr(cur, ';')) sems++;
+            if (strstr(cur, "ERROR") || strstr(cur, "error") ||
+                strstr(cur, "WARN")  || strstr(cur, "warn")  ||
+                strstr(cur, "FATAL") || strstr(cur, "Exception") ||
+                strstr(cur, "失败")  || strstr(cur, "错误")) logs++;
+        }
+        if (!end) break;
+        cur = end + 1;
+    }
+    if (lines >= 2 && (tabs == lines || commas == lines || sems == lines)) {
+        char d = (tabs == lines) ? '\t' : (commas == lines) ? ',' : ';';
+        *delim_out = d;
+        snprintf(kind, cap, "表格 · %d 行（%s）", lines,
+                 d == '\t' ? "Tab / Excel 单元格" : d == ',' ? "CSV" : "分号分隔");
+        return 0;
+    }
+    *delim_out = 0;
+    if (logs > 0) {
+        snprintf(kind, cap, "日志 · 找到 %d 行错误或警告，将提取摘要", logs);
+        return 2;
+    }
+    snprintf(kind, cap, "纯文本 · 建议原样粘贴");
+    return 3;
+}
+
+static void np_sp_make_table(notepad *a, const char *src, bool latex, char delim) {
+    char buf[16384];
+    size_t n = strlen(src);
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    memcpy(buf, src, n); buf[n] = 0;
+    char *rows[256];
+    int nr = 0;
+    char *cur = buf;
+    while (*cur && nr < 256) {
+        char *end = strchr(cur, '\n');
+        if (end) *end = 0;
+        if (*cur) rows[nr++] = cur;
+        if (!end) break;
+        cur = end + 1;
+    }
+    a->sp_out[0] = 0;
+    if (nr <= 0) return;
+    char *f[32];
+    int cols = np_sp_split(rows[0], delim, f, 32);
+    if (cols < 1) cols = 1;
+    size_t o = 0;
+    if (latex) {
+        o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "\\begin{table}[htbp]\n\\centering\n\\begin{tabular}{");
+        for (int c = 0; c < cols; c++)
+            if (o + 1 < sizeof a->sp_out) a->sp_out[o++] = 'l';
+        o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "}\n\\hline\n");
+        /* rows[0] was already split into f[] when computing cols; don't split
+         * it again (the delimiter bytes are now NULs). */
+        for (int c = 0; c < cols; c++)
+            o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "%s%s",
+                          c ? " & " : "", f[c] ? f[c] : "");
+        o = np_sp_app(a->sp_out, sizeof a->sp_out, o, " \\\\\n\\hline\n");
+        for (int r = 1; r < nr; r++) {
+            int cn = np_sp_split(rows[r], delim, f, 32);
+            for (int c = 0; c < cols; c++)
+                o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "%s%s",
+                              c ? " & " : "", (c < cn && f[c]) ? f[c] : "");
+            o = np_sp_app(a->sp_out, sizeof a->sp_out, o, " \\\\\n");
+        }
+        o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "\\hline\n\\end{tabular}\n\\end{table}\n");
+    } else {
+        for (int c = 0; c < cols; c++)
+            o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "| %s ",
+                          (c < cols && f[c]) ? f[c] : "");
+        o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "|\n|");
+        for (int c = 0; c < cols; c++)
+            o = np_sp_app(a->sp_out, sizeof a->sp_out, o, " --- |");
+        o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "\n");
+        for (int r = 1; r < nr; r++) {
+            int cn = np_sp_split(rows[r], delim, f, 32);
+            for (int c = 0; c < cols; c++)
+                o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "| %s ",
+                              (c < cn && f[c]) ? f[c] : "");
+            o = np_sp_app(a->sp_out, sizeof a->sp_out, o, "|\n");
+        }
+    }
+    (void)o;
+}
+
+static void np_sp_json_pretty(const char *src, char *out, size_t cap) {
+    size_t o = 0;
+    int depth = 0;
+    bool in_str = false, esc = false;
+    for (const char *p = src; *p && o + 6 < cap; p++) {
+        char c = *p;
+        if (in_str) {
+            out[o++] = c;
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; out[o++] = c; }
+        else if (c == '{' || c == '[') {
+            out[o++] = c; depth++; out[o++] = '\n';
+            for (int i = 0; i < depth && o + 1 < cap; i++) out[o++] = ' ';
+        } else if (c == '}' || c == ']') {
+            depth--; if (depth < 0) depth = 0;
+            out[o++] = '\n';
+            for (int i = 0; i < depth && o + 1 < cap; i++) out[o++] = ' ';
+            out[o++] = c;
+        } else if (c == ',') {
+            out[o++] = c; out[o++] = '\n';
+            for (int i = 0; i < depth && o + 1 < cap; i++) out[o++] = ' ';
+        } else if (c == ':') { out[o++] = c; out[o++] = ' '; }
+        else if (!isspace((unsigned char)c)) out[o++] = c;
+    }
+    out[o] = 0;
+}
+
+static void np_sp_log_summary(const char *src, char *out, size_t cap) {
+    char buf[32768];
+    size_t n = strlen(src);
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    memcpy(buf, src, n); buf[n] = 0;
+    size_t o = 0;
+    int kept = 0;
+    char *cur = buf;
+    while (*cur && kept < 40 && o + 8 < cap) {
+        char *end = strchr(cur, '\n');
+        if (end) *end = 0;
+        if (strstr(cur, "ERROR") || strstr(cur, "error") ||
+            strstr(cur, "WARN")  || strstr(cur, "warn")  ||
+            strstr(cur, "FATAL") || strstr(cur, "Exception") ||
+            strstr(cur, "失败")  || strstr(cur, "错误")) {
+            size_t l = strlen(cur);
+            if (l > 4 && !strstr(out, cur)) {
+                int w = snprintf(out + o, cap - o, "%s\n", cur);
+                if (w > 0) { o += (size_t)w; if (o >= cap) o = cap - 1; kept++; }
+            }
+        }
+        if (!end) break;
+        cur = end + 1;
+    }
+    out[o] = 0;
+}
+
+static bool np_smart_paste_insert(notepad *a, const char *text) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex || !text) return false;
+    int pos = NP_MAX(0, NP_MIN(d->caret, d->len));
+    size_t n = strlen(text);
+    if (!np_ensure_cap(d, (size_t)d->len + n + 1)) return false;
+    /* Write through the editor so the insertion becomes ONE undo step.
+     * A plain memmove leaves CUI's delta history with stale byte offsets;
+     * the next Ctrl+Z would then edit unrelated text (see np_ai_apply). */
+    int applied_len = d->len;
+    if (!cui_code_editor_replace_external(a->ui, d->editor_id,
+                                          d->text, d->cap, d->len,
+                                          pos, pos, text, (int)n,
+                                          &applied_len) ||
+        applied_len != d->len + (int)n) {
+        return false;
+    }
+    d->len = applied_len;
+    np_text_changed(a, d);
+    cui_code_editor_select(a->ui, d->editor_id, pos + (int)n, pos + (int)n);
+    return true;
+}
+
+static void np_smart_paste_open(notepad *a) {
+    const char *clip = cui_get_clipboard_text(a->ui);
+    if (!clip || !*clip) {
+        np_toast(a, "剪贴板为空", "请先复制要粘贴的内容", CUI_TONE_WARNING);
+        return;
+    }
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    snprintf(a->sp_src, sizeof a->sp_src, "%s", clip);
+    char delim = 0;
+    a->sp_mode = np_sp_detect(a->sp_src, a->sp_kind, sizeof a->sp_kind, &delim);
+    if (a->sp_mode == 0)
+        np_sp_make_table(a, a->sp_src, np_doc_is_latex(d), delim);
+    else if (a->sp_mode == 1)
+        np_sp_json_pretty(a->sp_src, a->sp_out, sizeof a->sp_out);
+    else if (a->sp_mode == 2)
+        np_sp_log_summary(a->sp_src, a->sp_out, sizeof a->sp_out);
+    else
+        snprintf(a->sp_out, sizeof a->sp_out, "%s", a->sp_src);
+    if (!a->sp_out[0] && a->sp_mode == 2) {
+        snprintf(a->sp_out, sizeof a->sp_out, "%s", a->sp_src);
+        snprintf(a->sp_kind, sizeof a->sp_kind, "日志 · 未发现错误行，可原样粘贴");
+    }
+    a->dlg_smart_paste = true;
+}
+
 static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     /* Keep a little headroom so ordinary typing never hits the ceiling. */
     if ((size_t)d->len + 8192 > d->cap)
@@ -5213,6 +6611,36 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 0) {
         np_doc_breadcrumb(ui, a, d);
+        /* Editor toolbar: quick AI actions on a selection, plus smart paste
+         * which is useful with or without one. */
+        if (!d->is_hex && a->ai_done != 1) {
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                if (d->caret != d->anchor) {
+                cui_text(ui, "选中 AI", .size = 11,
+                         .color = CUI_COLOR_TEXT_MUTED);
+                if (cui_button(ui, "润色", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST))
+                    np_ai_quick(a, 0);
+                if (cui_button(ui, "翻译", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST))
+                    np_ai_quick(a, 1);
+                if (cui_button(ui, "检查", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST))
+                    np_ai_quick(a, 2);
+                if (cui_button(ui, "解释", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST))
+                    np_ai_quick(a, 3);
+                if (cui_button(ui, "续写", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST))
+                    np_ai_quick(a, 5);
+                }
+                cui_spacer(ui);
+                if (cui_button(ui, "智能粘贴", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST,
+                               .tooltip = "识别表格 / JSON / 日志，转换前可预览"))
+                    np_smart_paste_open(a);
+            }
+        }
         cui_code_editor_result r = cui_code_editor(
             ui, d->editor_id, d->text, d->cap,
             .lang = NP_LANGS[d->lang].id,
@@ -5244,7 +6672,15 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                 np_ai_quick(a, 6);
             if (cui_menu_item(ui, "续写（光标处）", .icon = CUI_ICON_SPARKLES))
                 np_ai_quick(a, 5);
+            for (int i = 0; i < a->ai_action_count && i < 4; i++) {
+                char label[80];
+                snprintf(label, sizeof label, "%s（自定义）", a->ai_actions[i].name);
+                if (cui_menu_item(ui, label, .icon = CUI_ICON_SPARKLES))
+                    np_ai_quick(a, 7 + i);
+            }
             cui_menu_separator(ui);
+            if (cui_menu_item(ui, "智能粘贴…", .icon = CUI_ICON_CLIPBOARD))
+                np_smart_paste_open(a);
             if (cui_menu_item(ui, "打开 AI 面板", .icon = CUI_ICON_SPARKLES))
                 a->show_ai = true;
         }
@@ -6098,9 +7534,16 @@ static void np_preview_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                            .align = CUI_ALIGN_CENTER, .justify = CUI_JUSTIFY_CENTER, .gap = 8) {
                     cui_text(ui, "预览失败", .size = 13, .font = CUI_FONT_MEDIUM,
                              .color = CUI_COLOR_DANGER);
-                    if (a->tex_job.log[0])
+                    if (a->tex_job.log[0]) {
+                        if (cui_button(ui, "让 AI 分析编译错误",
+                                       .variant = CUI_BUTTON_PRIMARY,
+                                       .disabled = a->ai_done == 1))
+                            np_ai_fix_compile(a);
+                        cui_text(ui, "编译日志会随当前文档一起发送，修复结果可逐处接受。",
+                                 .size = 11, .color = CUI_COLOR_TEXT_MUTED);
                         cui_text(ui, a->tex_job.log, .size = 11, .nowrap = false,
                                  .font = CUI_FONT_MONO, .color = CUI_COLOR_TEXT_MUTED);
+                    }
                 }
             }
             }
@@ -6261,16 +7704,46 @@ static int np_ai_disp(int task) {
     }
 }
 
-/* Default instruction per task, or NULL when the user must type one. */
-static const char *np_ai_default_inst(int task) {
+/* Default instruction per task and document family. LaTeX gets its original
+ * careful prompts; everything else now gets prompts that fit the content. */
+static const char *np_ai_default_inst(notepad *a, int task, const np_doc *d) {
+    if (task >= 7) {                    /* user-saved custom action */
+        int i = task - 7;
+        return (a && i >= 0 && i < a->ai_action_count) ? a->ai_actions[i].inst : NULL;
+    }
+    bool latex = np_doc_is_latex(d);
+    bool md = !latex && np_doc_is_markdown(d);
+    bool code = !latex && !md && d && d->lang > NP_LANG_TEXT && d->lang < NP_LANG_COUNT;
     switch (task) {
-        case 0: return "请润色这段 LaTeX：改进措辞与表达，保持所有命令、公式和结构与原意不变。只输出润色后的完整源码。";
-        case 1: return "请把这段 LaTeX 翻译成中文，保持所有 LaTeX 命令、公式和环境不变。只输出翻译后的完整源码。";
-        case 2: return "请检查这段 LaTeX 的错误与问题（语法、宏包、引用、公式），逐条列出问题与建议。不要修改原文。";
-        case 3: return "请解释这段 LaTeX 的作用与结构。不要修改原文。";
-        case 5: return "请续写下面的 LaTeX 文档。只输出紧接在文末之后的续写内容，不要重复已有文本，不要任何解释或代码块标记。";
-        case 6: return "请生成一个可直接编译的 LaTeX 模板（从 \\documentclass 到 \\end{document} 的完整文档）。只输出完整源码，不要解释。需求：";
-        default: return NULL;
+        case 0:
+            if (latex) return "请润色这段 LaTeX：改进措辞与表达，保持所有命令、公式和结构与原意不变。只输出润色后的完整源码。";
+            if (code) return "请润色这段代码：改善命名与可读性，补全必要注释，不改变行为、接口和依赖。只输出完整代码。";
+            if (md) return "请润色这份 Markdown：改进表达与结构，保留标题、链接、列表和代码块。只输出完整内容。";
+            return "请润色这段文本：改进措辞与流畅度，保持原意、语气和段落结构。只输出完整文本。";
+        case 1:
+            if (latex) return "请把这段 LaTeX 翻译成中文，保持所有 LaTeX 命令、公式和环境不变。只输出翻译后的完整源码。";
+            if (code) return "请把这段代码中的注释和字符串翻译成中文，保持所有标识符、语法和行为不变。只输出完整代码。";
+            return "请把这段内容翻译成中文，保留原有格式、标记和结构。只输出完整内容。";
+        case 2:
+            if (latex) return "请检查这段 LaTeX 的错误与问题（语法、宏包、引用、公式），逐条列出问题与建议。不要修改原文。";
+            if (code) return "请检查这段代码的错误和边界条件（语法、空值、异常、资源释放），逐条列出问题与建议。不要修改原文。";
+            if (md) return "请检查这份 Markdown 的格式、链接、错别字和结构问题，逐条列出问题与建议。不要修改原文。";
+            return "请检查这段文本中的错别字、语法和逻辑问题，逐条列出问题与建议。不要修改原文。";
+        case 3:
+            if (code) return "请解释这段代码的作用、关键流程和潜在副作用。不要修改原文。";
+            if (latex) return "请解释这段 LaTeX 的作用与结构。不要修改原文。";
+            return "请解释这段内容的主旨与结构。不要修改原文。";
+        case 5:
+            if (latex) return "请续写下面的 LaTeX 文档。只输出紧接在文末之后的续写内容，不要重复已有文本，不要任何解释或代码块标记。";
+            if (code) return "请从光标处续写这段代码，风格与上下文保持一致。只输出可直接粘贴的代码，不要解释或代码块标记。";
+            return "请从光标处续写这段内容，语气与风格保持一致。只输出续写文本，不要重复已有内容或解释。";
+        case 6:
+            if (latex) return "请生成一个可直接编译的 LaTeX 模板（从 \\documentclass 到 \\end{document} 的完整文档）。只输出完整源码，不要解释。需求：";
+            if (code) return "请生成一个可直接运行的代码文件模板，包含必要导入和清晰的分段注释。只输出完整代码，不要解释。需求：";
+            if (md) return "请生成一份结构完整的 Markdown 文档模板（标题、摘要、章节、列表与表格）。只输出完整内容，不要解释。需求：";
+            return "请生成一份结构完整的文本模板，带清晰的分区和占位说明。只输出完整内容，不要解释。需求：";
+        default:
+            return NULL;
     }
 }
 
@@ -6278,11 +7751,33 @@ static const char *np_ai_default_inst(int task) {
  * the default instruction, opens the panel and fires the request. */
 static void np_ai_quick(notepad *a, int task) {
     a->ai_task = task;
-    const char *def = np_ai_default_inst(task);
+    const char *def = np_ai_default_inst(a, task, np_cur(a));
     if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
     a->ai_ctx = 0;                       /* act on the selection / caret */
+    a->ai_ctx_tabs = false;              /* quick actions never pull other sources */
+    a->ai_ctx_finds = false;
     a->show_ai = true;
     np_ai_start(a);
+}
+
+/* Send a failed LaTeX compile to the AI: the log becomes an extra prompt
+ * block and the source is sent in full. The answer follows the normal Diff
+ * review path, so nothing is written without an explicit accept. */
+static void np_ai_fix_compile(notepad *a) {
+    if (a->ai_done == 1 || !a->tex_job.log[0]) return;
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return;
+    a->ai_task = 4;                     /* custom instruction, Diff display */
+    a->ai_ctx = 1;                      /* whole document, not just selection */
+    a->ai_ctx_tabs = false;             /* only the compile log is extra here */
+    a->ai_ctx_finds = false;
+    snprintf(a->ai_inst, sizeof a->ai_inst,
+             "请根据下面的 LaTeX 编译日志定位并修复源码错误。只输出修复后的完整源码，不要解释或代码块标记。");
+    snprintf(a->ai_extra, sizeof a->ai_extra, "--- 编译日志 ---\n%s", a->tex_job.log);
+    a->show_ai = true;
+    np_ai_start(a);
+    np_toast(a, "已提交给 AI", "编译日志已随源码发送，请在面板中逐处确认修改",
+             CUI_TONE_INFO);
 }
 
 /* Put the AI result into a brand-new document (template generation). */
@@ -6302,6 +7797,130 @@ static bool np_ai_new_doc_from_result(notepad *a) {
     return true;
 }
 
+/* Byte offset of a 0-based line in a NUL-terminated text buffer. */
+static size_t np_text_line_offset(const char *s, int line) {
+    size_t off = 0;
+    int cur = 0;
+    while (s[off] && cur < line) {
+        if (s[off] == '\n') cur++;
+        off++;
+    }
+    return off;
+}
+
+/* Replace `old_count` lines of dst with `new_count` lines from src. Both
+ * ranges are 0-based line indices from cui_diff_compute(). */
+static bool np_patch_text_hunk(char *dst, size_t cap,
+                               int old_start, int old_count,
+                               const char *src, int new_start, int new_count) {
+    size_t os = np_text_line_offset(dst, old_start);
+    size_t oe = np_text_line_offset(dst, old_start + old_count);
+    size_t ns = np_text_line_offset(src, new_start);
+    size_t ne = np_text_line_offset(src, new_start + new_count);
+    size_t tail = strlen(dst + oe);
+    size_t need = os + (ne - ns) + tail + 1;
+    if (need > cap) return false;
+    memmove(dst + os + (ne - ns), dst + oe, tail + 1);
+    memcpy(dst + os, src + ns, ne - ns);
+    return true;
+}
+
+/* Accept or reject the diff hunk currently selected in the AI panel.
+ * Accepting patches the staged text toward the AI result; rejecting patches
+ * the result back toward the staged text. The diff then shrinks accordingly. */
+static bool np_ai_hunk_decision(notepad *a, bool accept) {
+    cui_diff_hunk hunks[NP_AI_HUNK_MAX];
+    cui_diff_stats stats;
+    int n = cui_diff_compute(a->ai_staged, strlen(a->ai_staged),
+                             a->ai_result, strlen(a->ai_result), 0,
+                             hunks, NP_AI_HUNK_MAX, &stats);
+    if (n <= 0) return false;
+    /* cui_diff_compute returns the REAL hunk count but only fills the first
+     * NP_AI_HUNK_MAX entries; clamp to the filled range, not to n. */
+    int usable = NP_MIN(n, NP_AI_HUNK_MAX);
+    int idx = NP_MAX(0, NP_MIN(a->ai_diff_current, usable - 1));
+    const cui_diff_hunk *h = &hunks[idx];
+    bool ok = accept
+        ? np_patch_text_hunk(a->ai_staged, sizeof a->ai_staged,
+                             h->old_start, h->old_count,
+                             a->ai_result, h->new_start, h->new_count)
+        : np_patch_text_hunk(a->ai_result, sizeof a->ai_result,
+                             h->new_start, h->new_count,
+                             a->ai_staged, h->old_start, h->old_count);
+    if (ok) a->ai_diff_current = idx;
+    return ok;
+}
+
+/* Keep recent results on the document they belong to, not in one global
+ * buffer that gets overwritten when the user switches tabs. */
+static void np_ai_push_history(notepad *a) {
+    np_doc *d = NULL;
+    for (int i = 0; i < a->count; i++)
+        if (a->docs[i] && a->docs[i]->uid == a->ai_target_uid) { d = a->docs[i]; break; }
+    if (!d) d = np_cur(a);
+    if (!d) return;
+    if (d->ai_hist_count == NP_AI_HISTORY_MAX) {
+        memmove(&d->ai_hist[0], &d->ai_hist[1],
+                (size_t)(NP_AI_HISTORY_MAX - 1) * sizeof d->ai_hist[0]);
+        d->ai_hist_count--;
+    }
+    np_ai_history *h = &d->ai_hist[d->ai_hist_count++];
+    memset(h, 0, sizeof *h);
+    snprintf(h->result, sizeof h->result, "%s", a->ai_result);
+    snprintf(h->orig, sizeof h->orig, "%s", a->ai_orig);
+    snprintf(h->inst, sizeof h->inst, "%s", a->ai_inst);
+    snprintf(h->target_path, sizeof h->target_path, "%s", a->ai_target_path);
+    h->target_uid = a->ai_target_uid;
+    h->target_rev = a->ai_target_rev;
+    h->target_len = a->ai_target_len;
+    h->task = a->ai_task;
+    h->target_s = a->ai_target_s;
+    h->target_e = a->ai_target_e;
+    d->ai_hist_sel = d->ai_hist_count - 1;
+}
+
+static void np_ai_restore_history(notepad *a, np_doc *d, int idx) {
+    if (!d || idx < 0 || idx >= d->ai_hist_count) return;
+    const np_ai_history *h = &d->ai_hist[idx];
+    snprintf(a->ai_result, sizeof a->ai_result, "%s", h->result);
+    snprintf(a->ai_orig, sizeof a->ai_orig, "%s", h->orig);
+    snprintf(a->ai_inst, sizeof a->ai_inst, "%s", h->inst);
+    snprintf(a->ai_target_path, sizeof a->ai_target_path, "%s", h->target_path);
+    snprintf(a->ai_staged, sizeof a->ai_staged, "%s", h->orig);
+    a->ai_task = h->task;
+    a->ai_target_uid = h->target_uid;
+    a->ai_target_rev = h->target_rev;
+    a->ai_target_len = h->target_len;
+    a->ai_target_s = h->target_s;
+    a->ai_target_e = h->target_e;
+    a->ai_diff_current = 0;
+    a->ai_error[0] = 0;
+    a->ai_cancel = false;
+    a->ai_done = 2;
+    a->ai_hist_pushed = true;
+    a->show_ai = true;
+}
+
+/* Insert an AI answer at the caret. Deliberately independent of the original
+ * target range: an answer task must never replace the entire document. */
+static bool np_ai_insert_here(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!a->ai_result[0] || !d || d->is_hex) return false;
+    int pos = NP_MAX(0, NP_MIN(d->caret, d->len));
+    size_t rl = strlen(a->ai_result);
+    /* Insert through the editor so Ctrl+Z can undo it and CUI's delta
+     * history keeps valid byte offsets (see np_ai_apply). */
+    int applied_len = d->len;
+    if (!cui_code_editor_replace_external(a->ui, d->editor_id,
+                                          d->text, d->cap, d->len,
+                                          pos, pos, a->ai_result, (int)rl,
+                                          &applied_len)) return false;
+    d->len = applied_len;
+    np_text_changed(a, d);
+    cui_code_editor_select(a->ui, d->editor_id, pos + (int)rl, pos + (int)rl);
+    return true;
+}
+
 static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
     (void)d;
     long st = a->ai_done;
@@ -6310,8 +7929,14 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
     if (st == 1) cui_request_redraw(ui);        /* keep the spinner animating */
 
     const char *ctxs[] = { "当前选区", "整个文件" };
-    const char *tasks[] = { "润色改写", "翻译", "检查错误", "解释说明",
-                            "补全续写", "生成模板", "自定义指令" };
+    static const char *tasks_builtin[] = { "润色改写", "翻译", "检查错误", "解释说明",
+                                           "补全续写", "生成模板", "自定义指令" };
+    const char *tasks[7 + NP_AI_ACTION_MAX];
+    int task_count = 0;
+    for (int i = 0; i < 7; i++) tasks[task_count++] = tasks_builtin[i];
+    for (int i = 0; i < a->ai_action_count && task_count < (int)(sizeof tasks / sizeof tasks[0]); i++)
+        tasks[task_count++] = a->ai_actions[i].name;
+    if (a->ai_task >= task_count) a->ai_task = 6;
     const char *backs_static[] = { "自动检测", "Claude Code", "Codex", "自定义命令", "MaClaw官方" };
     const char *backs[5 + 8];
     int back_count = 0;
@@ -6320,7 +7945,7 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
         backs[back_count++] = a->llm_prov[i].name;
     if (a->ai_backend >= back_count) a->ai_backend = 0;
     if (!a->ai_inst[0]) {
-        const char *def = np_ai_default_inst(a->ai_task);
+        const char *def = np_ai_default_inst(a, a->ai_task, d ? d : np_cur(a));
         if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
     }
 
@@ -6349,14 +7974,33 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
 
         /* Request builder ------------------------------------------------ */
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
-            if (cui_select(ui, "ai-task", tasks, 7, &a->ai_task,
+            if (cui_select(ui, "ai-task", tasks, task_count, &a->ai_task,
                            .label = "任务", .width = CUI_FILL)) {
-                const char *def = np_ai_default_inst(a->ai_task);
+                const char *def = np_ai_default_inst(a, a->ai_task, d ? d : np_cur(a));
                 if (def) snprintf(a->ai_inst, sizeof a->ai_inst, "%s", def);
             }
             if (cui_select(ui, "ai-ctx", ctxs, 2, &a->ai_ctx,
                            .label = "上下文", .width = CUI_FILL,
                            .disabled = a->ai_task == 5)) { /* caret-based */ }
+        }
+        if (!a->ai_ctx_summary[0] || a->ai_ctx_src_doc != a->active)
+            np_ai_refresh_sources(a);
+        cui_row(ui, .width = CUI_FILL, .gap = 12, .align = CUI_ALIGN_CENTER) {
+            if (cui_checkbox(ui, "其他标签页", &a->ai_ctx_tabs)) np_ai_refresh_sources(a);
+            if (cui_checkbox(ui, "查找结果", &a->ai_ctx_finds)) np_ai_refresh_sources(a);
+            cui_spacer(ui);
+        }
+        cui_text(ui, a->ai_ctx_summary, .size = 11,
+                 .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+            cui_text(ui, a->ai_action_count
+                     ? "常用指令已保存为动作，切换任务即可复用。"
+                     : "把常用指令保存为动作，以后一键调用。",
+                     .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+            cui_spacer(ui);
+            if (cui_button(ui, "管理动作…", .size = CUI_SIZE_SM,
+                           .variant = CUI_BUTTON_GHOST))
+                a->dlg_ai_actions = true;
         }
         if (cui_select(ui, "ai-back", backs, back_count, &a->ai_backend,
                        .label = "后端", .width = CUI_FILL)) {
@@ -6390,6 +8034,16 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
             cui_checkbox(ui, "带上下文追问（多轮）", &a->ai_followup);
             cui_spacer(ui);
         }
+        if (a->ai_extra[0]) {
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                cui_text(ui, "已附加：编译日志（会随请求发送，重试时仍保留）",
+                         .size = 11, .color = CUI_COLOR_ACCENT, .nowrap = false);
+                cui_spacer(ui);
+                if (cui_button(ui, "移除", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST))
+                    a->ai_extra[0] = 0;
+            }
+        }
         cui_row(ui, .width = CUI_FILL, .gap = 8) {
             if (cui_button(ui, st == 1 ? "处理中…" : "Ask AI",
                            .variant = CUI_BUTTON_PRIMARY,
@@ -6397,10 +8051,19 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                                        (a->ai_task == 6 && !a->ai_inst[0]))) {
                 np_ai_start(a);
             }
-            if (cui_button(ui, "清空对话", .variant = CUI_BUTTON_GHOST,
-                           .disabled = st == 1)) {
-                a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
-                a->ai_prev[0] = 0; a->ai_show_diff = false;
+            if (st == 1) {
+                if (cui_button(ui, "停止", .variant = CUI_BUTTON_GHOST))
+                    a->ai_cancel = true;
+            } else {
+                if (cui_button(ui, "重试", .variant = CUI_BUTTON_GHOST)) {
+                    np_ai_start(a);
+                }
+                if (cui_button(ui, "清空对话", .variant = CUI_BUTTON_GHOST)) {
+                    a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                    a->ai_prev[0] = 0;
+                    a->ai_staged[0] = 0; a->ai_error[0] = 0;
+                    a->ai_extra[0] = 0;
+                }
             }
         }
 
@@ -6408,26 +8071,65 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
         if (st == 1) {
             cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
                 cui_spinner(ui, 16);
-                cui_text(ui, "AI 正在处理，请稍候…", .size = 12,
+                cui_text(ui, a->ai_stream_len > 0
+                         ? "AI 正在生成…（已收到部分内容，可随时停止）"
+                         : "AI 正在处理，请稍候…", .size = 12,
                          .color = CUI_COLOR_TEXT_MUTED);
             }
-        } else if (st == 3) {
-            cui_text(ui, "AI 调用失败", .size = 13, .font = CUI_FONT_MEDIUM,
-                     .color = CUI_COLOR_DANGER);
+            if (a->ai_stream_len > 0 && a->ai_result[0])
+                cui_textarea(ui, "ai-stream", a->ai_result, sizeof a->ai_result,
+                             .height = -1, .read_only = true);
+        } else if (st == 3 || st == 5) {
+            cui_text(ui, st == 5 ? "已停止生成" : "AI 调用失败",
+                     .size = 13, .font = CUI_FONT_MEDIUM,
+                     .color = st == 5 ? CUI_COLOR_WARNING : CUI_COLOR_DANGER);
             cui_text(ui, a->ai_error[0] ? a->ai_error : "未知错误", .size = 12,
                      .nowrap = false);
+            if (a->ai_result[0]) {
+                cui_text(ui, "已收到的内容：", .size = 11,
+                         .color = CUI_COLOR_TEXT_MUTED);
+                cui_textarea(ui, "ai-partial", a->ai_result, sizeof a->ai_result,
+                             .height = 160, .read_only = true);
+            }
         } else if (st == 2 && a->ai_result[0]) {
+            /* Partial-success notes (e.g. a 64 KB output cap) live in
+             * ai_error; show them even though the request completed. */
+            if (a->ai_error[0])
+                cui_text(ui, a->ai_error, .size = 12,
+                         .color = CUI_COLOR_WARNING, .nowrap = false);
+            if (!a->ai_hist_pushed) {
+                np_ai_push_history(a);
+                a->ai_hist_pushed = true;
+            }
             if (disp == NP_AI_DISP_DIFF) {
-                cui_text(ui, "逐处 Diff（原文 → AI 结果），确认后才写入",
+                const char *lang = (d && np_doc_is_latex(d)) ? "tex"
+                                 : (d && d->lang > NP_LANG_TEXT && d->lang < NP_LANG_COUNT)
+                                     ? NP_LANGS[d->lang].id : "text";
+                cui_text(ui, "逐处 Diff：接受或拒绝当前修改，确认后才写入",
                          .size = 12, .font = CUI_FONT_MEDIUM);
-                cui_diff_result dr = cui_diff_view(ui, "ai-diff", a->ai_orig,
+                cui_diff_result dr = cui_diff_view(ui, "ai-diff", a->ai_staged,
                                                     a->ai_result, .height = -1,
-                                                    .context = 3, .language = "tex");
+                                                    .context = 3, .language = lang,
+                                                    .current = &a->ai_diff_current);
                 (void)dr;
-                if (cui_button(ui, "应用改写", .variant = CUI_BUTTON_PRIMARY)) {
-                    if (np_ai_apply(a)) {
-                        np_toast(a, "已应用", "AI 改写已写入文档", CUI_TONE_INFO);
-                        a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                    if (cui_button(ui, "接受当前处", .size = CUI_SIZE_SM,
+                                   .disabled = dr.changes <= 0)) {
+                        if (np_ai_hunk_decision(a, true))
+                            np_toast(a, "已接受", "当前修改已移入待写入内容", CUI_TONE_INFO);
+                    }
+                    if (cui_button(ui, "拒绝当前处", .size = CUI_SIZE_SM,
+                                   .disabled = dr.changes <= 0)) {
+                        if (np_ai_hunk_decision(a, false))
+                            np_toast(a, "已拒绝", "当前修改已从结果中移除", CUI_TONE_INFO);
+                    }
+                    if (cui_button(ui, "全部应用", .size = CUI_SIZE_SM,
+                                   .variant = CUI_BUTTON_PRIMARY)) {
+                        if (np_ai_apply(a)) {
+                            np_toast(a, "已应用", "已按逐处选择写入文档", CUI_TONE_INFO);
+                            a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                            a->ai_staged[0] = 0;
+                        }
                     }
                 }
             } else if (disp == NP_AI_DISP_INSERT) {
@@ -6462,10 +8164,21 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                     }
                 }
             } else {
-                cui_text(ui, "AI 回复（不会改动正文）", .size = 12,
+                cui_text(ui, "AI 回复（默认不改动正文）", .size = 12,
                          .font = CUI_FONT_MEDIUM);
                 cui_textarea(ui, "ai-answer", a->ai_result, sizeof a->ai_result,
                              .height = -1, .read_only = true);
+                cui_row(ui, .width = CUI_FILL, .gap = 8) {
+                    if (cui_button(ui, "插入到光标处",
+                                   .variant = CUI_BUTTON_PRIMARY)) {
+                        if (np_ai_insert_here(a))
+                            np_toast(a, "已插入", "AI 回复已写入光标处", CUI_TONE_INFO);
+                    }
+                    if (cui_button(ui, "复制结果", .variant = CUI_BUTTON_GHOST)) {
+                        cui_set_clipboard_text(a->ui, a->ai_result);
+                        np_toast(a, "已复制", "AI 回复已复制到剪贴板", CUI_TONE_INFO);
+                    }
+                }
             }
         } else {
             cui_column(ui, .width = CUI_FILL, .gap = 6) {
@@ -6479,6 +8192,32 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                          .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
                 cui_text(ui, "· 检查 / 解释 → 只回答，不改动正文", .size = 11,
                          .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+            }
+        }
+
+        /* Per-document history ---------------------------------------- */
+        if (d && d->ai_hist_count > 0) {
+            cui_separator(ui);
+            char labels[NP_AI_HISTORY_MAX][64];
+            const char *items[NP_AI_HISTORY_MAX];
+            for (int i = 0; i < d->ai_hist_count; i++) {
+                const np_ai_history *h = &d->ai_hist[i];
+                const char *tn = "AI";
+                if (h->task >= 7 && h->task - 7 < a->ai_action_count)
+                    tn = a->ai_actions[h->task - 7].name;
+                else if (h->task >= 0 && h->task < 7) tn = tasks[h->task];
+                snprintf(labels[i], sizeof labels[i], "历史 %d · %s", i + 1, tn);
+                items[i] = labels[i];
+            }
+            if (d->ai_hist_sel >= d->ai_hist_count) d->ai_hist_sel = d->ai_hist_count - 1;
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_select(ui, "ai-history", items, d->ai_hist_count,
+                           &d->ai_hist_sel, .label = "历史", .width = CUI_FILL);
+                if (cui_button(ui, "恢复", .size = CUI_SIZE_SM))
+                    np_ai_restore_history(a, d, d->ai_hist_sel);
+                if (cui_button(ui, "清空历史", .size = CUI_SIZE_SM,
+                               .variant = CUI_BUTTON_GHOST))
+                    d->ai_hist_count = 0;
             }
         }
     }
@@ -6511,8 +8250,12 @@ static void np_frame(cui_ctx *ui, void *user) {
 #endif
         np_webview_boot(a);      /* async: bring up native WebView for HTML preview */
         a->quiet = true;
-        for (int i = 0; i < a->startup_count; i++)
-            np_open_path(a, a->startup[i], false);
+        for (int i = 0; i < a->startup_count; i++) {
+            if (!strncmp(a->startup[i], "draft:", 6))
+                np_restore_draft(a, atoi(a->startup[i] + 6));
+            else
+                np_open_path(a, a->startup[i], false);
+        }
         if (a->startup_bt[0]) {
             np_doc *sd = np_cur(a);
             if (sd && sd->is_hex) {
@@ -6528,6 +8271,17 @@ static void np_frame(cui_ctx *ui, void *user) {
         a->quiet = false;
         a->last_active = a->active;
         np_logf(a, "就绪  ·  %d 个文档  ·  目录 %s", a->count, a->side_dir);
+    }
+
+    /* Periodically mirror unsaved buffers into the config directory. This is
+     * a best-effort crash net; exit still writes the authoritative snapshot. */
+    {
+        static time_t last_draft_save = 0;
+        time_t now = time(NULL);
+        if (now - last_draft_save >= 60) {
+            np_save_drafts(a);
+            last_draft_save = now;
+        }
     }
 
     /* EditPlus-style "directory follows the active file". */
@@ -7519,6 +9273,8 @@ int main(int argc, char **argv) {
     if (g.startup_count == 0 && g.session_restore) {
         for (int i = 0; i < g.session_count && g.startup_count < NP_DOC_MAX; i++)
             snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "%s", g.session[i]);
+        for (int i = 0; i < g.draft_count && g.startup_count < NP_DOC_MAX; i++)
+            snprintf(g.startup[g.startup_count++], NP_PATH_CAP, "draft:%d", i);
     }
 
 #ifdef __ANDROID__
