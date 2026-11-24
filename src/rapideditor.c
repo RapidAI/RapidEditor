@@ -6807,6 +6807,29 @@ static void np_smart_paste_open(notepad *a) {
 
 /* ---- inline completion (ghost text) --------------------------------- */
 
+/* Clean a raw model completion for inline display: trim whitespace, keep
+ * only the first line (the ghost renders on the caret's line) and unwrap a
+ * one-line code fence. Returns a pointer into buf, or NULL when nothing
+ * usable remains. Kept as a pure function so the regression test extracts
+ * and exercises the real implementation. */
+static char *np_inline_clean(char *buf) {
+    char *s = buf, *e = buf + strlen(buf);
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' ||
+                     e[-1] == '\r' || e[-1] == '\n')) e--;
+    *e = 0;
+    char *nl = strchr(s, '\n');
+    if (nl) *nl = 0;
+    /* models occasionally wrap one-liners in a code fence anyway */
+    size_t ln = strlen(s);
+    if (ln >= 6 && !strncmp(s, "```", 3) &&
+        !strncmp(s + ln - 3, "```", 3)) {
+        s[ln - 3] = 0;
+        s += 3;
+    }
+    return *s ? s : NULL;
+}
+
 static void np_inline_worker(void *arg) {
     notepad *a = (notepad *)arg;
     char out[1024] = {0}, err[256] = {0};
@@ -6814,23 +6837,9 @@ static void np_inline_worker(void *arg) {
                              a->inline_prompt, out, sizeof out, err, sizeof err);
     a->inline_result[0] = 0;
     if (ok) {
-        char *s = out, *e = out + strlen(out);
-        while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
-        while (e > s && (e[-1] == ' ' || e[-1] == '\t' ||
-                         e[-1] == '\r' || e[-1] == '\n')) e--;
-        *e = 0;
-        /* the suggestion renders on the caret's line: keep the first line */
-        char *nl = strchr(s, '\n');
-        if (nl) *nl = 0;
-        /* models occasionally wrap one-liners in a code fence anyway */
-        size_t ln = strlen(s);
-        if (ln >= 6 && !strncmp(s, "```", 3) &&
-            !strncmp(s + ln - 3, "```", 3)) {
-            s[ln - 3] = 0;
-            s += 3;
-        }
+        char *s = np_inline_clean(out);
         /* usable only when short enough to read at a glance */
-        if (*s && strlen(s) < 600) snprintf(a->inline_result, sizeof a->inline_result, "%s", s);
+        if (s && strlen(s) < 600) snprintf(a->inline_result, sizeof a->inline_result, "%s", s);
     }
     a->inline_done = ok ? 2 : 3;
 #ifdef _WIN32
