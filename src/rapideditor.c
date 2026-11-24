@@ -41,7 +41,7 @@
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.2.12"
+#define NP_APP_VERSION "1.3.1"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -3530,6 +3530,11 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "Alt             激活菜单栏，方向键选择菜单项",
             "编辑器内：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Tab 缩进",
             "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、括号跳转",
+            "Ctrl ,          外观设置（界面风格 / 深浅色 / 强调色 / 字号密度）",
+            "Alt \\           行内 AI 补全：光标处触发续写建议，Tab 接受 / Esc 忽略",
+            "Ctrl Alt 1..6   Markdown 标题级别（仅 .md），Ctrl Alt 0 恢复正文",
+            "Ctrl Alt B/I    Markdown 加粗 / 斜体（仅 .md）",
+            "Ctrl Alt T/M    LaTeX 表格向导 / 公式预览（仅 .tex）",
             "十六进制模式：二进制文件自动打开，或「文件 → 以十六进制模式重新打开」",
             "十六进制内：点击/拖选字节、方向键移动、键入十六进制覆盖、Ctrl C 复制",
             "十六进制内：Ctrl G 转到偏移、Ctrl A 全选、Ctrl Shift C 复制为 ASCII"
@@ -8311,7 +8316,7 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
             int d_idx = a->inline_delay >= 1 && a->inline_delay <= 3
                         ? a->inline_delay - 1 : 0;
             if (cui_select(ui, "inline-delay", inline_delays, 3, &d_idx,
-                           .label = "防抖"))
+                           .label = "防抖", .disabled = !a->ai_inline))
                 a->inline_delay = d_idx + 1;
         }
         cui_text(ui, a->ai_ctx_summary, .size = 11,
