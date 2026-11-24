@@ -8361,6 +8361,20 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                            .label = "防抖", .disabled = !a->ai_inline))
                 a->inline_delay = d_idx + 1;
         }
+        /* Inline suggestion preview: the editor only renders the first line
+         * of a multi-line ghost, so the full text is shown here to read
+         * before accepting it with Tab. */
+        if (d && !d->is_hex) {
+            const char *gt = cui_code_editor_ghost_text(a->ui, d->editor_id);
+            if (gt) {
+                cui_column(ui, .width = CUI_FILL, .gap = 4) {
+                    cui_text(ui, "行内建议预览（Tab 接受 · Esc 忽略）", .size = 11,
+                             .color = CUI_COLOR_TEXT_MUTED, .font = CUI_FONT_MEDIUM);
+                    cui_text(ui, gt, .size = 12, .nowrap = false,
+                             .color = CUI_COLOR_TEXT_MUTED);
+                }
+            }
+        }
         cui_text(ui, a->ai_ctx_summary, .size = 11,
                  .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
         cui_text(ui, a->ai_inline

@@ -1805,6 +1805,10 @@ CUI_API void cui_code_editor_ghost(cui_ctx *ui, const char *id, const char *text
  * The app cannot track the suggestion itself (the editor clears it on Escape
  * or caret moves), so state queries go through here. */
 CUI_API bool cui_code_editor_ghost_active(cui_ctx *ui, const char *id);
+/* The current suggestion text, or NULL. The pointer is owned by the editor
+ * and only valid until the next edit / suggestion change - use within the
+ * same frame, e.g. to preview a multi-line suggestion before accepting it. */
+CUI_API const char *cui_code_editor_ghost_text(cui_ctx *ui, const char *id);
 #ifndef __cplusplus
 #define cui_code_editor(ui, id, buf, cap, ...) cui_code_editor_ex((ui), (id), (buf), (cap), CUI__OPTS(cui_code_editor_opts, __VA_ARGS__))
 #endif

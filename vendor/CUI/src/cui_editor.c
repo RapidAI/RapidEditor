@@ -897,6 +897,13 @@ bool cui_code_editor_ghost_active(cui_ctx *ui, const char *id) {
     return s->init && s->ghost_len > 0;
 }
 
+const char *cui_code_editor_ghost_text(cui_ctx *ui, const char *id) {
+    cui__ed_state *s = cui__ed_get(ui, id);
+    if (!s->init || s->ghost_len <= 0) return NULL;
+    s->ghost[s->ghost_len] = 0;         /* cap+1 storage keeps this safe */
+    return s->ghost;
+}
+
 bool cui_code_editor_replace_external(cui_ctx *ui, const char *id,
         char *buf, size_t cap, int len, int a, int b,
         const char *text, int n, int *out_len) {
