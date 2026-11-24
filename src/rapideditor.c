@@ -528,7 +528,7 @@ typedef struct notepad {
     char inline_url[NP_LLM_PROV_URL_CAP], inline_key[NP_LLM_PROV_KEY_CAP],
          inline_model[NP_LLM_PROV_MODEL_CAP];       /* worker's provider snapshot */
     char inline_prompt[8192];
-    char inline_result[1024];           /* worker-owned until shown */
+    char inline_result[1280];           /* worker-owned until shown */
 
     /* maclaw official-service login (scan QR with phone) --------------- */
     bool dlg_maclaw;
@@ -6853,17 +6853,18 @@ static char *np_inline_clean(char *buf) {
 
 static void np_inline_worker(void *arg) {
     notepad *a = (notepad *)arg;
-    char out[1024] = {0}, err[256] = {0};
+    char out[2048] = {0}, err[256] = {0};
     /* per-call params: short suggestions with a fast timeout, independent
-     * of the (possibly expensive) global provider settings */
+     * of the (possibly expensive) global provider settings; 600 tokens
+     * covers the 300-character / 4-line budget of the prompt in Chinese */
     bool ok = np_openai_chat_ex(a->inline_url, a->inline_key, a->inline_model,
-                                a->inline_prompt, 0.f, 400, 30,
+                                a->inline_prompt, 0.f, 600, 30,
                                 out, sizeof out, err, sizeof err);
     a->inline_result[0] = 0;
     if (ok) {
         char *s = np_inline_clean(out);
         /* usable only when short enough to read at a glance */
-        if (s && strlen(s) < 600) snprintf(a->inline_result, sizeof a->inline_result, "%s", s);
+        if (s && strlen(s) < 1100) snprintf(a->inline_result, sizeof a->inline_result, "%s", s);
     }
     a->inline_done = ok ? 2 : 3;
 #ifdef _WIN32
@@ -6897,7 +6898,7 @@ static void np_inline_start(notepad *a, np_doc *d) {
              "你正在文本/代码编辑器里为用户提供行内续写。文件类型：%s。\n"
              "在 <CURSOR> 标记处续写。规则：\n"
              "1. 只输出要插入的续写文字本身，不要解释，不要 Markdown 代码块。\n"
-             "2. 最多两行、不超过 200 字符，宁短勿长。\n"
+             "2. 最多四行、不超过 300 字符，宁短勿长；需要多行时直接用换行。\n"
              "3. 不要重复 <CURSOR> 之后已有的内容。\n"
              "4. 没有合理续写时只输出一个空行。\n"
              "---<CURSOR> 之前---\n%s\n---<CURSOR>---\n%s\n---结束---",
