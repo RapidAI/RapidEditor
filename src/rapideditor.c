@@ -1511,10 +1511,11 @@ static void np_disk_check(notepad *a) {
         if (d->dirty) {
             np_toast(a, "文件已在磁盘上被修改",
                      "当前有未保存修改：直接保存将覆盖外部内容；"
-                     "如需外部版本，请先「另存为」本地内容", CUI_TONE_WARNING);
+                     "要改用磁盘版本请 Ctrl R 重新加载（放弃本地修改），"
+                     "或先「另存为」保留本地内容", CUI_TONE_WARNING);
         } else if (d->is_hex) {
             np_toast(a, "文件已在磁盘上被修改（十六进制视图未刷新）",
-                     d->path, CUI_TONE_WARNING);
+                     "Ctrl R 可从磁盘重新加载", CUI_TONE_WARNING);
         } else {
             int c = d->caret, sel = d->anchor;
             /* quiet during the reload: the "loaded" toast below replaces
@@ -1539,26 +1540,41 @@ static bool np_blank_untitled(const np_doc *d) {
     return !d->path[0] && !d->dirty && !d->text[0];
 }
 
-/* Idle auto-save for the active text document (opt-in). Reuses
+/* Idle auto-save for every dirty text document (opt-in). Reuses
  * inline_last_edit (bumped on every edit / caret move) as the idle
- * clock; a failed save backs off by the full idle window. Hex docs
- * are excluded - writing binaries back silently is too risky. */
+ * clock - saving all tabs once the user goes idle, not just the
+ * active one. A failed save backs off by the full idle window. Hex
+ * docs are excluded - writing binaries back silently is too risky. */
 static void np_auto_save_tick(notepad *a) {
     if (!a->auto_save || np_any_dialog(a)) return;
-    np_doc *d = np_cur(a);
-    if (!d || d->is_hex || !d->dirty || !d->path[0]) return;
-    /* The disk copy changed while we hold unsaved edits: auto-saving would
-     * silently overwrite it, which is exactly what the np_disk_check
-     * warning is about. Leave the decision to the user. */
-    if (d->disk_mtime_seen != 0 && d->disk_mtime_seen != d->disk_mtime) return;
     time_t now = time(NULL);
     if (now - a->inline_last_edit < 5) return;
-    if (np_save(a, d, d->path)) {
-        char msg[NP_PATH_CAP + 32];
-        snprintf(msg, sizeof msg, "%s", np_base(d->path));
-        np_toast(a, "已自动保存", msg, CUI_TONE_SUCCESS);
-    } else {
+    int saved = 0, blocked = 0, failed = 0;
+    for (int i = 0; i < a->count; i++) {
+        np_doc *d = a->docs[i];
+        if (!d || d->is_hex || !d->dirty || !d->path[0]) continue;
+        /* The disk copy changed while we hold unsaved edits: auto-saving
+         * would silently overwrite it, which is exactly what the
+         * np_disk_check warning is about. Leave the decision to the user. */
+        if (d->disk_mtime_seen != 0 && d->disk_mtime_seen != d->disk_mtime) {
+            blocked++;
+            continue;
+        }
+        if (np_save(a, d, d->path)) saved++;
+        else failed++;
+    }
+    if (failed > 0) {
         a->inline_last_edit = now;      /* back off before retrying */
+        return;
+    }
+    if (saved > 0) {
+        char msg[64];
+        if (blocked > 0)
+            snprintf(msg, sizeof msg, "已保存 %d 个文档（%d 个因外部修改跳过）",
+                     saved, blocked);
+        else
+            snprintf(msg, sizeof msg, "已保存 %d 个文档", saved);
+        np_toast(a, "自动保存", msg, CUI_TONE_SUCCESS);
     }
 }
 
@@ -2343,6 +2359,16 @@ static void np_apply_md_snip(notepad *a, int i) {
 static void np_open_find(notepad *a) {
     np_doc *d = np_cur(a);
     if (!d) return;
+    /* Seed the query with the current selection (capped), like most
+     * editors do - Ctrl F right after selecting a word just works. */
+    if (d->caret != d->anchor && !d->is_hex) {
+        int s0 = NP_MIN(d->caret, d->anchor), s1 = NP_MAX(d->caret, d->anchor);
+        int n = NP_MIN(s1 - s0, (int)sizeof a->find_query - 1);
+        if (n > 0 && n < 128 && !memchr(d->text + s0, '\n', (size_t)n)) {
+            memcpy(a->find_query, d->text + s0, (size_t)n);
+            a->find_query[n] = 0;
+        }
+    }
     cui_code_editor_find(a->ui, d->editor_id,
                          a->find_query[0] ? a->find_query : "");
 }
