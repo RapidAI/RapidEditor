@@ -516,6 +516,7 @@ typedef struct notepad {
      * accepts it (Tab) on its own; here we only decide when to ask the model.
      * Results are validated against the generation counter before showing. */
     bool ai_inline;                     /* enabled from the AI panel */
+    int  inline_delay;                  /* idle seconds before firing (1..5) */
     volatile long inline_done;          /* 0 idle 1 running 2 ok 3 fail */
     int  inline_gen;                    /* bumped on every edit / caret move */
     int  inline_res_gen;                /* generation the pending result belongs to */
@@ -5819,6 +5820,7 @@ static void np_config_load(notepad *a) {
     FILE *f = np_fopen_utf8(path, "rb");
     if (!f) return;
     a->style = -1;   /* legacy config without a style key keeps dark/accent behaviour */
+    a->inline_delay = 1;   /* config missing the key keeps the default debounce */
     char line[NP_PATH_CAP + 128];
     while (fgets(line, sizeof line, f)) {
         size_t n = strlen(line);
@@ -5885,6 +5887,10 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "ai_ctx")) { int v = atoi(val); if (v >= 0 && v <= 1) a->ai_ctx = v; }
         else if (!strcmp(key, "ai_ctx_tabs")) a->ai_ctx_tabs = atoi(val) != 0;
         else if (!strcmp(key, "ai_inline")) a->ai_inline = atoi(val) != 0;
+        else if (!strcmp(key, "ai_inline_delay")) {
+            a->inline_delay = atoi(val);
+            if (a->inline_delay < 1 || a->inline_delay > 5) a->inline_delay = 1;
+        }
         else if (!strcmp(key, "ai_ctx_finds")) a->ai_ctx_finds = atoi(val) != 0;
         else if (!strcmp(key, "ai_backend")) { int v = atoi(val); if (v >= 0 && v <= 12) a->ai_backend = v; }
         else if (!strncmp(key, "aiact", 5) && strchr(key + 5, '_')) {
@@ -6020,12 +6026,12 @@ static void np_config_save(notepad *a) {
             a->tidy_indent ? 1 : 0, a->tidy_join ? 1 : 0,
             a->tidy_trim ? 1 : 0, a->tidy_spaces);
     fprintf(f, "font_latin=%s\nfont_cjk=%s\n", a->font_latin_name, a->font_cjk_name);
-    fprintf(f, "ai_cmd=%s\nai_inst=%s\nai_task=%d\nai_ctx=%d\nai_backend=%d\nai_ctx_tabs=%d\nai_ctx_finds=%d\nai_inline=%d\n",
+    fprintf(f, "ai_cmd=%s\nai_inst=%s\nai_task=%d\nai_ctx=%d\nai_backend=%d\nai_ctx_tabs=%d\nai_ctx_finds=%d\nai_inline=%d\nai_inline_delay=%d\n",
             np_cfg_one_line(a->ai_cmd, cfgline1, sizeof cfgline1),
             np_cfg_one_line(a->ai_inst, cfgline2, sizeof cfgline2),
             a->ai_task, a->ai_ctx, a->ai_backend,
             a->ai_ctx_tabs ? 1 : 0, a->ai_ctx_finds ? 1 : 0,
-            a->ai_inline ? 1 : 0);
+            a->ai_inline ? 1 : 0, a->inline_delay);
     for (int i = 0; i < a->ai_action_count && i < NP_AI_ACTION_MAX; i++) {
         const np_ai_action *act = &a->ai_actions[i];
         fprintf(f, "aiact%d_name=%s\naiact%d_inst=%s\n", i,
@@ -6909,7 +6915,7 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                 if (a->ai_backend >= 5 && a->ai_backend - 5 < a->llm_prov_count) {
                     if (cui_button(ui, "补全", .size = CUI_SIZE_SM,
                                    .variant = CUI_BUTTON_GHOST,
-                                   .tooltip = "在光标处请求 AI 行内续写"))
+                                   .tooltip = "在光标处请求 AI 行内续写（Alt+\\）"))
                         np_inline_manual(a, d);
                 }
                 cui_spacer(ui);
@@ -7015,7 +7021,7 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             a->inline_done == 0 && a->ai_done == 0 &&
             a->ai_backend >= 5 && a->ai_backend - 5 < a->llm_prov_count &&
             !cui_code_editor_ghost_active(a->ui, d->editor_id) &&
-            time(NULL) - a->inline_last_edit >= 1) {
+            time(NULL) - a->inline_last_edit >= a->inline_delay) {
             np_inline_start(a, d);
         }
 
@@ -8301,12 +8307,18 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
             if (cui_checkbox(ui, "查找结果", &a->ai_ctx_finds)) np_ai_refresh_sources(a);
             cui_checkbox(ui, "行内补全", &a->ai_inline);
             cui_spacer(ui);
+            static const char *const inline_delays[3] = { "1 秒", "2 秒", "3 秒" };
+            int d_idx = a->inline_delay >= 1 && a->inline_delay <= 3
+                        ? a->inline_delay - 1 : 0;
+            if (cui_select(ui, "inline-delay", inline_delays, 3, &d_idx,
+                           .label = "防抖"))
+                a->inline_delay = d_idx + 1;
         }
         cui_text(ui, a->ai_ctx_summary, .size = 11,
                  .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
         cui_text(ui, a->ai_inline
-                 ? "行内补全：输入停顿约 1 秒后给出灰色续写建议，Tab 接受，Esc 忽略；也可点工具条「补全」或编辑器右键手动触发。"
-                 : "行内补全已关闭。开启后输入停顿时 AI 在光标处给出续写建议（Tab 接受）。",
+                 ? "行内补全：输入停顿后给出灰色续写建议（防抖时长本行可选），Tab 接受，Esc 忽略；Alt+\\、工具条「补全」或右键菜单可手动触发。"
+                 : "行内补全已关闭。开启后输入停顿时 AI 在光标处给出续写建议（Tab 接受）；Alt+\\ 随时可手动触发。",
                  .size = 11, .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
         cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
             cui_text(ui, a->ai_action_count
@@ -8658,6 +8670,12 @@ static void np_frame(cui_ctx *ui, void *user) {
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_0)) a->font_size = NP_FONT_DEF;
         for (int k = 0; k < 9 && k < a->count; k++)
             if (cui_shortcut(ui, CUI_MOD_PRIMARY, digit_keys[k])) np_activate(a, k, true);
+
+        /* Alt+\ triggers an inline AI completion at the caret (manual,
+         * independent of the auto-trigger switch). */
+        if (d && !d->is_hex && d->editor_focused &&
+            cui_shortcut(ui, CUI_MOD_ALT, CUI_KEY_BACKSLASH))
+            np_inline_manual(a, d);
 
         /* Markdown paragraph shortcuts (only for .md documents). Kept off the
          * plain Ctrl+digit range used for tab switching. */
@@ -9547,6 +9565,7 @@ int main(int argc, char **argv) {
     np_http_init(&g.web_server);
     g.side_ratio = 0.22f;
     g.ai_ratio = 0.72f;
+    g.inline_delay = 1;
     g.out_ratio = 0.76f;
     g.side_tab = 0;
     g.out_tab = 1;           /* start on the message log */

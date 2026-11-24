@@ -528,3 +528,22 @@ MSVC 构建通过；三组回归全绿。
   Esc 忽略」，同样基于 ghost_active 查询。
 
 MSVC 构建通过；test_openai / test_maclaw / test_fence 三组回归全绿。
+
+## 行内补全快捷键 / 防抖可配 / 一键回归（第十三批）
+
+- **Alt+\ 手动触发**：CUI 键枚举加 `CUI_KEY_BACKSLASH`（加在 `CUI_KEY_COUNT`
+  之前，不影响既有键值），五个平台层各加一行映射（win32 `VK_OEM_5`、cocoa
+  `'\\'`、glfw/sdl2/x11 各自常量）。应用层在 `np_frame` 主快捷键区注册
+  `Alt+\`：仅当前文档非 hex 且编辑器有焦点时调用 `np_inline_manual`。
+  `cui_shortcut` 是精确 mods 匹配（`(mods & relevant) == mods`），Alt+Shift+\
+  不会误触发。
+- **防抖时长可配**：`inline_delay` 字段（1..5 秒，配置键 `ai_inline_delay`，
+  load 时缺省/clamp 为 1），AI 面板「行内补全」同行的下拉可选 1/2/3 秒，
+  idle 触发条件改用该值。
+- **一键回归**：新增 `scripts/run_tests.ps1`——自动探测 MSVC/SDK 版本
+  （PS 5.1 的通配符 `*\Community\...` 会把 MSVC 目录本身当结果，必须逐层
+  循环展开），编译并运行 test_fence / test_openai / test_maclaw，任一失败
+  退出码非零。测试编译要点保留：`cl /I src`，链接对应实现文件（np_openai.c
+  / np_maclaw.c），多源文件不能带 /Fo。
+
+MSVC 构建通过；三组回归全绿。
