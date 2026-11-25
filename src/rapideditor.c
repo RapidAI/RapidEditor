@@ -408,6 +408,7 @@ typedef struct notepad {
     char replace_with[256];
     char goto_buf[32];
     bool match_case;
+    bool find_word;                     /* whole-word matching, shared by find surfaces */
     int  lang_pick;
 
     cui_ctx *ui;
@@ -1738,6 +1739,23 @@ static bool np_match(const char *p, const char *q, size_t n, bool match_case) {
     return true;
 }
 
+/* Word character for whole-word matching (same definition as the editor
+ * find bar: ASCII letters, digits, '_'; UTF-8 continuation bytes never
+ * count, so non-word queries simply never match at their edges). */
+static bool np_word_char(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Whole-word edge check for a match of n bytes at text[i]. ww=false is
+ * always true so callers can gate unconditionally. */
+static bool np_word_edge(const char *text, size_t len, size_t i, size_t n, bool ww) {
+    if (!ww) return true;
+    if (i > 0 && np_word_char((unsigned char)text[i - 1])) return false;
+    if (i + n < len && np_word_char((unsigned char)text[i + n])) return false;
+    return true;
+}
+
 static uint64_t np_str_hash(const char *s) {
     uint64_t h = 1469598103934665603ULL;
     for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
@@ -1751,12 +1769,14 @@ static int np_count_matches(notepad *a) {
     size_t qlen = strlen(a->find_query);
     if (!d || !qlen) return 0;
     uint64_t key = d->content_rev * 1315423911ULL + np_str_hash(a->find_query)
-                   + (uint64_t)a->match_case;
+                   + (uint64_t)a->match_case
+                   + (a->find_word ? 0x9e3779b9ULL : 0);
     if (d->matches_key == key) return d->match_count;
     size_t n = (size_t)d->len;
     int count = 0;
     for (size_t i = 0; i + qlen <= n;) {
-        if (np_match(d->text + i, a->find_query, qlen, a->match_case)) {
+        if (np_match(d->text + i, a->find_query, qlen, a->match_case) &&
+            np_word_edge(d->text, n, i, qlen, a->find_word)) {
             count++;
             i += qlen;
         } else {
@@ -1785,7 +1805,8 @@ static int np_replace_all(notepad *a) {
     size_t o = 0;
     int count = 0;
     for (size_t i = 0; i < n;) {
-        if (i + qlen <= n && np_match(d->text + i, a->find_query, qlen, a->match_case)) {
+        if (i + qlen <= n && np_match(d->text + i, a->find_query, qlen, a->match_case) &&
+            np_word_edge(d->text, n, i, qlen, a->find_word)) {
             memcpy(d->tmp + o, a->replace_with, rlen);
             o += rlen;
             i += qlen;
@@ -2392,11 +2413,11 @@ static void np_open_find(notepad *a) {
             a->find_query[n] = 0;
         }
     }
-    /* The find bar follows the dialog's "match case" setting, so both
-     * find surfaces agree on what a match is. */
-    cui_code_editor_find_case(a->ui, d->editor_id,
+    /* The find bar follows the dialog's match settings, so both find
+     * surfaces agree on what a match is. */
+    cui_code_editor_find_opts(a->ui, d->editor_id,
                               a->find_query[0] ? a->find_query : "",
-                              a->match_case);
+                              a->match_case, a->find_word);
 }
 
 static void np_do_goto(notepad *a) {
@@ -2928,6 +2949,7 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
                       .label = "替换为", .placeholder = "留空表示删除",
                       .width = CUI_FILL);
             cui_checkbox(ui, "区分大小写", &a->match_case);
+            cui_checkbox(ui, "全词匹配", &a->find_word);
             char info[96];
             snprintf(info, sizeof info, "共找到 %d 处匹配", np_count_matches(a));
             cui_text(ui, info, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
@@ -6087,6 +6109,7 @@ static void np_config_load(notepad *a) {
         else if (!strcmp(key, "auto_save")) a->auto_save = atoi(val) != 0;
         else if (!strcmp(key, "session_restore")) a->session_restore = atoi(val) != 0;
         else if (!strcmp(key, "match_case")) a->match_case = atoi(val) != 0;
+        else if (!strcmp(key, "find_word")) a->find_word = atoi(val) != 0;
         else if (!strcmp(key, "lt_align")) snprintf(a->ltable_align, sizeof a->ltable_align, "%s", val);
         else if (!strcmp(key, "lt_style")) { int v = atoi(val); if (v >= 0 && v <= 1) a->ltable_style = v; }
         else if (!strcmp(key, "lt_header")) a->ltable_header = atoi(val) != 0;
@@ -6223,11 +6246,11 @@ static void np_config_save(notepad *a) {
             a->show_preview ? 1 : 0, a->preview_ratio,
             a->show_ai ? 1 : 0, a->ai_ratio);
     fprintf(f, "follow_active=%d\ndefault_crlf=%d\nmake_backup=%d\n"
-               "session_restore=%d\nmatch_case=%d\nsystem_theme=%d\n"
+               "session_restore=%d\nmatch_case=%d\nfind_word=%d\nsystem_theme=%d\n"
                "auto_save=%d\n",
             a->follow_active ? 1 : 0, a->default_crlf ? 1 : 0,
             a->make_backup ? 1 : 0, a->session_restore ? 1 : 0,
-            a->match_case ? 1 : 0, a->dark_valid ? 0 : 1,
+            a->match_case ? 1 : 0, a->find_word ? 1 : 0, a->dark_valid ? 0 : 1,
             a->auto_save ? 1 : 0);
     fprintf(f, "editor_font=%s\neditor_font_path=%s\n",
             a->font_ident[0] ? a->font_ident : "default", a->font_custom_path);
@@ -6519,7 +6542,9 @@ static void np_build_hits(notepad *a, np_doc *d) {
     int line = 1, line_start = 0;
     for (int i = 0; i + (int)qlen <= n; i++) {
         if (first_ok[t[i]] &&
-            np_match(d->text + i, a->find_query, qlen, a->match_case)) {
+            np_match(d->text + i, a->find_query, qlen, a->match_case) &&
+            np_word_edge((const char *)d->text, (size_t)n, (size_t)i,
+                         qlen, a->find_word)) {
             int s = i > line_start + 40 ? i - 40 : line_start;
             while (s < i && (t[s] & 0xC0) == 0x80) s++;
             int e = i + (int)qlen;
@@ -8905,6 +8930,22 @@ static void np_frame(cui_ctx *ui, void *user) {
     /* Opt-in idle auto-save (after the disk check: it updates mtime). */
     np_auto_save_tick(a);
 
+    /* The find bar's Aa / W toggles are the live source of truth: mirror
+     * them back into the shared settings (and persist on change) so the
+     * replace dialog and Ctrl F agree the next time either opens. */
+    {
+        np_doc *cur = np_cur(a);
+        if (cur) {
+            bool mc, ww;
+            cui_code_editor_find_toggles(a->ui, cur->editor_id, &mc, &ww);
+            if (mc != a->match_case || ww != a->find_word) {
+                a->match_case = mc;
+                a->find_word = ww;
+                np_config_save(a);
+            }
+        }
+    }
+
     /* EditPlus-style "directory follows the active file". */
     if (a->follow_active && a->active != a->last_active) {
         np_doc *cur = np_cur(a);
@@ -9848,6 +9889,7 @@ int main(int argc, char **argv) {
     g.accent = CUI_ACCENT_BLUE;
     g.density = 0;
     g.match_case = false;
+    g.find_word = false;
     g.pending_action = ACT_NONE;
     g.pending_doc = -1;
     g.show_sidebar = true;

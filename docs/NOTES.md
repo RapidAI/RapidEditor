@@ -760,3 +760,29 @@ Ctrl F 打开的编辑器内嵌查找栏此前永远不区分大小写，而「�
   吞字符，"\xC3\x89a" 会被解析成 \x89a——用字符串拼接断开。
 
 MSVC 构建通过；六项回归全绿（check_config + 5 组单测）。
+
+## 查找栏 Aa / 全词切换按钮（第二十八批）
+
+第二十七批把 match_case 贯通到查找栏后，遗留问题：用户在查找栏内
+没有开关可按——只能去替换对话框勾选。本批给查找栏加两个即时切换
+按钮，并把「全词匹配」作为新语义同时落进 app 层。
+
+- vendor/CUI：查找栏加「Aa」（区分大小写）与「W」（全词）两个
+  toggle 按钮（selected + accent 色），翻转后立即从选区重跑搜索，
+  计数与高亮同步更新。`cui__ed_word_byte`（ASCII 字母数字下划线；
+  UTF-8 续字节永不计入，非词查询在边界处自然不命中）。
+- 新 API：`cui_code_editor_find_opts`（seed 两个开关）、
+  `cui_code_editor_find_toggles`（读回开关状态——遵循「以持有真相
+  的一方做查询」模式）。
+- app 层：notepad 加 `find_word`（配置键 find_word，load/save 各一）；
+  主循环每帧读回当前文档的开关状态，变化即写回 match_case/find_word
+  并立即 np_config_save——查找栏与替换对话框互相镜像，永不分叉。
+- np_replace_all / np_count_matches / np_ff_run 三处接入
+  `np_word_edge`（word=false 恒真，调用方无脑 gate）；matches_key
+  哈希掺入 find_word。替换对话框加「全词匹配」checkbox。
+- test_match 增补 np_word_edge 用例（8 个）：两端边界、'-' 不算
+  词字符、'_' 算、UTF-8 字节不算词字符、ww=false 恒真。
+- 踩坑：提取式测试要求签名单行（签名折行会让 \s*\{ 匹配失败）；
+  np_word_edge 引用 np_word_char，两者都要提取。
+
+MSVC 构建通过；六项回归全绿（test_match 现含 23 用例）。

@@ -50,6 +50,8 @@ function Extract-Fn([string]$signature, [string]$implPath) {
 Extract-Fn "static void np_ai_strip_code_fence(char *buf, size_t cap)" (Join-Path $out "np_ai_strip_code_fence.impl")
 Extract-Fn "static char *np_inline_clean(char *buf)" (Join-Path $out "np_inline_clean.impl")
 Extract-Fn "static bool np_match(const char *p, const char *q, size_t n, bool match_case)" (Join-Path $out "np_match.impl")
+Extract-Fn "static bool np_word_char(unsigned char c)" (Join-Path $out "np_word_char.impl")
+Extract-Fn "static bool np_word_edge(const char *text, size_t len, size_t i, size_t n, bool ww)" (Join-Path $out "np_word_edge.impl")
 
 # Static config-key consistency check (needs no compiler).
 Write-Host "== check_config ==" -ForegroundColor Cyan

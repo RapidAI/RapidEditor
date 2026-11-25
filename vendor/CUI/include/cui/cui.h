@@ -1800,6 +1800,12 @@ CUI_API void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query
 /* Same as cui_code_editor_find; match_case makes the find bar honour letter
  * case (matches, counts and highlights). */
 CUI_API void cui_code_editor_find_case(cui_ctx *ui, const char *id, const char *query, bool match_case);
+/* Same, with both find-bar toggles seeded (the bar's Aa and W buttons can
+ * change them at runtime). */
+CUI_API void cui_code_editor_find_opts(cui_ctx *ui, const char *id, const char *query, bool match_case, bool whole_word);
+/* Reads back the find bar's toggle state, so the app can mirror the bar's
+ * Aa / W buttons into its own settings. */
+CUI_API void cui_code_editor_find_toggles(cui_ctx *ui, const char *id, bool *match_case, bool *whole_word);
 /* Shows an inline completion suggestion (ghost text) right after the caret;
  * NULL or "" clears it. The editor clears the suggestion automatically on any
  * edit, caret move or Escape. Tab accepts it as one undoable edit. */

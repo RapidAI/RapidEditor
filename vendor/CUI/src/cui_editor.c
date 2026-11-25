@@ -37,6 +37,7 @@ typedef struct {
     int mode;                   /* bar: 0 none, 1 find, 2 go to line */
     char query[128], go[24];
     bool find_case;             /* find bar honours letter case */
+    bool find_word;             /* find bar matches whole words only */
     bool tab_free;              /* Esc released Tab: the next one moves focus */
     bool bar_focus;             /* give the bar's field focus this frame */
     bool pend_sel, pend_goto, pend_find, init;
@@ -430,26 +431,42 @@ static void cui__ed_brackets(const cui__ed *E, int caret, int *a, int *b) {
 /* ---- find ---- */
 
 
-/* mc: case sensitive match. Default (false) keeps the historical
- * case-insensitive behaviour of the find bar. */
-static bool cui__ed_hit(const char *s, int len, int i, const char *q, int qn, bool mc) {
+/* Word character for whole-word matching: ASCII letters, digits, '_'.
+ * Multi-byte UTF-8 bytes never count as word chars, so a whole-word
+ * query that is not a word itself simply never matches at its edges. */
+static bool cui__ed_word_byte(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+/* mc: case sensitive match (default false keeps the historical
+ * case-insensitive behaviour of the find bar). ww: the match must be a
+ * whole word - no word character may touch either edge. */
+static bool cui__ed_hit(const char *s, int len, int i, const char *q, int qn,
+                        bool mc, bool ww) {
     if (qn <= 0 || i < 0 || i + qn > len) return false;
-    if (mc) return memcmp(s + i, q, (size_t)qn) == 0;
-    for (int k = 0; k < qn; k++) if (cui__ascii_lower((unsigned char)s[i + k]) != cui__ascii_lower((unsigned char)q[k])) return false;
+    if (mc) { if (memcmp(s + i, q, (size_t)qn) != 0) return false; }
+    else {
+        for (int k = 0; k < qn; k++) if (cui__ascii_lower((unsigned char)s[i + k]) != cui__ascii_lower((unsigned char)q[k])) return false;
+    }
+    if (ww) {
+        if (i > 0 && cui__ed_word_byte((unsigned char)s[i - 1])) return false;
+        if (i + qn < len && cui__ed_word_byte((unsigned char)s[i + qn])) return false;
+    }
     return true;
 }
 
 /* First match at or after from (dir > 0), or last one before from (dir < 0),
  * wrapping around the ends; -1 when there is none. */
-static int cui__ed_find(const char *s, int len, const char *q, int qn, int from, int dir, bool mc) {
+static int cui__ed_find(const char *s, int len, const char *q, int qn, int from, int dir, bool mc, bool ww) {
     if (qn <= 0 || qn > len) return -1;
     int last = len - qn;
     if (dir > 0) {
-        for (int i = CUI_MAX(0, from); i <= last; i++) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
-        for (int i = 0; i < CUI_MIN(from, last + 1); i++) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
+        for (int i = CUI_MAX(0, from); i <= last; i++) if (cui__ed_hit(s, len, i, q, qn, mc, ww)) return i;
+        for (int i = 0; i < CUI_MIN(from, last + 1); i++) if (cui__ed_hit(s, len, i, q, qn, mc, ww)) return i;
     } else {
-        for (int i = CUI_MIN(from - 1, last); i >= 0; i--) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
-        for (int i = last; i >= CUI_MAX(0, from); i--) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
+        for (int i = CUI_MIN(from - 1, last); i >= 0; i--) if (cui__ed_hit(s, len, i, q, qn, mc, ww)) return i;
+        for (int i = last; i >= CUI_MAX(0, from); i--) if (cui__ed_hit(s, len, i, q, qn, mc, ww)) return i;
     }
     return -1;
 }
@@ -457,7 +474,7 @@ static int cui__ed_find(const char *s, int len, const char *q, int qn, int from,
 static void cui__ed_find_go(cui__ed *E, int from, int dir) {
     const char *q = E->st->query;
     int qn = (int)strlen(q);
-    int at = cui__ed_find(E->buf, E->len, q, qn, from, dir, E->st->find_case);
+    int at = cui__ed_find(E->buf, E->len, q, qn, from, dir, E->st->find_case, E->st->find_word);
     if (at < 0) return;
     E->st->ed.anchor = at;
     E->st->ed.cursor = at + qn;
@@ -628,6 +645,7 @@ typedef struct {
     float br_px[2];
     const char *query; int qn;
     bool qcase;                 /* find matches honour letter case */
+    bool qword;                 /* find matches whole words only */
     const cui_text_mark *marks; int nmarks;   /* the app's marks that reach the lines in view */
     cui_color mark_colors[7];
     const char *placeholder;
@@ -769,7 +787,7 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
         /* find matches */
         if (p->qn > 0) {
             for (int i = ls; i + p->qn <= le; i++) {
-                if (!cui__ed_hit(s, le, i, p->query, p->qn, p->qcase)) continue;
+                if (!cui__ed_hit(s, le, i, p->query, p->qn, p->qcase, p->qword)) continue;
                 float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i);
                 float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i + p->qn);
                 cui_draw_rect_border(ui, (cui_rect){ x0 + xa - 1, y + 1, xb - xa + 2, p->lh - 2 }, CUI_CORNERS(3), p->match, p->match_edge, 1);
@@ -868,18 +886,33 @@ void cui_code_editor_select(cui_ctx *ui, const char *id, int anchor, int cursor)
 }
 
 void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query) {
-    cui_code_editor_find_case(ui, id, query, false);
+    cui_code_editor_find_opts(ui, id, query, false, false);
 }
 
 /* Open the find bar seeded with query; match_case honours letter case. */
 void cui_code_editor_find_case(cui_ctx *ui, const char *id, const char *query, bool match_case) {
+    cui_code_editor_find_opts(ui, id, query, match_case, false);
+}
+
+/* Open the find bar with both toggles set; the bar's Aa and W buttons
+ * change them at runtime (read them back with cui_code_editor_find_toggles). */
+void cui_code_editor_find_opts(cui_ctx *ui, const char *id, const char *query, bool match_case, bool whole_word) {
     cui__ed_state *s = cui__ed_get(ui, id);
     s->find_case = match_case;
+    s->find_word = whole_word;
     if (!query) { s->mode = 0; return; }
     snprintf(s->query, sizeof s->query, "%s", query);
     s->mode = 1;
     s->bar_focus = s->pend_find = true;
     ui->animating = true;
+}
+
+/* Current find-bar toggle state (false when no frame has run yet). Lets
+ * the app mirror the bar's toggles into its own persisted settings. */
+void cui_code_editor_find_toggles(cui_ctx *ui, const char *id, bool *match_case, bool *whole_word) {
+    cui__ed_state *s = cui__ed_get(ui, id);
+    if (match_case) *match_case = s->init && s->find_case;
+    if (whole_word) *whole_word = s->init && s->find_word;
 }
 
 void cui_code_editor_ghost(cui_ctx *ui, const char *id, const char *text) {
@@ -1347,13 +1380,28 @@ static void cui__edf_build_find(cui__edf *f, cui_input_opts *io, cui_button_opts
     int s0 = CUI_MIN(e->cursor, e->anchor);
     if (fl & CUI_CHANGED) cui__ed_find_go(E, s0, 1);   /* as you type, from where the selection starts */
     if (fl & CUI_SUBMITTED) cui__ed_find_go(E, shift ? s0 : s0 + (e->cursor != e->anchor ? 1 : 0), shift ? -1 : 1);
+    /* case / whole-word toggles: flipping either re-runs the search from
+     * the selection so the count and the highlight catch up immediately */
+    bo->tooltip = "Match case";
+    bo->selected = st->find_case;
+    bo->color = st->find_case ? CUI_COLOR_ACCENT : (cui_color){ 0 };
+    if (cui_button_ex(ui, "Aa", bo)) { st->find_case = !st->find_case; cui__ed_find_go(E, s0, 1); }
+    ui->nodes[ui->last_node].h = CUI_PX(26);
+    bo->tooltip = "Match whole word";
+    bo->selected = st->find_word;
+    bo->color = st->find_word ? CUI_COLOR_ACCENT : (cui_color){ 0 };
+    if (cui_button_ex(ui, "W", bo)) { st->find_word = !st->find_word; cui__ed_find_go(E, s0, 1); }
+    ui->nodes[ui->last_node].h = CUI_PX(26);
+    bo->selected = false;
+    bo->color = (cui_color){ 0 };
+    bo->tooltip = NULL;
     /* the count, and which match the selection is */
     int total = 0, index = 0;
     s0 = CUI_MIN(e->cursor, e->anchor);
     int s1 = CUI_MAX(e->cursor, e->anchor);
-    bool on_match = qn > 0 && s1 - s0 == qn && cui__ed_hit(E->buf, E->len, s0, st->query, qn, st->find_case);
+    bool on_match = qn > 0 && s1 - s0 == qn && cui__ed_hit(E->buf, E->len, s0, st->query, qn, st->find_case, st->find_word);
     for (int i = 0; qn > 0 && i + qn <= E->len; i++)
-        if (cui__ed_hit(E->buf, E->len, i, st->query, qn, st->find_case)) { total++; if (i < s0 || (on_match && i == s0)) index++; }
+        if (cui__ed_hit(E->buf, E->len, i, st->query, qn, st->find_case, st->find_word)) { total++; if (i < s0 || (on_match && i == s0)) index++; }
     f->res->find_matches = total;
     f->res->find_index = on_match ? index : 0;
     const char *label = qn == 0 ? "" : narrow ? (on_match ? cui__frame_printf(ui, "%d/%d", index, total) : cui__frame_printf(ui, "%d", total))
@@ -1533,7 +1581,7 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
             }
         }
     }
-    if (st->mode == 1 && st->query[0]) { p->query = cui__frame_strdup(ui, st->query, -1); p->qn = (int)strlen(p->query); p->qcase = st->find_case; }
+    if (st->mode == 1 && st->query[0]) { p->query = cui__frame_strdup(ui, st->query, -1); p->qn = (int)strlen(p->query); p->qcase = st->find_case; p->qword = st->find_word; }
     if (f->o->marks && f->o->mark_count > 0) {   /* the marks that reach the lines in view, copied: the caller owns them */
         const cui_text_mark *mk = f->o->marks;
         int n = f->o->mark_count, lo = 0, hi = n;

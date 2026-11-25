@@ -12,7 +12,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include "np_word_char.impl"
 #include "np_match.impl"
+#include "np_word_edge.impl"
 
 static int fails = 0;
 #define CHECK(cond, msg) do { \
@@ -53,6 +55,17 @@ int main(void) {
     m("abc", "abc", true, true, "exact full-string match");
     m("aXc", "abc", false, false, "middle mismatch");
     m("", "a", false, false, "empty haystack");
+
+    /* whole-word edge check (np_word_edge: text, len, i, n, ww) */
+    CHECK(np_word_edge("var x = var;", 12, 0, 3, true), "ww: match at start");
+    CHECK(np_word_edge("var x = var;", 12, 8, 3, true), "ww: match before NUL edge");
+    CHECK(!np_word_edge("xvar", 4, 1, 3, true), "ww: word char on left edge");
+    CHECK(!np_word_edge("vars", 4, 0, 3, true), "ww: word char on right edge");
+    CHECK(np_word_edge("a-var", 5, 2, 3, true), "ww: '-' is not a word char");
+    CHECK(!np_word_edge("var_v", 5, 0, 3, true), "ww: '_' is a word char");
+    CHECK(np_word_edge("vars", 4, 0, 3, false), "ww off: edges ignored");
+    CHECK(np_word_edge("\xE4\xBD\xA0var", 5, 2, 3, true),
+          "ww: UTF-8 byte is not a word char");
 
     printf(fails ? "\n%d FAILURES\n" : "\nALL TESTS PASSED (%d failures)\n",
            fails);
