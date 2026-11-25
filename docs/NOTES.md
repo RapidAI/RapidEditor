@@ -988,3 +988,33 @@ UI_PLAN P2 第七、八项落地（文件类型图标着色 + 标签页语言图
 
 MSVC 构建通过；八项回归全绿。注意：CUI_C 是 vendor 内部宏，app 层
 读具体主题色用 cui_theme_get(ui)->colors[...]。
+
+UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
+
+- 「目录」tab 从平面列表 + 「.. 上级」改为 cui_tree 递归树。固定
+  节点池 NP_TREE_MAX 3072（约 245KB 名字块），子目录懒加载——只在
+  展开时 cui_fs_list 一次（400 上限，复用 np_dir_cmp 排序）；空闲帧
+  只画开路径上的节点，零扫描成本。
+- 展开态按「相对根的路径」记忆（np_open_set，160 条上限），根变化
+  时清空；重建（刷新/换目录/文件操作）后从集合恢复，无需重扫。
+- 当前文件自动展开定位（reveal）：按路径逐级确保已加载并展开，
+  选中该文件。触发点两处：tab 切换（follow_active 时还会把根重定向
+  到文件目录）与启动（此前 last_active 在就绪块被同步、follow 块
+  永不触发——启动也要显式 reveal）。
+- 右键菜单绑定在树行上（cui_context_menu 紧跟 cui_tree_begin，
+  last_id 即行）：新建文件/新建文件夹/重命名（对话框复用
+  cui_dialog + cui_input，Enter 提交）/在系统中打开/打开所在文件夹。
+  新建与重命名走 _wmkdir/_wrename/_wfopen（UTF-8 全程安全）；重命名
+  后同步更新持有旧路径的打开文档。
+- vendor：cui_tree_opts 加 icon_color（alpha 0 默认），树文件图标与
+  #7 家族着色一致。
+- 路径语义修复（调试实锤）：np_tree_root 此前从未赋值——np_tree_path
+  返回空串，cui_fs_list("") 列出进程 CWD；且文档路径按原样存相对
+  路径（命令行 "src\main.c"），follow/reveal 全部错位。两修：
+  np_tree_build 显式落地 np_tree_root；np_open_path 入口 np_abs_path
+  绝对化（文档路径从此全绝对）。
+- 顺手修面包屑 "###crumb" 后缀泄漏（cui_text 不剥 ###id）。
+- 验证：MSVC 构建 + 八项回归全绿；RDP 恢复后截图实证——树形层级、
+  懒加载展开、follow 重定向 + reveal 选中高亮、家族图标着色全部
+  正常。右键菜单代码审查通过（与编辑器菜单同机制），屏幕抓取随后
+  在环境层失效未能截图。

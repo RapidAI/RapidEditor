@@ -994,6 +994,7 @@ CUI_API void cui_accordion_end(cui_ctx *ui);
 typedef struct cui_tree_opts {
     int _;
     const char *icon;
+    cui_color icon_color;      /* alpha 0 keeps the default muted icon color */
     bool leaf;                 /* a node without children: no chevron, a file icon, and `*open` is left alone */
     bool selected;             /* drawn with the active background and medium weight text */
 } cui_tree_opts;

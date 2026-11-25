@@ -149,7 +149,9 @@ bool cui_tree_begin(cui_ctx *ui, const char *label, bool *open, const cui_tree_o
     if (o->leaf) cui_gap(ui, 14);
     else cui__chevron_node(ui, -CUI_PI * 0.5f + st->t.x * CUI_PI * 0.5f, 14, CUI_C(ui, TEXT_MUTED));
     const char *icon = o->icon ? o->icon : (o->leaf ? CUI_ICON_FILE : (is_open ? CUI_ICON_FOLDER_OPEN : CUI_ICON_FOLDER));
-    cui__icon_node(ui, icon, 16, o->selected ? CUI_C(ui, FOREGROUND) : CUI_C(ui, TEXT_SECONDARY));
+    cui__icon_node(ui, icon, 16, o->selected ? CUI_C(ui, FOREGROUND)
+                                             : (o->icon_color.a ? o->icon_color
+                                                                : CUI_C(ui, TEXT_SECONDARY)));
     int t = cui__text_node(ui, label, cui__display_len(label), o->selected ? CUI_FONT_MEDIUM : CUI_FONT_BODY,
                            cui__fs(ui, ui->theme.text_body), CUI_C(ui, FOREGROUND), false);
     ui->nodes[t].line_height = 1.3f;

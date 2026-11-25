@@ -44,6 +44,7 @@
 #define NP_APP_VERSION "1.3.3"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -64,6 +65,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <wchar.h>
+#include <direct.h>         /* _wmkdir */
 #include <wincrypt.h>       /* DPAPI: encrypt saved LLM API keys */
 #endif
 
@@ -163,6 +165,36 @@ static const char *np_ext(const char *path) {
 }
 
 static void np_dir_of(const char *path, char *out, size_t cap);  /* defined below */
+
+/* Resolve a path against the process cwd; absolute input passes through.
+ * Document paths are stored absolute so the tree, follow-mode and reveal
+ * agree no matter where the app was launched from. */
+static void np_abs_path(const char *path, char *out, size_t cap) {
+    bool absolute =
+#ifdef _WIN32
+        (path[0] && path[1] == ':') || path[0] == '/' || path[0] == '\\';
+#else
+        path[0] == '/';
+#endif
+    if (absolute) {
+        snprintf(out, cap, "%s", path);
+        return;
+    }
+    char cwd[NP_PATH_CAP];
+#ifdef _WIN32
+    wchar_t w[1024];
+    DWORD n = GetCurrentDirectoryW(1024, w);
+    if (n > 0 && n < 1024)
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, cwd, sizeof cwd, NULL, NULL);
+    else
+        snprintf(cwd, sizeof cwd, ".");
+#else
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+#endif
+    snprintf(out, cap, "%s%s%s", cwd,
+             cwd[strlen(cwd) - 1] == '/' || cwd[strlen(cwd) - 1] == '\\' ? "" : "/",
+             path);
+}
 
 static bool np_ext_in(const char *list, const char *ext) {
     size_t n = strlen(ext);
@@ -501,10 +533,7 @@ typedef struct notepad {
     float ai_ratio;                 /* workspace share when the AI panel is docked */
     int  side_tab, out_tab;         /* 目录/文档/最近 · 查找结果/消息 */
     char side_dir[NP_PATH_CAP];
-    bool side_reload;
-    cui_file_entry side_entries[NP_DIR_MAX];
-    char side_names[NP_DIR_MAX * 96];
-    int  side_count;
+    bool side_reload;               /* rebuild the sidebar tree next frame */
 
     char msgs[NP_LOG_MAX][256];
     int  msg_count;
@@ -803,10 +832,19 @@ static void np_sem_start(notepad *a);
 static void np_config_save(notepad *a);
 static bool np_smart_paste_insert(notepad *a, const char *text);
 static void np_smart_paste_open(notepad *a);
+static void np_system_open(notepad *a, const char *path, bool locate);  /* defined below */
+
+/* sidebar tree file-op dialog (state + confirm live with the tree below) */
+enum { NP_TREE_OP_NONE = 0, NP_TREE_OP_NEWFILE, NP_TREE_OP_NEWDIR, NP_TREE_OP_RENAME };
+static int  np_tree_op;                     /* which file op the dialog performs */
+static bool np_tree_op_open;                /* dialog visible */
+static char np_tree_op_path[NP_PATH_CAP];   /* target dir (new) or node (rename) */
+static char np_tree_op_name[NP_PATH_CAP];   /* name text input */
+static void np_tree_confirm(notepad *a);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
-           a->dlg_hexfind ||
+           a->dlg_hexfind || np_tree_op_open ||
            a->dlg_settings || a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
@@ -1667,6 +1705,9 @@ static void np_auto_save_tick(notepad *a) {
 /* Open a path in a new tab (or switch to the tab that already has it). */
 static bool np_open_path(notepad *a, const char *path, bool focus_editor) {
     if (!path || !path[0]) return false;
+    char abspath[NP_PATH_CAP];
+    np_abs_path(path, abspath, sizeof abspath);
+    path = abspath;
     for (int i = 0; i < a->count; i++) {
         if (a->docs[i]->path[0] && strcmp(a->docs[i]->path, path) == 0) {
             np_activate(a, i, focus_editor);
@@ -3097,6 +3138,35 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
     np_settings_dialog(ui, a);
     np_ai_actions_dialog(ui, a);
     np_smart_paste_dialog(ui, a);
+
+    /* Sidebar tree file ops: new file, new folder, rename. */
+    if (np_tree_op_open) {
+        const char *title = np_tree_op == NP_TREE_OP_NEWFILE ? "新建文件"
+                          : np_tree_op == NP_TREE_OP_NEWDIR ? "新建文件夹"
+                                                            : "重命名";
+        char where[NP_PATH_CAP + 32];
+        snprintf(where, sizeof where, "位置：%s", np_tree_op_path);
+        cui_dialog(ui, title, &np_tree_op_open,
+                   .description = where, .width = 420) {
+            int flags = cui_input(ui, "tree-op-name", np_tree_op_name,
+                                  sizeof np_tree_op_name,
+                                  .label = np_tree_op == NP_TREE_OP_RENAME ? "新名称" : "名称",
+                                  .placeholder = np_tree_op == NP_TREE_OP_NEWDIR
+                                                     ? "新文件夹"
+                                                     : "新文件.c",
+                                  .width = CUI_FILL, .autofocus = true);
+            if (flags & CUI_SUBMITTED) np_tree_confirm(a);
+            cui_dialog_footer(ui) {
+                if (cui_button(ui, "取消")) {
+                    np_tree_op_open = false;
+                    np_tree_op = NP_TREE_OP_NONE;
+                }
+                if (cui_button(ui, "确定", .variant = CUI_BUTTON_PRIMARY,
+                               .disabled = !np_tree_op_name[0]))
+                    np_tree_confirm(a);
+            }
+        }
+    }
 
     cui_dialog(ui, "有未保存的修改", &a->dlg_confirm,
                .description = a->confirm_desc, .width = 420) {
@@ -5231,16 +5301,6 @@ static int np_dir_cmp(const void *x, const void *y) {
 }
 
 /* cui_fs_list only runs on navigation or refresh, never once per frame. */
-static void np_dir_refresh(notepad *a) {
-    int n = cui_fs_list(NULL, a->side_dir, a->side_entries, NP_DIR_MAX,
-                        a->side_names, sizeof a->side_names, false);
-    a->side_count = n > 0 ? n : 0;
-    if (n < 0) np_logf(a, "无法读取目录  %s", a->side_dir);
-    if (a->side_count > 1)
-        qsort(a->side_entries, (size_t)a->side_count,
-              sizeof a->side_entries[0], np_dir_cmp);
-    a->side_reload = false;
-}
 
 /* ------------------------------------------------------------------ */
 /* EditPlus-style additions: find in files, text transforms, cliptext,  */
@@ -5260,6 +5320,339 @@ static bool np_file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
 #endif
+}
+
+/* ---- sidebar directory tree (UI_PLAN P2 #6) ------------------------ */
+/* A lazily-loaded tree over a fixed node pool. Children of a directory are
+ * scanned once, when the directory is first expanded; expansion state is
+ * remembered by path, so a rebuild (root change, refresh, file op) restores
+ * every open node without rescanning the disk. The tree only ever draws
+ * nodes of open ancestors, so an idle frame costs nothing. */
+
+enum { NP_TREE_MAX = 3072, NP_TREE_CHILD_CAP = 400, NP_TREE_DEPTH = 24,
+       NP_OPENSET_MAX = 160, NP_TREE_SELCAP = 320 };
+
+typedef struct np_tnode {
+    const char *name;           /* one path segment, into np_tree_names */
+    int parent, child, next;    /* pool indices; -1 = none */
+    bool dir, loaded, open;
+} np_tnode;
+
+static np_tnode np_tree[NP_TREE_MAX];
+static int      np_tree_count;
+static char     np_tree_names[NP_TREE_MAX * 80];
+static size_t   np_tree_nused;
+static char     np_tree_root[NP_PATH_CAP];      /* the dir the pool was built for */
+static char     np_tree_sel_rel[NP_TREE_SELCAP];/* selected node, path relative to the root */
+static char     np_reveal_pending[NP_PATH_CAP]; /* path to expand + select next frame */
+
+/* Expansion memory, relative paths under np_tree_root; cleared on a root change. */
+static char np_open_root[NP_PATH_CAP];
+static char np_open_set[NP_OPENSET_MAX][NP_TREE_SELCAP];
+static int  np_open_count;
+
+static const char *np_tree_name_add(const char *name) {
+    size_t n = strlen(name) + 1;
+    if (np_tree_nused + n > sizeof np_tree_names) return "?";
+    char *p = np_tree_names + np_tree_nused;
+    memcpy(p, name, n);
+    np_tree_nused += n;
+    return p;
+}
+
+/* Path of a node: with_root gives the absolute path, otherwise relative to
+ * the tree root (the root's own relative path is the empty string). */
+static void np_tree_path_ex(int idx, char *out, size_t cap, bool with_root) {
+    const char *segs[NP_TREE_DEPTH + 8];
+    int n = 0;
+    for (int i = idx; i > 0 && n < (int)(sizeof segs / sizeof segs[0]);
+         i = np_tree[i].parent)
+        segs[n++] = np_tree[i].name;
+    out[0] = 0;
+    if (with_root) snprintf(out, cap, "%s", np_tree_root);
+    size_t used = strlen(out);
+    for (int i = n - 1; i >= 0; i--) {
+        size_t l = strlen(segs[i]);
+        if (used + l + 2 >= cap) break;
+        if (used && out[used - 1] != '/' && out[used - 1] != '\\')
+            out[used++] = '/';
+        memcpy(out + used, segs[i], l + 1);
+        used += l;
+    }
+}
+
+static void np_tree_path(int idx, char *out, size_t cap) {
+    np_tree_path_ex(idx, out, cap, true);
+}
+
+static void np_tree_rel(int idx, char *out, size_t cap) {
+    np_tree_path_ex(idx, out, cap, false);
+}
+
+static void np_tree_sel_set(int idx) {
+    np_tree_rel(idx, np_tree_sel_rel, sizeof np_tree_sel_rel);
+}
+
+static bool np_tree_sel_is(int idx) {
+    if (!np_tree_sel_rel[0]) return false;
+    char rel[NP_TREE_SELCAP];
+    np_tree_rel(idx, rel, sizeof rel);
+    return strcmp(rel, np_tree_sel_rel) == 0;
+}
+
+/* Expansion-memory primitives. Paths are stored with '/' separators. */
+static void np_tree_norm_rel(char *s) {
+    for (; *s; s++) if (*s == '\\') *s = '/';
+}
+
+static bool np_tree_open_has(const char *rel) {
+    for (int i = 0; i < np_open_count; i++)
+        if (strcmp(np_open_set[i], rel) == 0) return true;
+    return false;
+}
+
+static void np_tree_open_add(const char *rel) {
+    if (np_tree_open_has(rel)) return;
+    if (np_open_count < NP_OPENSET_MAX)
+        snprintf(np_open_set[np_open_count++], NP_TREE_SELCAP, "%s", rel);
+}
+
+static void np_tree_open_del(const char *rel) {
+    for (int i = 0; i < np_open_count; i++)
+        if (strcmp(np_open_set[i], rel) == 0) {
+            memmove(np_open_set[i], np_open_set[i + 1],
+                    (size_t)(np_open_count - i - 1) * NP_TREE_SELCAP);
+            np_open_count--;
+            return;
+        }
+}
+
+/* Scan one directory into the pool; runs once per directory per build. */
+static void np_tree_load(int idx) {
+    np_tnode *n = &np_tree[idx];
+    if (n->loaded || !n->dir) return;
+    n->loaded = true;
+    static cui_file_entry ents[NP_TREE_CHILD_CAP];      /* scratch, UI thread only */
+    static char names[NP_TREE_CHILD_CAP * 96];
+    char full[NP_PATH_CAP], prel[NP_TREE_SELCAP];
+    np_tree_path(idx, full, sizeof full);
+    np_tree_rel(idx, prel, sizeof prel);
+    int cnt = cui_fs_list(NULL, full, ents, NP_TREE_CHILD_CAP,
+                          names, sizeof names, false);
+    if (cnt < 0) return;                                /* unreadable: no children */
+    if (cnt > 1) qsort(ents, (size_t)cnt, sizeof ents[0], np_dir_cmp);
+    int last = -1;
+    for (int i = 0; i < cnt && np_tree_count < NP_TREE_MAX; i++) {
+        int c = np_tree_count++;
+        char crel[NP_TREE_SELCAP];
+        snprintf(crel, sizeof crel, "%s%s%s", prel,
+                 prel[0] && prel[strlen(prel) - 1] != '/' ? "/" : "", ents[i].name);
+        np_tree[c] = (np_tnode){ .name = np_tree_name_add(ents[i].name),
+                                 .parent = idx, .child = -1, .next = -1,
+                                 .dir = ents[i].dir,
+                                 .open = ents[i].dir && np_tree_open_has(crel) };
+        if (last < 0) np_tree[idx].child = c;
+        else np_tree[last].next = c;
+        last = c;
+    }
+}
+
+/* Rebuild the pool for a->side_dir. A root change resets expansion memory. */
+static void np_tree_build(notepad *a) {
+    if (strcmp(np_open_root, a->side_dir) != 0) {
+        snprintf(np_open_root, sizeof np_open_root, "%s", a->side_dir);
+        np_open_count = 0;
+        np_tree_sel_rel[0] = 0;
+    }
+    snprintf(np_tree_root, sizeof np_tree_root, "%s", a->side_dir);
+    np_tree_count = 0;
+    np_tree_nused = 0;
+    const char *nm = np_base(a->side_dir);
+    if (!nm[0] || nm[strlen(nm) - 1] == '/' || nm[strlen(nm) - 1] == '\\')
+        nm = a->side_dir;               /* "C:\" and kin have no usable base name */
+    np_tree[0] = (np_tnode){ .name = np_tree_name_add(nm),
+                             .parent = -1, .child = -1, .next = -1,
+                             .dir = true, .loaded = false, .open = true };
+    np_tree_count = 1;
+    np_tree_open_add("");
+}
+
+/* Expand the ancestors of `full` (already saved on disk) and select it. */
+static void np_tree_reveal(int idx_root, const char *full) {
+    size_t rl = strlen(np_tree_root);
+    if (!rl || strncmp(full, np_tree_root, rl) != 0) return;
+    const char *q = full + rl;
+    if (*q == '/' || *q == '\\') q++;
+    int node = idx_root;
+    while (*q) {
+        const char *e = q;
+        while (*e && *e != '/' && *e != '\\') e++;
+        char seg[NP_TREE_SELCAP];
+        size_t l = (size_t)(e - q);
+        if (l == 0 || l >= sizeof seg) break;
+        memcpy(seg, q, l); seg[l] = 0;
+        if (!np_tree[node].loaded) np_tree_load(node);
+        int c = np_tree[node].child, found = -1;
+        for (; c >= 0; c = np_tree[c].next)
+            if (strcmp(np_tree[c].name, seg) == 0) { found = c; break; }
+        if (found < 0) break;           /* not on disk (yet): select nothing */
+        if (np_tree[found].dir && !np_tree[found].open) {
+            np_tree[found].open = true;
+            np_tree_rel(found, seg, sizeof seg);
+            np_tree_open_add(seg);
+        }
+        node = found;
+        q = *e ? e + 1 : e;
+    }
+    if (node != idx_root) np_tree_sel_set(node);
+}
+
+static void np_tree_queue_reveal(const char *path) {
+    snprintf(np_reveal_pending, sizeof np_reveal_pending, "%s", path);
+}
+
+/* File ops behind the tree's context menu. UTF-8 safe on Windows. */
+static bool np_fs_mkdir(const char *path) {
+#ifdef _WIN32
+    wchar_t w[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048) <= 0) return false;
+    return _wmkdir(w) == 0;
+#else
+    return mkdir(path, 0777) == 0;
+#endif
+}
+
+static bool np_fs_touch(const char *path) {
+#ifdef _WIN32
+    wchar_t w[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048) <= 0) return false;
+    FILE *f = _wfopen(w, L"ab");        /* fresh file: zero bytes */
+#else
+    FILE *f = fopen(path, "ab");
+#endif
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static bool np_fs_rename(const char *from, const char *to) {
+#ifdef _WIN32
+    wchar_t a[2048], b[2048];
+    if (MultiByteToWideChar(CP_UTF8, 0, from, -1, a, 2048) <= 0) return false;
+    if (MultiByteToWideChar(CP_UTF8, 0, to, -1, b, 2048) <= 0) return false;
+    return _wrename(a, b) == 0;
+#else
+    return rename(from, to) == 0;
+#endif
+}
+
+/* Confirm button / Enter of the tree's new-file, new-folder and rename dialog. */
+static void np_tree_confirm(notepad *a) {
+    char path[NP_PATH_CAP];
+    if (np_tree_op == NP_TREE_OP_RENAME) {
+        np_dir_of(np_tree_op_path, path, sizeof path);
+        np_dir_join(path, sizeof path, path, np_tree_op_name);
+        if (!strcmp(path, np_tree_op_path)) goto done;
+        if (np_file_exists(path)) {
+            np_toast(a, "无法重命名", "目标名称已存在", CUI_TONE_DANGER);
+            return;
+        }
+        if (!np_fs_rename(np_tree_op_path, path)) {
+            np_toast(a, "重命名失败", "文件可能被其他程序占用", CUI_TONE_DANGER);
+            return;
+        }
+        for (int i = 0; i < a->count; i++)      /* keep open docs on the moved file */
+            if (!strcmp(a->docs[i]->path, np_tree_op_path))
+                snprintf(a->docs[i]->path, NP_PATH_CAP, "%s", path);
+        np_toast(a, "已重命名", np_tree_op_name, CUI_TONE_SUCCESS);
+        np_logf(a, "重命名  %s -> %s", np_tree_op_path, path);
+    } else {
+        np_dir_join(path, sizeof path, np_tree_op_path, np_tree_op_name);
+        if (np_file_exists(path)) {
+            np_toast(a, "无法创建", "同名文件或文件夹已存在", CUI_TONE_DANGER);
+            return;
+        }
+        bool ok = np_tree_op == NP_TREE_OP_NEWDIR
+                      ? np_fs_mkdir(path) : np_fs_touch(path);
+        if (!ok) {
+            np_toast(a, "创建失败", "无法写入目标目录", CUI_TONE_DANGER);
+            return;
+        }
+        np_toast(a, np_tree_op == NP_TREE_OP_NEWDIR ? "已新建文件夹" : "已新建文件",
+                 path, CUI_TONE_SUCCESS);
+        np_logf(a, "%s  %s",
+                np_tree_op == NP_TREE_OP_NEWDIR ? "新建文件夹" : "新建文件", path);
+    }
+done:
+    np_tree_op_open = false;
+    np_tree_op = NP_TREE_OP_NONE;
+    a->side_reload = true;
+    np_tree_queue_reveal(path);
+}
+
+/* Depth-first draw of one node; recursion only reaches open ancestors. */
+static void np_tree_draw_node(cui_ctx *ui, notepad *a, int idx, int depth) {
+    np_tnode *n = &np_tree[idx];
+    if (n->dir && n->open && !n->loaded) np_tree_load(idx);
+    char label[NP_PATH_CAP + 16], full[NP_PATH_CAP];
+    snprintf(label, sizeof label, "%s###t%d", n->name, idx);
+    np_tree_path(idx, full, sizeof full);
+    int fk = n->dir ? NP_FK_TEXT : np_file_family(full);
+    if (depth >= NP_TREE_DEPTH) n->dir = false;     /* guard runaway recursion */
+    cui_tree_opts o = { .leaf = !n->dir,
+                        .icon = n->dir ? NULL : np_family_icon(fk),
+                        .icon_color = np_family_tint(ui, fk),
+                        .selected = np_tree_sel_is(idx) };
+    bool expanded = cui_tree_begin(ui, label, n->dir ? &n->open : NULL, &o);
+    if (cui_tree_clicked(ui)) {
+        np_tree_sel_set(idx);
+        if (!n->dir) {
+            np_open_path(a, full, true);
+        } else if (n->open) {
+            char rel[NP_TREE_SELCAP];
+            np_tree_rel(idx, rel, sizeof rel);
+            np_tree_open_add(rel);
+        } else {
+            char rel[NP_TREE_SELCAP];
+            np_tree_rel(idx, rel, sizeof rel);
+            np_tree_open_del(rel);
+        }
+    }
+    /* Context menu binds to the tree row created above. */
+    cui_context_menu(ui, "side-tree-ctx") {
+        char dir[NP_PATH_CAP];
+        if (n->dir) snprintf(dir, sizeof dir, "%s", full);
+        else np_dir_of(full, dir, sizeof dir);
+        if (cui_menu_item(ui, "新建文件", .icon = CUI_ICON_FILE_TEXT)) {
+            np_tree_op = NP_TREE_OP_NEWFILE;
+            snprintf(np_tree_op_path, sizeof np_tree_op_path, "%s", dir);
+            np_tree_op_name[0] = 0;
+            np_tree_op_open = true;
+        }
+        if (cui_menu_item(ui, "新建文件夹", .icon = CUI_ICON_FOLDER)) {
+            np_tree_op = NP_TREE_OP_NEWDIR;
+            snprintf(np_tree_op_path, sizeof np_tree_op_path, "%s", dir);
+            np_tree_op_name[0] = 0;
+            np_tree_op_open = true;
+        }
+        if (cui_menu_item(ui, "重命名", .icon = CUI_ICON_PENCIL,
+                          .disabled = idx == 0)) {
+            np_tree_op = NP_TREE_OP_RENAME;
+            snprintf(np_tree_op_path, sizeof np_tree_op_path, "%s", full);
+            snprintf(np_tree_op_name, sizeof np_tree_op_name, "%s", n->name);
+            np_tree_op_open = true;
+        }
+        cui_menu_separator(ui);
+        if (cui_menu_item(ui, "在系统中打开", .icon = CUI_ICON_EXTERNAL_LINK))
+            np_system_open(a, full, false);
+        if (cui_menu_item(ui, "打开所在文件夹", .icon = CUI_ICON_FOLDER_OPEN))
+            np_system_open(a, full, true);
+    }
+    if (n->dir && expanded) {
+        for (int c = n->child; c >= 0; c = np_tree[c].next)
+            np_tree_draw_node(ui, a, c, depth + 1);
+        cui_tree_end(ui);
+    }
 }
 
 /* ---- find in files ------------------------------------------------ */
@@ -6802,8 +7195,14 @@ static void np_system_open(notepad *a, const char *path, bool locate) {
 }
 
 static void np_sidebar(cui_ctx *ui, notepad *a) {
-    if (a->side_reload) np_dir_refresh(a);
-    np_doc *cur = np_cur(a);
+    if (a->side_reload) {
+        np_tree_build(a);
+        a->side_reload = false;
+    }
+    if (np_reveal_pending[0]) {
+        np_tree_reveal(0, np_reveal_pending);
+        np_reveal_pending[0] = 0;
+    }
     static const char *tab_names[4] = { "目录", "文档", "最近", "片段" };
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
@@ -6849,30 +7248,8 @@ static void np_sidebar(cui_ctx *ui, notepad *a) {
         cui_scroll(ui, .id = "side_list", .width = CUI_FILL, .height = CUI_FILL,
                    .pad = 6, .gap = 1) {
             if (a->side_tab == 0) {
-                if (cui_list_item(ui, "..  上级目录###up", .icon = CUI_ICON_ARROW_UP)) {
-                    char up[NP_PATH_CAP];
-                    np_dir_parent(a->side_dir, up, sizeof up);
-                    np_dir_set(a, up);
-                }
-                for (int i = 0; i < a->side_count; i++) {
-                    cui_file_entry *e = &a->side_entries[i];
-                    char full[NP_PATH_CAP], label[320], sz[48];
-                    np_dir_join(full, sizeof full, a->side_dir, e->name);
-                    snprintf(label, sizeof label, "%s###dir%d", e->name, i);
-                    np_size_str(sz, sizeof sz, (size_t)e->size);
-                    bool here = cur && cur->path[0] && strcmp(full, cur->path) == 0;
-                    int fk = e->dir ? NP_FK_TEXT : np_file_family(full);
-                    if (cui_list_item(ui, label,
-                                      .icon = e->dir ? CUI_ICON_FOLDER : np_family_icon(fk),
-                                      .icon_color = e->dir ? (cui_color){0, 0, 0, 0}
-                                                           : np_family_tint(ui, fk),
-                                      .trailing = e->dir ? NULL : sz,
-                                      .selected = here)) {
-                        if (e->dir) np_dir_set(a, full);
-                        else np_open_path(a, full, true);
-                    }
-                }
-                if (!a->side_count)
+                np_tree_draw_node(ui, a, 0, 0);
+                if (np_tree[0].loaded && np_tree[0].child < 0)
                     cui_text(ui, "目录为空或无法读取", .size = 12,
                              .color = CUI_COLOR_TEXT_MUTED);
             } else if (a->side_tab == 1) {
@@ -7149,13 +7526,13 @@ static void np_doc_breadcrumb(cui_ctx *ui, notepad *a, np_doc *d) {
             np_dir_of(d->path, dir, sizeof dir);
             const char *base = np_base(dir);
             if (base[0])
-                snprintf(crumb, sizeof crumb, "%s  /  %s###crumb", base, np_base(d->path));
+                snprintf(crumb, sizeof crumb, "%s  /  %s", base, np_base(d->path));
             else
-                snprintf(crumb, sizeof crumb, "%s###crumb", d->path);
+                snprintf(crumb, sizeof crumb, "%s", d->path);
             cui_text(ui, crumb, .size = 11, .color = CUI_COLOR_TEXT_MUTED,
                      .nowrap = true, .font = CUI_FONT_MONO);
         } else {
-            cui_text(ui, "未命名文档###crumb", .size = 11,
+            cui_text(ui, "未命名文档", .size = 11,
                      .color = CUI_COLOR_TEXT_MUTED);
         }
         cui_spacer(ui);
@@ -9322,6 +9699,17 @@ static void np_frame(cui_ctx *ui, void *user) {
             a->startup_bt[0] = 0;       /* apply once */
         }
         a->quiet = false;
+        {   /* reveal the file opened from the command line (the sync below
+             * would otherwise keep the follow block from ever firing) */
+            np_doc *rd = np_cur(a);
+            if (rd && rd->path[0]) {
+                char rdir[NP_PATH_CAP];
+                np_dir_of(rd->path, rdir, sizeof rdir);
+                if (a->follow_active && strcmp(rdir, a->side_dir) != 0)
+                    np_dir_set(a, rdir);
+                np_tree_queue_reveal(rd->path);
+            }
+        }
         a->last_active = a->active;
         np_logf(a, "就绪  ·  %d 个文档  ·  目录 %s", a->count, a->side_dir);
     }
@@ -9359,13 +9747,17 @@ static void np_frame(cui_ctx *ui, void *user) {
         }
     }
 
-    /* EditPlus-style "directory follows the active file". */
-    if (a->follow_active && a->active != a->last_active) {
+    /* EditPlus-style "directory follows the active file", now expressed by
+     * the tree: retarget the root (follow mode) and reveal + select the
+     * active file inside it. */
+    if (a->active != a->last_active) {
         np_doc *cur = np_cur(a);
         if (cur && cur->path[0]) {
             char dir[NP_PATH_CAP];
             np_dir_of(cur->path, dir, sizeof dir);
-            if (strcmp(dir, a->side_dir) != 0) np_dir_set(a, dir);
+            if (a->follow_active && strcmp(dir, a->side_dir) != 0)
+                np_dir_set(a, dir);
+            np_tree_queue_reveal(cur->path);
         }
     }
     a->last_active = a->active;
