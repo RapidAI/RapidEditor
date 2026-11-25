@@ -890,3 +890,21 @@ VS Code / EditPlus 的行级编辑标配，此前缺失：
   同步更新。
 
 MSVC 构建通过；八项回归全绿。
+
+## 缩进参考线（P1 #1）
+
+UI_PLAN P1 第一项落地：
+
+- vendor：`cui_code_editor_opts.no_indent_guides`（默认开，opt-out）。
+  行循环里按行扫描行首空白（空格 +1 列、Tab 进到下一 stop），每个被
+  覆盖的 stop 画 1px 竖线，最内层贴着首个内容字符左缘；光标行且编辑
+  器聚焦时整行参考线用强调色（guide_on）。列语义为字节列，与
+  cui__ed_span / Tab 展开一致，中文混排不错位。
+- 配色：guide = fg 低 alpha（深 0.11 / 浅 0.08），guide_on = accent
+  alpha 0.45/0.38——随 9 风格预设与深浅自动适配。
+- app：配置键 indent_guides（load/save 配对，check_config 验证），
+  默认开；视图菜单「缩进参考线」开关（hex 下禁用——hex 视图无此概念）。
+- 位置注意：参考线画在选区之后、marks / find 高亮 / 正文之前——
+  垫底不被正文遮挡，选区下依然可见。
+
+MSVC 构建通过（vendor 全量重编）；八项回归全绿。

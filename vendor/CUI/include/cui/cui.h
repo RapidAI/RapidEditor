@@ -1760,6 +1760,7 @@ typedef struct cui_code_editor_opts {
     bool use_tabs;             /* indent with tab characters instead of spaces */
     bool read_only;
     bool no_line_numbers;      /* hides the gutter of line numbers */
+    bool no_indent_guides;     /* hides the vertical indentation guides */
     bool autofocus;
     const char *placeholder;   /* shown while the text is empty */
     const cui_text_mark *marks;   /* ranges to highlight (search results, regex matches), sorted by start */

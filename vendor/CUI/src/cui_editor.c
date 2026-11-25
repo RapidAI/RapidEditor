@@ -637,7 +637,7 @@ typedef struct {
     const char *text;           /* a copy of the lines in view; text[0] is byte `base` */
     int base, first, count, nl;
     const int *ls;              /* starts of the lines in view and the one after */
-    bool in_block, json, empty, focused, show_line, ro;
+    bool in_block, json, empty, focused, show_line, ro, guides;
     cui__lang lang;
     int tab, cursor, anchor, caret_line, caret_col;
     float caret_px;             /* caret in real text pixels, not grid columns */
@@ -656,6 +656,7 @@ typedef struct {
     double caret_phase;
     cui_color colors[CUI__TK_COUNT];
     cui_color num, num_on, band, sel, match, match_edge, brk, brk_edge, caret, muted, line, bar;
+    cui_color guide, guide_on;  /* indent guides; guide_on marks the caret's line */
     int vc0, vc1;               /* columns in view */
     const char *ghost;          /* inline suggestion drawn after the caret, or NULL */
     int ghost_len;
@@ -772,6 +773,25 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
             float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, b);
             if (s1 > ale) xb += p->cw * 0.6f;   /* the newline is selected too */
             cui_draw_rect(ui, (cui_rect){ x0 + xa, y, xb - xa, p->lh }, CUI_CORNERS(2), p->sel);
+        }
+        /* indent guides: one thin line per tab stop the leading whitespace
+         * covers; the innermost hugs the first content column. The caret's
+         * line draws its guides in the accent. */
+        if (p->guides && le > ls) {
+            int wcol = 0, i = ls;
+            while (i < le) {
+                if (s[i] == '\t') wcol = (wcol / p->tab + 1) * p->tab;
+                else if (s[i] == ' ') wcol++;
+                else break;
+                i++;
+            }
+            if (wcol >= p->tab) {
+                bool on = p->show_line && line == p->caret_line;
+                cui_color gc = on ? p->guide_on : p->guide;
+                for (int stp = p->tab; stp <= wcol; stp += p->tab)
+                    cui_draw_rect(ui, (cui_rect){ x0 + (float)stp * p->cw - 1.0f, y + 1, 1, p->lh - 2 },
+                                  CUI_CORNERS(0), gc);
+            }
         }
         /* the app's marks, behind the find matches */
         for (int m = 0; m < p->nmarks; m++) {
@@ -1550,6 +1570,7 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     p->show_line = focused || ui->focus == f->fid || ui->focus == f->gid;
     p->ro = E->ro;
     p->empty = E->len == 0;
+    p->guides = !f->o->no_indent_guides;
     p->placeholder = f->o->placeholder;
     p->size = f->size; p->lh = lh; p->cw = cw; p->gutter = f->gutter;
     p->view_h = f->known ? f->br.h : 0;
@@ -1612,6 +1633,8 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     p->caret = ui->accent == CUI_ACCENT_NEUTRAL ? fg : CUI_C(ui, ACCENT);
     p->muted = CUI_C(ui, TEXT_MUTED);
     p->line = CUI_C(ui, BORDER);
+    p->guide = cui_alpha(fg, dark ? 0.11f : 0.08f);
+    p->guide_on = cui_alpha(acc, dark ? 0.45f : 0.38f);
     p->bar = ui->accent == CUI_ACCENT_NEUTRAL ? fg : CUI_C(ui, ACCENT);
     /* the scrollbars show while scrolling, while hovered or held */
     bool recent = st->last_activity > 0 && ui->time - st->last_activity < 0.9;

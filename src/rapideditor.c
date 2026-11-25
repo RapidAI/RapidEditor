@@ -354,6 +354,7 @@ typedef struct notepad {
     int  draft_count;
 
     bool boot_done, fonts_ready, dark, line_numbers, show_status, default_crlf;
+    bool indent_guides;                 /* vertical indentation guides in the editor */
     bool quiet;                         /* no "opened" toasts while loading startup files */
     int  accent, font_size;
     int  density;                       /* 0 comfortable, 1 compact, 2 spacious */
@@ -6406,6 +6407,7 @@ static void np_config_load(notepad *a) {
             int v = atoi(val);
             if (v >= 0 && v <= 2) a->density = v;
         } else if (!strcmp(key, "line_numbers")) a->line_numbers = atoi(val) != 0;
+        else if (!strcmp(key, "indent_guides")) a->indent_guides = atoi(val) != 0;
         else if (!strcmp(key, "show_status")) a->show_status = atoi(val) != 0;
         else if (!strcmp(key, "show_sidebar")) a->show_sidebar = atoi(val) != 0;
         else if (!strcmp(key, "show_output")) a->show_output = atoi(val) != 0;
@@ -6555,9 +6557,9 @@ static void np_config_save(notepad *a) {
     }
     fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\nstyle=%d\n",
             a->dark ? 1 : 0, a->accent, a->font_size, a->density, a->style);
-    fprintf(f, "line_numbers=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n"
+    fprintf(f, "line_numbers=%d\nindent_guides=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n"
                "show_preview=%d\npreview_ratio=%.4f\nshow_ai=%d\nai_ratio=%.4f\n",
-            a->line_numbers ? 1 : 0, a->show_status ? 1 : 0,
+            a->line_numbers ? 1 : 0, a->indent_guides ? 1 : 0, a->show_status ? 1 : 0,
             a->show_sidebar ? 1 : 0, a->show_output ? 1 : 0,
             a->show_preview ? 1 : 0, a->preview_ratio,
             a->show_ai ? 1 : 0, a->ai_ratio);
@@ -7531,6 +7533,7 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             .length = d->len,          /* skip a full strlen on every frame */
             .revision = d->rev,        /* rebuild the line index only when needed */
             .no_line_numbers = !a->line_numbers,
+            .no_indent_guides = !a->indent_guides,
             .placeholder = "在这里输入文字…  Ctrl+N 新建标签，Ctrl+O 打开文件，Ctrl+S 保存",
             .read_only = false);
 
@@ -9768,6 +9771,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "显示行号", .checked = a->line_numbers))
                     a->line_numbers = !a->line_numbers;
+                if (cui_menu_item(ui, "缩进参考线", .checked = a->indent_guides,
+                                  .disabled = d->is_hex))
+                    a->indent_guides = !a->indent_guides;
                 if (cui_menu_item(ui, "显示状态栏", .checked = a->show_status))
                     a->show_status = !a->show_status;
                 cui_menu_separator(ui);
@@ -10235,6 +10241,7 @@ int main(int argc, char **argv) {
     g.font_size = NP_FONT_DEF;
     snprintf(g.font_ident, sizeof g.font_ident, "default");
     g.line_numbers = true;
+    g.indent_guides = true;
     g.show_status = true;
     g.accent = CUI_ACCENT_BLUE;
     g.density = 0;
