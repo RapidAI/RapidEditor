@@ -3053,8 +3053,9 @@ static void np_ai_actions_dialog(cui_ctx *ui, notepad *a) {
         cui_column(ui, .width = CUI_FILL, .gap = 8) {
             cui_text(ui, "已保存的动作", .size = 13, .font = CUI_FONT_MEDIUM);
             if (a->ai_action_count == 0)
-                cui_text(ui, "还没有动作。填好下面的名称与指令，点「新建」即可。",
-                         .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                cui_empty_state(ui, "还没有动作", .compact = true,
+                                .icon = CUI_ICON_SLIDERS_HORIZONTAL,
+                                .description = "填好下面的名称与指令，点「新建」即可保存第一个动作。");
             for (int i = 0; i < a->ai_action_count; i++) {
                 char line[192];
                 snprintf(line, sizeof line, "%d. %s — %.60s", i + 1,
@@ -3560,8 +3561,9 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             }
         }
         if (a->llm_prov_count == 0 && a->llm_prov_edit < 0)
-            cui_text(ui, "还没有自定义服务商。填写服务地址与 API Key 即可使用。",
-                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_empty_state(ui, "还没有自定义服务商", .compact = true,
+                            .icon = CUI_ICON_CLOUD,
+                            .description = "填写服务地址与 API Key 即可使用自己的模型服务。");
         if (a->llm_prov_count < 8 && a->llm_prov_edit < 0) {
             if (cui_button(ui, "添加服务商")) {
                 a->llm_prov_gen++;
@@ -9511,25 +9513,30 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                     a->ai_extra[0] = 0;
             }
         }
-        cui_row(ui, .width = CUI_FILL, .gap = 8) {
-            if (cui_button(ui, st == 1 ? "处理中…" : "Ask AI",
-                           .variant = CUI_BUTTON_PRIMARY,
-                           .disabled = st == 1 ||
-                                       (a->ai_task == 6 && !a->ai_inst[0]))) {
-                np_ai_start(a);
-            }
-            if (st == 1) {
-                if (cui_button(ui, "停止", .variant = CUI_BUTTON_GHOST))
-                    a->ai_cancel = true;
-            } else {
-                if (cui_button(ui, "重试", .variant = CUI_BUTTON_GHOST)) {
+        /* In the idle no-result state the empty state below owns the
+         * primary action; hiding this row avoids two "Ask AI" buttons. */
+        bool ai_idle = (st == 0 || st == 2) && !a->ai_result[0];
+        if (!ai_idle) {
+            cui_row(ui, .width = CUI_FILL, .gap = 8) {
+                if (cui_button(ui, st == 1 ? "处理中…" : "Ask AI",
+                               .variant = CUI_BUTTON_PRIMARY,
+                               .disabled = st == 1 ||
+                                           (a->ai_task == 6 && !a->ai_inst[0]))) {
                     np_ai_start(a);
                 }
-                if (cui_button(ui, "清空对话", .variant = CUI_BUTTON_GHOST)) {
-                    a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
-                    a->ai_prev[0] = 0;
-                    a->ai_staged[0] = 0; a->ai_error[0] = 0;
-                    a->ai_extra[0] = 0;
+                if (st == 1) {
+                    if (cui_button(ui, "停止", .variant = CUI_BUTTON_GHOST))
+                        a->ai_cancel = true;
+                } else {
+                    if (cui_button(ui, "重试", .variant = CUI_BUTTON_GHOST)) {
+                        np_ai_start(a);
+                    }
+                    if (cui_button(ui, "清空对话", .variant = CUI_BUTTON_GHOST)) {
+                        a->ai_result[0] = 0; a->ai_done = 0; a->ai_last_state = 0;
+                        a->ai_prev[0] = 0;
+                        a->ai_staged[0] = 0; a->ai_error[0] = 0;
+                        a->ai_extra[0] = 0;
+                    }
                 }
             }
         }
@@ -9648,6 +9655,13 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
                 }
             }
         } else {
+            if (cui_empty_state(ui, "还没有结果",
+                                .icon = CUI_ICON_SPARKLES, .compact = true,
+                                .description = "选好任务与指令，向 AI 发起第一次请求。",
+                                .action = "Ask AI",
+                                .action_icon = CUI_ICON_SPARKLES)
+                && !(a->ai_task == 6 && !a->ai_inst[0]))
+                np_ai_start(a);
             cui_column(ui, .width = CUI_FILL, .gap = 6) {
                 cui_text(ui, "Ask AI 会根据任务自动取上下文：", .size = 12,
                          .color = CUI_COLOR_TEXT_MUTED);

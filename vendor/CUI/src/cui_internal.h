@@ -130,6 +130,8 @@ float cui__tween(cui_ctx *ui, float *x, float target, float duration);   /* expo
 #define CUI__SPRING_EXPAND 0.32f, 0.0f   /* disclosures, trees, accordions open and close */
 #define CUI__SPRING_ENTER  0.28f, 0.0f   /* popovers, menus, tooltips, hover cards */
 #define CUI__SPRING_DIALOG 0.34f, 0.0f   /* dialogs */
+#define CUI__SPRING_SHEET  0.42f, 0.0f   /* sheets: slower because they travel the full screen height */
+#define CUI__SPRING_TOAST  0.34f, 0.0f   /* toasts arrive like dialogs, leave like everything else */
 #define CUI__SPRING_EXIT   0.16f, 0.0f   /* every floating layer leaves faster than it came */
 #define CUI__ENTER_SCALE 0.96f   /* floating layers grow from here */
 #define CUI__PRESS       0.97f   /* buttons, chips, tiles */

@@ -465,7 +465,8 @@ int cui_speed_dial_ex(cui_ctx *ui, const char *id_str, const cui_speed_action *a
         if ((ui->mpressed[0] || ui->mpressed[1]) && ui->hot != id && ui->hot_layer != fid) st->open = false;
     }
     if (st->press.x == 0) st->press.x = 1;
-    cui__spring(ui, &st->t, st->open ? 1.0f : 0.0f, st->open ? 0.42f : 0.24f, st->open ? 0.18f : 0.0f);
+    if (st->open) cui__spring(ui, &st->t, 1.0f, CUI__SPRING_EXPAND);
+    else cui__spring(ui, &st->t, 0.0f, CUI__SPRING_EXIT);
     cui__spring(ui, &st->press, r.pressed ? CUI__PRESS : 1.0f, CUI_SPRING_SNAPPY);
     cui__tween(ui, &st->hover, r.hovered ? 1.0f : 0.0f, CUI__T_HOVER);
     float size = 52;

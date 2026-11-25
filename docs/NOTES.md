@@ -1099,3 +1099,38 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
   绘制段。验证时的临时注入要在 a->ui 赋值之后（先崩过一次空指针），
   且文档存在后才触发（首帧 np_cur 为 NULL）。
 - 验证：MSVC 构建 + 七项回归全绿。
+
+## UI_PLAN P4：统一空态样式（#14）与动效一致性（#15）
+
+- #14 AI 面板空态：idle 无结果时由 4 行纯文本说明改为 cui_empty_state
+  （compact，SPARKLES 图标 +「还没有结果」+ 一句描述 +「Ask AI」主行动
+  按钮）；空态接管主行动后，原按钮行在 idle 态整行隐藏，避免两个
+  「Ask AI」并存（st==0/2 且无结果时 ai_idle 判定）。任务说明 4 行保留
+  在空态下方。顺手把两个对话框内小空态换统一组件：自定义 AI 动作
+  （SLIDERS_HORIZONTAL 图标，无 action——下方表单即主行动）、LLM 服务商
+  （CLOUD 图标）。至此空态点位全覆盖：目录树/查找结果×2/文件搜索/
+  消息/AI 面板/动作对话框/服务商对话框。
+- #15 动效一致性清点结论：vendor 已有集中 token 体系（cui_internal.h，
+  「One value per job」），CUI__T_HIGHLIGHT/HOVER/FOCUS/STATE 与
+  SPRING_SMOOTH/SNAPPY/MORPH/EXPAND/ENTER/DIALOG/EXIT 覆盖绝大多数
+  调用点；漏网四处归一：
+  - tooltip（0.2/0.12 硬编码）→ CUI__SPRING_ENTER / CUI__SPRING_EXIT
+    （token 注释本就声明 tooltip 归 ENTER）；
+  - FAB 弹出菜单（open 0.42+bounce 0.18 / close 0.24，close 反而比
+    open 慢，违反「exit 快于 enter」体系）→ CUI__SPRING_EXPAND /
+    CUI__SPRING_EXIT；
+  - sheet（0.42 硬编码）→ 新 token CUI__SPRING_SHEET 0.42f,0（值不变，
+    提为 token 并注明行程长所以慢）；
+  - toast 进出场（0.38/0.22）→ 新 token CUI__SPRING_TOAST 0.34f,0 进、
+    CUI__SPRING_EXIT 退。
+  其余散落 spring 属组件个性物理（tab 指示器拉伸、滚动条、counter
+  pop、hold-button arm）或图表入场/进度类，有注释设计意图，不属
+  弹层/折叠范畴，保留。app 层仅 #12 两处 0.15s spring（计划值）。
+  ⚠️ spring 宏含逗号（"0.42f, 0.0f"），只能作为实参列表尾部展开，
+  不能嵌进三目/表达式——分支动画一律写 if/else 两行。
+- 截图实证（CUI_SCREENSHOT 链路）：AI 面板空态完整渲染（图标+标题+
+  描述+绿色 Ask AI 主行动），无重复按钮行。临时初始化值注意：show_ai
+  在 config 中有持久化键，临时值必须放 np_config_load 之后（放前面
+  会被 config 覆盖，第一次截图白跑）。
+- 验证：MSVC 构建 + 七项回归全绿。UI_PLAN #14/#15 标 ✅，P4 仅剩
+  #17 连字评估（L，评估类）。
