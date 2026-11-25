@@ -810,13 +810,37 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
         const char *s = p->text;
         float y = r.y + CUI__ED_INSET + (float)((double)line * p->lh - p->sy);
         int als = p->ls[k], ale = p->ls[k + 1] - 1;                    /* in the buffer */
-        /* selection */
+        /* the app's marks, then the find matches, then the selection — the
+         * selection is translucent and covers both (VS Code layering) */
+        for (int m = 0; m < p->nmarks; m++) {
+            const cui_text_mark *mk = &p->marks[m];
+            if (mk->start > ale) break;
+            if (mk->end <= als && !(mk->end == mk->start && mk->start == als)) continue;
+            int a = CUI_MAX(mk->start, als) - p->base, b = CUI_MIN(mk->end, ale) - p->base;
+            float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, a);
+            float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, b);
+            if (xb - xa < 2) { xa -= 1; xb = xa + 2; }   /* an empty match shows as a bar */
+            cui_draw_rect(ui, (cui_rect){ x0 + xa, y + 1, xb - xa, p->lh - 2 }, CUI_CORNERS(2), p->mark_colors[CUI_CLAMP(mk->color, 0, 6)]);
+        }
+        if (p->qn > 0) {
+            for (int i = ls; i + p->qn <= le; i++) {
+                if (!cui__ed_hit(s, le, i, p->query, p->qn, p->qcase, p->qword)) continue;
+                float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i);
+                float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i + p->qn);
+                cui_draw_rect_border(ui, (cui_rect){ x0 + xa - 1, y + 1, xb - xa + 2, p->lh - 2 }, CUI_CORNERS(3), p->match, p->match_edge, 1);
+            }
+        }
+        /* selection: corners rounded only where the selection actually starts
+         * or ends, so a multi-line selection joins without scalloped notches */
         if (s1 > s0 && s1 > als && s0 <= ale) {
             int a = CUI_MAX(s0, als) - p->base, b = CUI_MIN(s1, ale) - p->base;
             float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, a);
             float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, b);
             if (s1 > ale) xb += p->cw * 0.6f;   /* the newline is selected too */
-            cui_draw_rect(ui, (cui_rect){ x0 + xa, y, xb - xa, p->lh }, CUI_CORNERS(2), p->sel);
+            bool top = s0 > als || als == 0;    /* starts on this line */
+            bool bot = s1 <= ale + 1;           /* ends on this line */
+            cui_corners rad = { top ? 2 : 0, top ? 2 : 0, bot ? 2 : 0, bot ? 2 : 0 };
+            cui_draw_rect(ui, (cui_rect){ x0 + xa, y, xb - xa, p->lh }, rad, p->sel);
         }
         /* indent guides: one thin line per tab stop the leading whitespace
          * covers; the innermost hugs the first content column. The caret's
@@ -841,26 +865,6 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
          * picks leading-only or all, trailing whitespace draws warm */
         if (p->ws > 0 && le > ls)
             cui__ed_paint_ws(ui, p, s, ls, le, p->ws == 1, x0, y + ty);
-        /* the app's marks, behind the find matches */
-        for (int m = 0; m < p->nmarks; m++) {
-            const cui_text_mark *mk = &p->marks[m];
-            if (mk->start > ale) break;
-            if (mk->end <= als && !(mk->end == mk->start && mk->start == als)) continue;
-            int a = CUI_MAX(mk->start, als) - p->base, b = CUI_MIN(mk->end, ale) - p->base;
-            float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, a);
-            float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, b);
-            if (xb - xa < 2) { xa -= 1; xb = xa + 2; }   /* an empty match shows as a bar */
-            cui_draw_rect(ui, (cui_rect){ x0 + xa, y + 1, xb - xa, p->lh - 2 }, CUI_CORNERS(2), p->mark_colors[CUI_CLAMP(mk->color, 0, 6)]);
-        }
-        /* find matches */
-        if (p->qn > 0) {
-            for (int i = ls; i + p->qn <= le; i++) {
-                if (!cui__ed_hit(s, le, i, p->query, p->qn, p->qcase, p->qword)) continue;
-                float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i);
-                float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i + p->qn);
-                cui_draw_rect_border(ui, (cui_rect){ x0 + xa - 1, y + 1, xb - xa + 2, p->lh - 2 }, CUI_CORNERS(3), p->match, p->match_edge, 1);
-            }
-        }
         /* the bracket pair */
         for (int m = 0; m < 2; m++)
             if (p->br_line[m] == line)
@@ -1670,8 +1674,11 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     cui__syntax_colors(ui, p->colors);
     cui_color fg = CUI_C(ui, FOREGROUND);
     cui_color acc = ui->accent == CUI_ACCENT_NEUTRAL ? cui_oklch(0.6f, 0.13f, 250, 1) : CUI_C(ui, ACCENT);
-    p->num = cui_alpha(CUI_C(ui, TEXT_MUTED), 0.7f);
-    p->num_on = CUI_C(ui, TEXT_SECONDARY);
+    /* VS Code behaviour: an unfocused editor dims the whole gutter, easing
+     * with the same focus tween the border uses (st->focus_t is updated
+     * before this call every frame). */
+    p->num = cui_alpha(CUI_C(ui, TEXT_MUTED), 0.45f + 0.25f * st->focus_t);
+    p->num_on = cui_alpha(CUI_C(ui, TEXT_SECONDARY), 0.5f + 0.5f * st->focus_t);
     p->band = cui_alpha(fg, dark ? 0.05f : 0.04f);
     p->sel = cui_alpha(acc, ui->accent == CUI_ACCENT_NEUTRAL ? 0.28f : 0.26f);
     if (!focused && !p->show_line) p->sel = cui_alpha(fg, dark ? 0.12f : 0.08f);   /* resting: a quiet selection */
