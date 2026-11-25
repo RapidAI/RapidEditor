@@ -52,7 +52,11 @@ jobs:
   # x64 natively and ARM64 via the VS cross toolchain on the x64 runner.
   windows:
     needs: meta
-    runs-on: windows-latest
+    # windows-latest now resolves to the 2025 image, which no longer ships
+    # NSIS and whose Chocolatey feed has been failing the install step.
+    # The 2022 image has NSIS 3.10 preinstalled and the same MSVC cross
+    # toolchain used by the successful v1.3.4 release.
+    runs-on: windows-2022
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
