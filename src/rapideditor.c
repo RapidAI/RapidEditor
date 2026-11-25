@@ -4114,7 +4114,9 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
     cui_dialog(ui, "关于 RapidEditor", &a->dlg_about,
                .description = "由 Dr.Daniel（RapidAI）开发的多文档编辑器", .width = 440) {
         cui_column(ui, .width = CUI_FILL, .gap = 6) {
-            cui_text(ui, "RapidEditor 2.0", .size = 16, .font = CUI_FONT_MEDIUM);
+            char about_ver[64];
+            snprintf(about_ver, sizeof about_ver, "RapidEditor %s", NP_APP_VERSION);
+            cui_text(ui, about_ver, .size = 16, .font = CUI_FONT_MEDIUM);
             cui_text(ui, "作者：Dr.Daniel（RapidAI）", .size = 12);
             cui_text(ui, "界面：yappologistic/CUI（C99, MIT, 自绘组件）", .size = 12);
             cui_text(ui, "多标签编辑：cui_doc_tabs + 每个文档独立的 cui_code_editor 状态；", .size = 12);

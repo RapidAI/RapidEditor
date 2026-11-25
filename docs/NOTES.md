@@ -1233,3 +1233,13 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
      作基线；resizeableActivity=true 使 DeX/分屏/PC 模式忽略它，不受影响。
 - 桌面不受影响：cui_app_sdl2.c 仅 CUI_PLATFORM=sdl2（Android）编译，
   Windows 走 win32 平台层。
+
+## 第三十六批（关于对话框显示实际版本）
+
+- 修复：src/rapideditor.c 关于对话框硬编码「RapidEditor 2.0」改为
+  snprintf(about_ver, "RapidEditor %s", NP_APP_VERSION)；局部栈缓冲，
+  不动更新对话框专用 update_buf。截图实证显示「RapidEditor 1.3.5」。
+- v1.3.5 发版 CI 失败：Windows job 的 Install NSIS 步骤 4 次 choco 重试
+  均失败（github logs 需鉴权，未能取到更细错误）；Android 两 ABI、
+  macOS、Linux 两架构均成功，release job 跳过（未生成 Release）。
+   workaround：随本修复以 v1.3.6 重新发版（新 tag 重跑完整 CI）。
