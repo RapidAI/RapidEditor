@@ -61,14 +61,39 @@ jobs:
       - name: Install NSIS
         shell: pwsh
         run: |
-          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
-            choco install nsis -y --no-progress --limit-output
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "${env:ProgramFiles}\NSIS\makensis.exe",
+            "$env:LOCALAPPDATA\Programs\NSIS\makensis.exe"
+          )
+          function Find-Makensis {
+            $hit = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+            if ($hit) { return $hit }
+            $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+            return $null
           }
-          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
-          if (Test-Path $nsis) {
-            $nsis | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $exe = Find-Makensis
+          if (-not $exe) {
+            # The Chocolatey community feed occasionally returns 503. Retry a
+            # few times instead of letting one transient failure abort the
+            # whole release (see v1.2.12 first attempt).
+            $installed = $false
+            for ($i = 1; $i -le 4 -and -not $installed; $i++) {
+              Write-Host "Chocolatey NSIS install attempt $i/4"
+              choco install nsis -y --no-progress --limit-output
+              if ($LASTEXITCODE -eq 0) { $installed = $true }
+              else { Start-Sleep -Seconds 15 }
+            }
+            # PATH changes from choco only apply to new processes, so re-scan
+            # the known install locations rather than relying on Get-Command.
+            $exe = Find-Makensis
           }
-          & (Join-Path $nsis 'makensis.exe') -VERSION
+          if (-not $exe) { throw 'makensis.exe not found after install attempts' }
+          (Split-Path $exe -Parent) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Using makensis: $exe"
+          & $exe -VERSION
 
       - name: Set up MSVC x64
         uses: ilammy/msvc-dev-cmd@v1
