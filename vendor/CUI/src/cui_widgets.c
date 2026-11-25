@@ -986,23 +986,64 @@ bool cui_empty_state_ex(cui_ctx *ui, const char *title, const cui_empty_opts *o)
     cui_empty_opts d;
     memset(&d, 0, sizeof d);
     if (!o) o = &d;
+    bool compact = o->compact;
     int i = cui__node_new(ui, 0);
     cui_node *n = &ui->nodes[i];
-    n->align = CUI_ALIGN_CENTER; n->gap = 6;
-    n->pad[0] = n->pad[2] = 40; n->pad[1] = n->pad[3] = 24;
+    n->align = CUI_ALIGN_CENTER; n->gap = compact ? 3 : 6;
+    n->pad[0] = n->pad[2] = compact ? 16 : 40;
+    n->pad[1] = n->pad[3] = compact ? 12 : 24;
     n->w = CUI_FILL;
+    if (o->fill) { n->h = CUI_FILL; n->justify = CUI_JUSTIFY_CENTER; }
     cui__open(ui, i);
+    if (o->icon && compact) {
+        /* compact: icon rides inline with the title, so the whole state fits
+         * in a short bottom pane without scrolling */
+        int r = cui__node_new(ui, 0);
+        cui_node *rn = &ui->nodes[r];
+        rn->dir = CUI_ROW; rn->gap = 7;
+        rn->align = CUI_ALIGN_CENTER;
+        cui__open(ui, r);
+        cui__icon_node(ui, o->icon, 14, CUI_C(ui, TEXT_MUTED));
+        int t = cui__text_node(ui, title, -1, CUI_FONT_MEDIUM,
+                               cui__fs(ui, ui->theme.text_body),
+                               CUI_C(ui, FOREGROUND), true);
+        ui->nodes[t].self_align = CUI_ALIGN_CENTER;
+        cui__close(ui);
+        if (o->description) {
+            int dsc = cui__text_node(ui, o->description, -1, CUI_FONT_BODY,
+                                     cui__fs(ui, ui->theme.text_sm),
+                                     CUI_C(ui, TEXT_SECONDARY), true);
+            ui->nodes[dsc].text_align = CUI_TEXT_CENTER;
+            ui->nodes[dsc].max_w = 420;
+            ui->nodes[dsc].self_align = CUI_ALIGN_CENTER;
+        }
+        bool clicked = false;
+        if (o->action) {
+            cui_gap(ui, 8);
+            cui_button_opts bo;
+            memset(&bo, 0, sizeof bo);
+            bo.variant = CUI_BUTTON_PRIMARY;
+            bo.icon = o->action_icon ? o->action_icon : CUI_ICON_PLUS;
+            bo.size = CUI_SIZE_SM;
+            clicked = cui_button_ex(ui, o->action, &bo);
+            ui->nodes[ui->last_node].self_align = CUI_ALIGN_CENTER;
+        }
+        cui__close(ui);
+        return clicked;
+    }
     if (o->icon) {
         int ic = cui__node_new(ui, 0);
         cui_node *in = &ui->nodes[ic];
-        in->w = CUI_PX(32); in->h = CUI_PX(32);   /* the icon alone, larger and quiet; no tile */
+        in->w = CUI_PX(compact ? 22 : 32); in->h = CUI_PX(compact ? 22 : 32);   /* the icon alone, larger and quiet; no tile */
         in->dir = CUI_STACK; in->align = CUI_ALIGN_CENTER; in->justify = CUI_JUSTIFY_CENTER;
         cui__open(ui, ic);
-        cui__icon_node(ui, o->icon, 28, CUI_C(ui, TEXT_MUTED));
+        cui__icon_node(ui, o->icon, compact ? 18 : 28, CUI_C(ui, TEXT_MUTED));
         cui__close(ui);
-        cui_gap(ui, 8);
+        cui_gap(ui, compact ? 4 : 8);
     }
-    int t = cui__text_node(ui, title, -1, CUI_FONT_MEDIUM, cui__fs(ui, ui->theme.text_lg), CUI_C(ui, FOREGROUND), true);
+    int t = cui__text_node(ui, title, -1, CUI_FONT_MEDIUM,
+                           cui__fs(ui, compact ? ui->theme.text_body : ui->theme.text_lg),
+                           CUI_C(ui, FOREGROUND), true);
     ui->nodes[t].text_align = CUI_TEXT_CENTER;
     ui->nodes[t].self_align = CUI_ALIGN_CENTER;
     if (o->description) {
@@ -1013,11 +1054,12 @@ bool cui_empty_state_ex(cui_ctx *ui, const char *title, const cui_empty_opts *o)
     }
     bool clicked = false;
     if (o->action) {
-        cui_gap(ui, 10);
+        cui_gap(ui, compact ? 6 : 10);
         cui_button_opts bo;
         memset(&bo, 0, sizeof bo);
         bo.variant = CUI_BUTTON_PRIMARY;
-        bo.icon = CUI_ICON_PLUS;
+        bo.icon = o->action_icon ? o->action_icon : CUI_ICON_PLUS;
+        if (compact) bo.size = CUI_SIZE_SM;
         clicked = cui_button_ex(ui, o->action, &bo);
         ui->nodes[ui->last_node].self_align = CUI_ALIGN_CENTER;
     }

@@ -1018,3 +1018,28 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
   懒加载展开、follow 重定向 + reveal 选中高亮、家族图标着色全部
   正常。右键菜单代码审查通过（与编辑器菜单同机制），屏幕抓取随后
   在环境层失效未能截图。
+
+## UI_PLAN P2 #9：输出面板打磨（空态统一 + 消息徽标）
+
+- 「消息」tab 补计数徽标（与查找结果/文件搜索同款 CUI_TONE_INFO badge）。
+- 输出面板四处空态 + 侧栏目录树空态全部换用 vendor cui_empty_state：
+  查找结果未设词（含主行动「开始查找 Ctrl+F」→ np_open_find）、
+  查找无匹配、文件搜索未设词（行动「打开文件搜索 Ctrl+Shift+F」→
+  dlg_find_files）、文件搜索无匹配（AI 语义失败态保留自定义错误样式）、
+  消息空、目录树空。
+- vendor cui_empty_opts 兼容扩展三个字段（memset 0 默认，不破坏宿主）：
+  action_icon（主行动按钮图标，默认 plus）、fill（占满高度并居中）、
+  compact（紧凑变体：图标 14px 与标题同行、text_body/text_sm、
+  pad 16/12、SM 按钮）。
+- 紧凑变体是被截图逼出来的：输出面板内容区 ~160px，标准空态
+  （pad 40 + 28px icon + text_lg 标题 + 按钮）超高被裁；先压缩间距仍
+  裁 ~20px，图标与标题同行后 ~90px 完整放下。
+- 视觉验证改走 CUI_SCREENSHOT 自绘链路（CUI_SCREENSHOT=path +
+  CUI_SCREENSHOT_FRAMES=90，程序渲染 N 帧后自行存 PNG 退出），
+  彻底绕开窗口存活问题；out_tab 用临时 main 初始化值切换三个 tab，
+  验完恢复。三个空态 + 消息徽标「7」截图实证通过。
+- 插曲：本机存在间歇性外部 WM_CLOSE（~40% 概率，20 秒内）杀死 GUI
+  子进程——trace 实锤非程序内部路径（无 quit 调用、无崩溃、退出码 0），
+  基线同样暴露；Visualizer 截图链路不可靠时 CUI_SCREENSHOT 是稳定
+  替代。g.out_tab 默认值 1（消息 tab）在 main 初始化块，勿当 bug 排查。
+- 验证：MSVC 构建 + 七项回归全绿。

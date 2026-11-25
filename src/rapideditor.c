@@ -7250,8 +7250,9 @@ static void np_sidebar(cui_ctx *ui, notepad *a) {
             if (a->side_tab == 0) {
                 np_tree_draw_node(ui, a, 0, 0);
                 if (np_tree[0].loaded && np_tree[0].child < 0)
-                    cui_text(ui, "目录为空或无法读取", .size = 12,
-                             .color = CUI_COLOR_TEXT_MUTED);
+                    cui_empty_state(ui, "目录为空或无法读取", .compact = true,
+                            .icon = CUI_ICON_FOLDER_OPEN,
+                            .description = "换一个目录，或从「文件 → 打开目录」重新选择。");
             } else if (a->side_tab == 1) {
                 for (int i = 0; i < a->count; i++) {
                     np_doc *t = a->docs[i];
@@ -7375,6 +7376,11 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
             if (cui_button(ui, "消息", .size = CUI_SIZE_SM,
                            .variant = CUI_BUTTON_GHOST, .icon = CUI_ICON_TERMINAL,
                            .selected = a->out_tab == 1)) a->out_tab = 1;
+            if (a->msg_count) {
+                char n[16];
+                snprintf(n, sizeof n, "%d", a->msg_count);
+                cui_badge(ui, n, .size = CUI_SIZE_SM, .tone = CUI_TONE_INFO);
+            }
             cui_spacer(ui);
             char info[192];
             if (a->out_tab == 0)
@@ -7420,11 +7426,16 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                    .height = CUI_FILL, .pad = 4, .gap = 0, .horizontal = true) {
             if (a->out_tab == 0) {
                 if (!a->find_query[0]) {
-                    cui_text(ui, "按 Ctrl+F 输入查找词，或用「搜索 → 在当前文件中查找」列出所有匹配行。",
-                             .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                    if (cui_empty_state(ui, "在当前文件中查找",
+                            .icon = CUI_ICON_SEARCH, .compact = true,
+                            .description = "输入查找词，文档中所有匹配行会列在这里。",
+                            .action = "开始查找  Ctrl+F",
+                            .action_icon = CUI_ICON_SEARCH))
+                        np_open_find(a);
                 } else if (!a->hit_count) {
-                    cui_text(ui, "没有找到匹配行。", .size = 12,
-                             .color = CUI_COLOR_TEXT_MUTED);
+                    cui_empty_state(ui, "没有找到匹配行", .compact = true,
+                            .icon = CUI_ICON_SEARCH,
+                            .description = "换个查找词试试，或检查“区分大小写”“全词匹配”开关。");
                 } else {
                     for (int i = 0; i < a->hit_count; i++) {
                         np_hit *h = &a->hits[i];
@@ -7456,8 +7467,14 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                     cui_text(ui, a->sem_error[0] ? a->sem_error : "未知错误",
                              .size = 12, .nowrap = false);
                 } else if (!a->ff_query[0]) {
-                    cui_text(ui, "用「搜索 → 在文件中查找…」(Ctrl+Shift+F) 搜索文字，或点「AI 语义搜索」用自然语言找文件。",
-                             .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                    if (cui_empty_state(ui, "在多个文件中查找",
+                            .icon = CUI_ICON_FOLDER_OPEN, .compact = true,
+                            .description = "跨目录搜索文字，或用 AI 语义搜索以自然语言描述要找的内容。",
+                            .action = "打开文件搜索  Ctrl+Shift+F",
+                            .action_icon = CUI_ICON_FOLDER_OPEN)) {
+                        a->dlg_find_files = true;
+                        if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
+                    }
                 } else if (a->sem_mode == 1 && a->sem_done == 2 && a->sem_answer[0]) {
                     cui_text(ui, a->sem_answer, .size = 12, .nowrap = false);
                     if (a->ff_hit_count) {
@@ -7483,10 +7500,12 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                             np_open_fhit(a, i);
                     }
                 } else if (!a->ff_hit_count) {
-                    cui_text(ui, a->sem_done == 2
-                             ? "AI 未找到相关文件，可换一种描述或放宽文件类型。"
-                             : "没有找到匹配行。", .size = 12,
-                             .color = CUI_COLOR_TEXT_MUTED);
+                    cui_empty_state(ui, a->sem_done == 2 ? "AI 未找到相关文件"
+                                                         : "没有找到匹配行", .compact = true,
+                            .icon = CUI_ICON_SEARCH,
+                            .description = a->sem_done == 2
+                             ? "换一种描述试试，或放宽文件类型后重新搜索。"
+                             : "换个查找词试试，或检查“区分大小写”“全词匹配”开关。");
                 } else {
                     for (int i = 0; i < a->ff_hit_count; i++) {
                         np_fhit *h = &a->ff_hits[i];
@@ -7503,8 +7522,9 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
                 }
             } else {
                 if (!a->msg_count)
-                    cui_text(ui, "暂无消息。打开、保存和替换文件时会在这里留下记录。",
-                             .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+                    cui_empty_state(ui, "暂无消息", .compact = true,
+                            .icon = CUI_ICON_INBOX,
+                            .description = "打开、保存和替换文件时会在这里留下记录。");
                 for (int i = 0; i < a->msg_count; i++)
                     cui_text(ui, a->msgs[i], .size = 12, .nowrap = true,
                              .font = CUI_FONT_MONO);

@@ -964,6 +964,9 @@ typedef struct cui_empty_opts {
     const char *icon;
     const char *description;
     const char *action;        /* label of a button under the text; the call returns true when it is clicked */
+    const char *action_icon;   /* icon of the action button; default the plus icon */
+    bool fill;                 /* take all the vertical space and center the content in it */
+    bool compact;              /* tighter paddings and smaller type, for panes and sidebars */
 } cui_empty_opts;
 /* Empty state. Returns true when its action button is clicked. */
 CUI_API bool cui_empty_state_ex(cui_ctx *ui, const char *title, const cui_empty_opts *opts);
