@@ -213,6 +213,73 @@ static int np_detect_lang(const char *path, const char *text) {
     return NP_LANG_TEXT;
 }
 
+/* P2 #7/#8: one file-type look shared by the sidebar, doc tabs and the
+ * breadcrumb. Families are coarse on purpose; tints reuse the categorical
+ * series palette (the same family the editor marks tint with), which stays
+ * legible on every style preset in both light and dark. */
+enum {
+    NP_FK_TEXT = 0, NP_FK_C, NP_FK_WEB, NP_FK_PY, NP_FK_RS, NP_FK_GO,
+    NP_FK_JSON, NP_FK_SH, NP_FK_SQL, NP_FK_MD, NP_FK_TEX, NP_FK_HEX,
+};
+
+static int np_lang_family(int lang) {
+    const char *id = NP_LANGS[lang].id;
+    if (!strcmp(id, "c") || !strcmp(id, "cpp")) return NP_FK_C;
+    if (!strcmp(id, "js") || !strcmp(id, "ts")) return NP_FK_WEB;
+    if (!strcmp(id, "python")) return NP_FK_PY;
+    if (!strcmp(id, "rust")) return NP_FK_RS;
+    if (!strcmp(id, "go")) return NP_FK_GO;
+    if (!strcmp(id, "json")) return NP_FK_JSON;
+    if (!strcmp(id, "shell")) return NP_FK_SH;
+    if (!strcmp(id, "sql")) return NP_FK_SQL;
+    return NP_FK_TEXT;
+}
+
+/* families NP_LANGS does not know: docs, TeX, web markup/styles, config */
+static int np_file_family(const char *path) {
+    char ext[32];
+    size_t i = 0;
+    for (const char *p = np_ext(path); *p && i + 1 < sizeof ext; p++, i++)
+        ext[i] = (char)tolower((unsigned char)*p);
+    ext[i] = 0;
+    if (ext[0]) {
+        if (np_ext_in("html;htm;xhtml;css;scss;sass;less;vue;svelte;astro", ext)) return NP_FK_WEB;
+        if (np_ext_in("md;markdown;mdx;rst;adoc", ext)) return NP_FK_MD;
+        if (np_ext_in("tex;sty;cls;bib;dtx;ins", ext)) return NP_FK_TEX;
+        if (np_ext_in("ini;cfg;conf;toml;yaml;yml;properties;env;bat;cmd;ps1;reg;cmake", ext)) return NP_FK_SH;
+        for (int k = 1; k < NP_LANG_COUNT; k++)
+            if (np_ext_in(NP_LANGS[k].exts, ext)) return np_lang_family(k);
+    }
+    const char *base = np_base(path);
+    if (np_ieq(base, "Makefile") || np_ieq(base, "GNUmakefile") ||
+        np_ieq(base, "makefile") || np_ieq(base, "Dockerfile") ||
+        np_ieq(base, "CMakeLists.txt") || np_ieq(base, ".bashrc") ||
+        np_ieq(base, ".zshrc") || np_ieq(base, ".profile"))
+        return NP_FK_SH;
+    return NP_FK_TEXT;
+}
+
+static const char *np_family_icon(int fk) {
+    return fk == NP_FK_HEX ? CUI_ICON_CPU
+         : (fk == NP_FK_TEXT || fk == NP_FK_MD) ? CUI_ICON_FILE_TEXT
+         : CUI_ICON_CODE;
+}
+
+static cui_color np_family_tint(cui_ctx *ui, int fk) {
+    const cui_theme *t = cui_theme_get(ui);
+    switch (fk) {
+    case NP_FK_C:    return t->colors[CUI_TOKEN_SERIES_1];
+    case NP_FK_PY:   return t->colors[CUI_TOKEN_SERIES_2];
+    case NP_FK_WEB:  return t->colors[CUI_TOKEN_SERIES_3];
+    case NP_FK_RS: case NP_FK_GO: return t->colors[CUI_TOKEN_SERIES_4];
+    case NP_FK_SH: case NP_FK_TEX: return t->colors[CUI_TOKEN_SERIES_5];
+    case NP_FK_JSON: case NP_FK_SQL: return t->colors[CUI_TOKEN_SERIES_6];
+    case NP_FK_HEX:  return cui_alpha(t->colors[CUI_TOKEN_FOREGROUND], 0.55f);
+    case NP_FK_MD:   return t->colors[CUI_TOKEN_FOREGROUND];   /* docs read bright */
+    default:         return (cui_color){0, 0, 0, 0}; /* keep the default */
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Application state                                                   */
 /* ------------------------------------------------------------------ */
@@ -293,6 +360,15 @@ typedef struct np_doc {
     np_ai_history ai_hist[NP_AI_HISTORY_MAX];
     int  ai_hist_count, ai_hist_sel;
 } np_doc;
+
+/* family for an open document: hex wins, then the path's extension, and a
+ * content-detected language as the fallback for unnamed buffers */
+static int np_doc_family(const np_doc *d) {
+    if (d->is_hex) return NP_FK_HEX;
+    int fk = np_file_family(d->path);
+    if (fk == NP_FK_TEXT && d->lang != NP_LANG_TEXT) fk = np_lang_family(d->lang);
+    return fk;
+}
 
 typedef struct np_hit {
     int line;
@@ -6785,8 +6861,11 @@ static void np_sidebar(cui_ctx *ui, notepad *a) {
                     snprintf(label, sizeof label, "%s###dir%d", e->name, i);
                     np_size_str(sz, sizeof sz, (size_t)e->size);
                     bool here = cur && cur->path[0] && strcmp(full, cur->path) == 0;
+                    int fk = e->dir ? NP_FK_TEXT : np_file_family(full);
                     if (cui_list_item(ui, label,
-                                      .icon = e->dir ? CUI_ICON_FOLDER : CUI_ICON_FILE_TEXT,
+                                      .icon = e->dir ? CUI_ICON_FOLDER : np_family_icon(fk),
+                                      .icon_color = e->dir ? (cui_color){0, 0, 0, 0}
+                                                           : np_family_tint(ui, fk),
                                       .trailing = e->dir ? NULL : sz,
                                       .selected = here)) {
                         if (e->dir) np_dir_set(a, full);
@@ -6804,7 +6883,9 @@ static void np_sidebar(cui_ctx *ui, notepad *a) {
                              t->dirty ? "● " : "",
                              t->path[0] ? np_base(t->path) : "未命名", t->uid);
                     snprintf(tail, sizeof tail, "%s", NP_LANGS[t->lang].label);
-                    if (cui_list_item(ui, label, .icon = CUI_ICON_FILE_TEXT,
+                    int fk = np_doc_family(t);
+                    if (cui_list_item(ui, label, .icon = np_family_icon(fk),
+                                      .icon_color = np_family_tint(ui, fk),
                                       .trailing = tail, .selected = (i == a->active)))
                         np_activate(a, i, true);
                 }
@@ -7059,6 +7140,10 @@ static void np_output_panel(cui_ctx *ui, notepad *a) {
 static void np_doc_breadcrumb(cui_ctx *ui, notepad *a, np_doc *d) {
     (void)a;
     cui_row(ui, .width = CUI_FILL, .gap = 8, .pad_x = 6, .pad_y = 2) {
+        int fk = np_doc_family(d);
+        cui_color ic = np_family_tint(ui, fk);
+        if (!ic.a) ic = cui_theme_get(ui)->colors[CUI_TOKEN_TEXT_MUTED];
+        cui_icon(ui, np_family_icon(fk), 12, ic);
         if (d->path[0]) {
             char dir[NP_PATH_CAP], crumb[NP_PATH_CAP + 64];
             np_dir_of(d->path, dir, sizeof dir);
@@ -8542,8 +8627,10 @@ static np_doc *np_workspace(cui_ctx *ui, notepad *a, bool busy) {
                      t->dirty ? "  ·  未保存" : "",
                      stale ? "  ·  磁盘内容已变化" : "",
                      t->disk_missing ? "  ·  磁盘文件已删除" : "");
+            int fk = np_doc_family(t);
             tabs[i] = (cui_doc_tab){ .title = t->tab_title,
-                                     .icon = t->is_hex ? CUI_ICON_CPU : CUI_ICON_FILE_TEXT,
+                                     .icon = np_family_icon(fk),
+                                     .icon_color = np_family_tint(ui, fk),
                                      .tooltip = t->tab_tip,
                                      .dirty = t->dirty };
         }
@@ -9497,8 +9584,10 @@ static void np_frame(cui_ctx *ui, void *user) {
                     cui_menu_label(ui, "最近打开");
                     for (int i = 0; i < a->recent_count; i++) {
                         char label[NP_PATH_CAP + 32];
+                        int fk = np_file_family(a->recent[i]);
                         snprintf(label, sizeof label, "%s##recent%d", np_base(a->recent[i]), i);
-                        if (cui_menu_item(ui, label, .icon = CUI_ICON_FILE_TEXT))
+                        if (cui_menu_item(ui, label, .icon = np_family_icon(fk),
+                                          .icon_color = np_family_tint(ui, fk)))
                             np_open_path(a, a->recent[i], true);
                     }
                 }

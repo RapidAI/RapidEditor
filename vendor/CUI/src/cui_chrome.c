@@ -1282,7 +1282,10 @@ static void cui__dtf_build_tab(cui__dtf *f, int k, int vis_sel, float rad, float
     if (tr.hovered || dragged) cui__set_cursor(ui, dragged ? CUI_CURSOR_MOVE : CUI_CURSOR_HAND);
     cui__open(ui, i);
     cui_color fg = active ? CUI_C(ui, FOREGROUND) : cui_mix(CUI_C(ui, TEXT_SECONDARY), CUI_C(ui, FOREGROUND), ts->hover * 0.7f);
-    if (tb->icon) cui__icon_node(ui, tb->icon, 14, active ? CUI_C(ui, FOREGROUND) : CUI_C(ui, TEXT_SECONDARY));
+    if (tb->icon)
+        cui__icon_node(ui, tb->icon, 14,
+                       tb->icon_color.a ? tb->icon_color
+                                        : (active ? CUI_C(ui, FOREGROUND) : CUI_C(ui, TEXT_SECONDARY)));
     const char *title = tb->title ? tb->title : "";
     int t = cui__text_node(ui, title, cui__display_len(title), CUI_FONT_BODY, fs, fg, false);
     ui->nodes[t].line_height = 1.3f;

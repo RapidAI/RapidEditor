@@ -266,7 +266,8 @@ bool cui_menu_item_ex(cui_ctx *ui, const char *label, const cui_menu_item_opts *
     if (r.hovered && !disabled) cui__set_cursor(ui, CUI_CURSOR_HAND);
     cui__open(ui, i);
     cui_color fg = o->danger ? CUI_C(ui, DANGER) : CUI_C(ui, FOREGROUND);
-    if (o->icon) cui__icon_node(ui, o->icon, 16, o->danger ? fg : CUI_C(ui, TEXT_SECONDARY));
+    if (o->icon) cui__icon_node(ui, o->icon, 16, o->danger ? fg
+                             : (o->icon_color.a ? o->icon_color : CUI_C(ui, TEXT_SECONDARY)));
     float ts = o->text_size > 0 ? o->text_size : ui->theme.text_body;
     if (o->text_size > 0) ui->nodes[i].h = CUI_PX(CUI_MAX(32.0f, roundf(cui__fs(ui, ts)) + 20));
     int t = cui__text_node(ui, label, cui__display_len(label), o->font, cui__fs(ui, ts), fg, false);

@@ -210,7 +210,8 @@ bool cui_list_item_ex(cui_ctx *ui, const char *title, const cui_list_item_opts *
         memset(&ao, 0, sizeof ao);
         ao.size = o->subtitle ? 34 : 26;
         cui_avatar_ex(ui, o->avatar, &ao);
-    } else if (o->icon) cui__icon_node(ui, o->icon, 16, CUI_C(ui, TEXT_SECONDARY));
+    } else if (o->icon) cui__icon_node(ui, o->icon, 16,
+                                       o->icon_color.a ? o->icon_color : CUI_C(ui, TEXT_SECONDARY));
     int col = cui__node_new(ui, 0);
     ui->nodes[col].gap = 1; ui->nodes[col].w = CUI_FILL;
     cui__open(ui, col);

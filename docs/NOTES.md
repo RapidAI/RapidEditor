@@ -968,3 +968,23 @@ UI_PLAN P1 第四项落地（语法配色审查，P1 全部完成）：
 - 工具构建：cl /MD scripts/audit_contrast.c /I vendor/CUI/include
   /I vendor/CUI/src /link cui.lib + win32 系统库（cui.lib 静态库按
   /MD CRT 构建，缺 /MD 会报 __imp_cbrtf 未解析）。
+
+UI_PLAN P2 第七、八项落地（文件类型图标着色 + 标签页语言图标）：
+
+- app 单一映射（np_file_family / np_lang_family / np_doc_family）：
+  12 个粗粒度家族（C/C++、Web、Python、Rust/Go、JSON/SQL、Shell/
+  配置、Markdown、TeX、HEX、纯文本）；图标 NP_FK_HEX 用 CPU、
+  文本/MD 用 FILE_TEXT、其余 CODE；着色复用主题分类色板
+  SERIES_1..6（与编辑器 marks 同族，所有风格深浅两态均可辨），
+  MD 用 FOREGROUND（文档读起来「亮」），HEX 用 55% 前景灰，
+  纯文本不着色走默认。
+- vendor 三个组件加 icon_color（alpha 0 = 行为不变，默认渲染不破坏
+  其他宿主）：cui_list_item_opts、cui_doc_tab、cui_menu_item_opts。
+- app 接入五处：侧栏目录列表（目录保持文件夹图标不着色）、侧栏
+  文档列表、文档标签、面包屑（无着色时退 TEXT_MUTED）、最近打开
+  菜单。状态栏 chip 已有 tone 语义，未动。
+- 标签溢出审查（#8 要求）：cui_doc_tabs 本就走横向滚动条 + 标题
+  max_w 200 截断 + 拖拽重排，行为合格，无需改动。
+
+MSVC 构建通过；八项回归全绿。注意：CUI_C 是 vendor 内部宏，app 层
+读具体主题色用 cui_theme_get(ui)->colors[...]。

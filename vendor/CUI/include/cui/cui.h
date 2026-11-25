@@ -799,6 +799,7 @@ CUI_API void cui_context_menu_end(cui_ctx *ui);
 typedef struct cui_menu_item_opts {
     int _;
     const char *icon;
+    cui_color icon_color;      /* tints the icon; alpha 0 keeps the default colour */
     const char *shortcut;
     bool danger;
     bool disabled;
@@ -1004,6 +1005,7 @@ CUI_API bool cui_tree_clicked(cui_ctx *ui);   /* the node created by the last cu
 typedef struct cui_list_item_opts {
     int _;
     const char *icon;
+    cui_color icon_color;      /* tints the icon; alpha 0 keeps the default muted colour */
     const char *subtitle;      /* second line under the title, smaller; makes the row taller */
     const char *trailing;      /* muted text at the right edge, e.g. a time or a count */
     bool selected;             /* drawn with the active background */
@@ -3314,6 +3316,7 @@ CUI_API void cui_status_bar_progress_ex(cui_ctx *ui, float value, const cui_stat
 typedef struct cui_doc_tab {
     const char *title;         /* the tab's text and its identity; add "##key" to tell two tabs with one name apart */
     const char *icon;
+    cui_color icon_color;      /* tints the icon; alpha 0 keeps the default text colour */
     const char *tooltip;
     bool dirty;                /* unsaved changes: a dot in place of the x, which returns under the pointer */
 } cui_doc_tab;
