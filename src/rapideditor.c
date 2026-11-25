@@ -2555,12 +2555,22 @@ static void np_hex_find_run(notepad *a, bool next) {
         for (size_t i = lo; i < hi; i++) {
             if (t[i] != (char)pat[0]) continue;   /* cheap first-byte gate */
             if (memcmp(t + i, pat, (size_t)pn) == 0) {
+                /* count every match and which one this is, so the toast
+                 * reads "2 of 7" like the text find bar does */
+                int total = 0, index = 0;
+                for (size_t j = 0; j + (size_t)pn <= n; j++) {
+                    if (t[j] != (char)pat[0]) continue;
+                    if (memcmp(t + j, pat, (size_t)pn) == 0) {
+                        total++;
+                        if (j == i) index = total;
+                    }
+                }
                 a->hexfind_at = i;
                 a->hexfind_len = (size_t)pn;
                 if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, i);
                 char msg[96];
-                snprintf(msg, sizeof msg, "0x%X 处命中 %d 字节",
-                         (unsigned)i, pn);
+                snprintf(msg, sizeof msg, "%d of %d · 0x%X 处命中 %d 字节",
+                         index, total, (unsigned)i, pn);
                 np_toast(a, next ? "下一个命中" : "已找到", msg, CUI_TONE_SUCCESS);
                 a->dlg_hexfind = false;
                 return;
