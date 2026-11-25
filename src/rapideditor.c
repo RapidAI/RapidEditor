@@ -3924,7 +3924,8 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "视图 → 编辑器字体：内置开源编程字体 + 自定义 TTF / OTF 文件",
             "Alt             激活菜单栏，方向键选择菜单项",
             "编辑器内：Ctrl+A 全选、Ctrl+C/X/V 复制/剪切/粘贴、Tab 缩进",
-            "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、括号跳转",
+            "编辑器内：Ctrl D 复制当前行、Alt Up / Alt Down 上下移动选中的行",
+            "菜单「编辑 → 转换」：大小写、行排序、去重、删空行、剪裁空白、Tab↔空格、合并行、括号跳转",
             "Ctrl ,          外观设置（界面风格 / 深浅色 / 强调色 / 字号密度）",
             "Ctrl R          从磁盘重新加载当前文件（有未保存修改时先确认）",
             "Alt \\           行内 AI 补全：光标处触发续写建议，Tab 接受 / Esc 忽略",
@@ -5980,6 +5981,79 @@ static void np_line_transform(notepad *a, np_doc *d, int mode) {
     np_splice(a, d, ls, le, join, o);
     free(join);
     free(scratch);
+}
+
+/* Copy the whole line(s) under the caret or selection to just below them
+ * (one undo step through np_splice). The caret lands at the copy's start. */
+static void np_duplicate_line(notepad *a, np_doc *d) {
+    int ls, le;
+    if (!np_line_range(d, &ls, &le)) return;
+    int len = d->len;
+    bool ends_nl = le < len || d->text[le - 1] == '\n';
+    int bl = le - ls;
+    char *ins = (char *)malloc((size_t)bl + 2);
+    if (!ins) {
+        np_toast(a, "内存不足", "无法分配复制缓冲区", CUI_TONE_WARNING);
+        return;
+    }
+    size_t n;
+    if (ends_nl) {
+        memcpy(ins, d->text + ls, (size_t)bl);
+        n = (size_t)bl;
+    } else {
+        ins[0] = '\n';                      /* last line: copy below it */
+        memcpy(ins + 1, d->text + ls, (size_t)bl);
+        n = (size_t)bl + 1;
+    }
+    int at = le;
+    np_splice(a, d, le, le, ins, n);
+    free(ins);
+    if (d->len == len + (int)n)             /* splice succeeded */
+        cui_code_editor_select(a->ui, d->editor_id, at + (ends_nl ? 0 : 1),
+                               at + (ends_nl ? 0 : 1));
+}
+
+/* Move the whole line(s) under the caret or selection up or down, swapping
+ * them with the adjacent line block. The caret / selection keeps its shape
+ * and rides along with the block. */
+static void np_move_lines(notepad *a, np_doc *d, int dir) {
+    int ls, le;
+    if (!np_line_range(d, &ls, &le)) return;
+    int len = d->len;
+    int bl = le - ls, other, at, delta;
+    char *buf;
+    if (dir < 0) {
+        if (ls == 0) return;                /* already the first line */
+        other = ls - 1;
+        while (other > 0 && d->text[other - 1] != '\n') other--;
+        delta = -(ls - other);
+        buf = (char *)malloc((size_t)bl + (size_t)(ls - other));
+        if (!buf) goto oom;
+        memcpy(buf, d->text + ls, (size_t)bl);
+        memcpy(buf + bl, d->text + other, (size_t)(ls - other));
+        at = other;
+        np_splice(a, d, other, le, buf, (size_t)bl + (size_t)(ls - other));
+    } else {
+        if (le >= len) return;              /* last line: nothing below */
+        int ne = le;
+        while (ne < len && d->text[ne] != '\n') ne++;
+        if (ne < len) ne++;
+        delta = ne - le;
+        buf = (char *)malloc((size_t)bl + (size_t)(ne - le));
+        if (!buf) goto oom;
+        memcpy(buf, d->text + le, (size_t)(ne - le));
+        memcpy(buf + (ne - le), d->text + ls, (size_t)bl);
+        at = ls;
+        np_splice(a, d, ls, ne, buf, (size_t)(ne - le) + (size_t)bl);
+    }
+    free(buf);
+    if (d->len != len) return;              /* splice failed; keep it simple */
+    d->caret = NP_MAX(0, NP_MIN(d->caret + delta, d->len));
+    d->anchor = NP_MAX(0, NP_MIN(d->anchor + delta, d->len));
+    cui_code_editor_select(a->ui, d->editor_id, d->anchor, d->caret);
+    return;
+oom:
+    np_toast(a, "内存不足", "无法分配移动缓冲区", CUI_TONE_WARNING);
 }
 
 /* Jump between matching (), [] and {} around the caret. */
@@ -9245,6 +9319,17 @@ static void np_frame(cui_ctx *ui, void *user) {
             cui_shortcut(ui, CUI_MOD_ALT, CUI_KEY_BACKSLASH))
             np_inline_manual(a, d);
 
+        /* Line tools: duplicate (Ctrl D) and move up / down (Alt Up/Down).
+         * Editor focus required so they never fire while typing elsewhere. */
+        if (d && !d->is_hex && d->editor_focused) {
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_D))
+                np_duplicate_line(a, d);
+            if (cui_shortcut(ui, CUI_MOD_ALT, CUI_KEY_UP))
+                np_move_lines(a, d, -1);
+            if (cui_shortcut(ui, CUI_MOD_ALT, CUI_KEY_DOWN))
+                np_move_lines(a, d, 1);
+        }
+
         /* Markdown paragraph shortcuts (only for .md documents). Kept off the
          * plain Ctrl+digit range used for tab switching. */
         if (d && np_doc_is_markdown(d)) {
@@ -9477,6 +9562,16 @@ static void np_frame(cui_ctx *ui, void *user) {
                     np_line_transform(a, d, TR_SP2TAB);
                 if (cui_menu_item(ui, "合并选中的行", .icon = CUI_ICON_CHEVRON_DOWN))
                     np_line_transform(a, d, TR_JOIN);
+                cui_menu_separator(ui);
+                if (cui_menu_item(ui, "复制当前行", .icon = CUI_ICON_COPY,
+                                  .shortcut = "Ctrl D"))
+                    np_duplicate_line(a, d);
+                if (cui_menu_item(ui, "上移选中的行", .icon = CUI_ICON_ARROW_UP,
+                                  .shortcut = "Alt Up"))
+                    np_move_lines(a, d, -1);
+                if (cui_menu_item(ui, "下移选中的行", .icon = CUI_ICON_ARROW_DOWN,
+                                  .shortcut = "Alt Down"))
+                    np_move_lines(a, d, 1);
                 if (cui_menu_item(ui, "转到匹配的括号", .icon = CUI_ICON_CHEVRONS_UP_DOWN))
                     np_goto_bracket(a, d);
                 cui_menu_separator(ui);
