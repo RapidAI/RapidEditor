@@ -2392,8 +2392,11 @@ static void np_open_find(notepad *a) {
             a->find_query[n] = 0;
         }
     }
-    cui_code_editor_find(a->ui, d->editor_id,
-                         a->find_query[0] ? a->find_query : "");
+    /* The find bar follows the dialog's "match case" setting, so both
+     * find surfaces agree on what a match is. */
+    cui_code_editor_find_case(a->ui, d->editor_id,
+                              a->find_query[0] ? a->find_query : "",
+                              a->match_case);
 }
 
 static void np_do_goto(notepad *a) {

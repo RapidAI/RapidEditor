@@ -36,6 +36,7 @@ typedef struct {
     double last_activity;
     int mode;                   /* bar: 0 none, 1 find, 2 go to line */
     char query[128], go[24];
+    bool find_case;             /* find bar honours letter case */
     bool tab_free;              /* Esc released Tab: the next one moves focus */
     bool bar_focus;             /* give the bar's field focus this frame */
     bool pend_sel, pend_goto, pend_find, init;
@@ -429,23 +430,26 @@ static void cui__ed_brackets(const cui__ed *E, int caret, int *a, int *b) {
 /* ---- find ---- */
 
 
-static bool cui__ed_hit(const char *s, int len, int i, const char *q, int qn) {
+/* mc: case sensitive match. Default (false) keeps the historical
+ * case-insensitive behaviour of the find bar. */
+static bool cui__ed_hit(const char *s, int len, int i, const char *q, int qn, bool mc) {
     if (qn <= 0 || i < 0 || i + qn > len) return false;
+    if (mc) return memcmp(s + i, q, (size_t)qn) == 0;
     for (int k = 0; k < qn; k++) if (cui__ascii_lower((unsigned char)s[i + k]) != cui__ascii_lower((unsigned char)q[k])) return false;
     return true;
 }
 
 /* First match at or after from (dir > 0), or last one before from (dir < 0),
- * wrapping around the ends; -1 when there is none. Case is ignored. */
-static int cui__ed_find(const char *s, int len, const char *q, int qn, int from, int dir) {
+ * wrapping around the ends; -1 when there is none. */
+static int cui__ed_find(const char *s, int len, const char *q, int qn, int from, int dir, bool mc) {
     if (qn <= 0 || qn > len) return -1;
     int last = len - qn;
     if (dir > 0) {
-        for (int i = CUI_MAX(0, from); i <= last; i++) if (cui__ed_hit(s, len, i, q, qn)) return i;
-        for (int i = 0; i < CUI_MIN(from, last + 1); i++) if (cui__ed_hit(s, len, i, q, qn)) return i;
+        for (int i = CUI_MAX(0, from); i <= last; i++) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
+        for (int i = 0; i < CUI_MIN(from, last + 1); i++) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
     } else {
-        for (int i = CUI_MIN(from - 1, last); i >= 0; i--) if (cui__ed_hit(s, len, i, q, qn)) return i;
-        for (int i = last; i >= CUI_MAX(0, from); i--) if (cui__ed_hit(s, len, i, q, qn)) return i;
+        for (int i = CUI_MIN(from - 1, last); i >= 0; i--) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
+        for (int i = last; i >= CUI_MAX(0, from); i--) if (cui__ed_hit(s, len, i, q, qn, mc)) return i;
     }
     return -1;
 }
@@ -453,7 +457,7 @@ static int cui__ed_find(const char *s, int len, const char *q, int qn, int from,
 static void cui__ed_find_go(cui__ed *E, int from, int dir) {
     const char *q = E->st->query;
     int qn = (int)strlen(q);
-    int at = cui__ed_find(E->buf, E->len, q, qn, from, dir);
+    int at = cui__ed_find(E->buf, E->len, q, qn, from, dir, E->st->find_case);
     if (at < 0) return;
     E->st->ed.anchor = at;
     E->st->ed.cursor = at + qn;
@@ -623,6 +627,7 @@ typedef struct {
     int br_line[2];
     float br_px[2];
     const char *query; int qn;
+    bool qcase;                 /* find matches honour letter case */
     const cui_text_mark *marks; int nmarks;   /* the app's marks that reach the lines in view */
     cui_color mark_colors[7];
     const char *placeholder;
@@ -764,7 +769,7 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
         /* find matches */
         if (p->qn > 0) {
             for (int i = ls; i + p->qn <= le; i++) {
-                if (!cui__ed_hit(s, le, i, p->query, p->qn)) continue;
+                if (!cui__ed_hit(s, le, i, p->query, p->qn, p->qcase)) continue;
                 float xa = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i);
                 float xb = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, i + p->qn);
                 cui_draw_rect_border(ui, (cui_rect){ x0 + xa - 1, y + 1, xb - xa + 2, p->lh - 2 }, CUI_CORNERS(3), p->match, p->match_edge, 1);
@@ -863,7 +868,13 @@ void cui_code_editor_select(cui_ctx *ui, const char *id, int anchor, int cursor)
 }
 
 void cui_code_editor_find(cui_ctx *ui, const char *id, const char *query) {
+    cui_code_editor_find_case(ui, id, query, false);
+}
+
+/* Open the find bar seeded with query; match_case honours letter case. */
+void cui_code_editor_find_case(cui_ctx *ui, const char *id, const char *query, bool match_case) {
     cui__ed_state *s = cui__ed_get(ui, id);
+    s->find_case = match_case;
     if (!query) { s->mode = 0; return; }
     snprintf(s->query, sizeof s->query, "%s", query);
     s->mode = 1;
@@ -1340,9 +1351,9 @@ static void cui__edf_build_find(cui__edf *f, cui_input_opts *io, cui_button_opts
     int total = 0, index = 0;
     s0 = CUI_MIN(e->cursor, e->anchor);
     int s1 = CUI_MAX(e->cursor, e->anchor);
-    bool on_match = qn > 0 && s1 - s0 == qn && cui__ed_hit(E->buf, E->len, s0, st->query, qn);
+    bool on_match = qn > 0 && s1 - s0 == qn && cui__ed_hit(E->buf, E->len, s0, st->query, qn, st->find_case);
     for (int i = 0; qn > 0 && i + qn <= E->len; i++)
-        if (cui__ed_hit(E->buf, E->len, i, st->query, qn)) { total++; if (i < s0 || (on_match && i == s0)) index++; }
+        if (cui__ed_hit(E->buf, E->len, i, st->query, qn, st->find_case)) { total++; if (i < s0 || (on_match && i == s0)) index++; }
     f->res->find_matches = total;
     f->res->find_index = on_match ? index : 0;
     const char *label = qn == 0 ? "" : narrow ? (on_match ? cui__frame_printf(ui, "%d/%d", index, total) : cui__frame_printf(ui, "%d", total))
@@ -1522,7 +1533,7 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
             }
         }
     }
-    if (st->mode == 1 && st->query[0]) { p->query = cui__frame_strdup(ui, st->query, -1); p->qn = (int)strlen(p->query); }
+    if (st->mode == 1 && st->query[0]) { p->query = cui__frame_strdup(ui, st->query, -1); p->qn = (int)strlen(p->query); p->qcase = st->find_case; }
     if (f->o->marks && f->o->mark_count > 0) {   /* the marks that reach the lines in view, copied: the caller owns them */
         const cui_text_mark *mk = f->o->marks;
         int n = f->o->mark_count, lo = 0, hi = n;

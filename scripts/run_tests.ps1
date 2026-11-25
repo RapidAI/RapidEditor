@@ -49,6 +49,7 @@ function Extract-Fn([string]$signature, [string]$implPath) {
 }
 Extract-Fn "static void np_ai_strip_code_fence(char *buf, size_t cap)" (Join-Path $out "np_ai_strip_code_fence.impl")
 Extract-Fn "static char *np_inline_clean(char *buf)" (Join-Path $out "np_inline_clean.impl")
+Extract-Fn "static bool np_match(const char *p, const char *q, size_t n, bool match_case)" (Join-Path $out "np_match.impl")
 
 # Static config-key consistency check (needs no compiler).
 Write-Host "== check_config ==" -ForegroundColor Cyan
@@ -60,7 +61,8 @@ $tests = @(
     @{ name = "test_fence";   src = "scripts\test_fence.c";   link = @() },
     @{ name = "test_inline";  src = "scripts\test_inline.c";  link = @() },
     @{ name = "test_openai";  src = "scripts\test_openai.c";  link = @("src\np_openai.c") },
-    @{ name = "test_maclaw";  src = "scripts\test_maclaw.c";  link = @("src\np_maclaw.c") }
+    @{ name = "test_maclaw";  src = "scripts\test_maclaw.c";  link = @("src\np_maclaw.c") },
+    @{ name = "test_match";   src = "scripts\test_match.c";    link = @() }
 )
 
 $fail = 0

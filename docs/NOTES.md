@@ -739,3 +739,24 @@ MSVC 构建通过；五项回归全绿（check_config + 4 组单测）。
   语义保持不变。
 
 MSVC 构建通过；五项回归全绿。
+
+## 查找栏区分大小写贯通（第二十七批）
+
+Ctrl F 打开的编辑器内嵌查找栏此前永远不区分大小写，而「查找和替换」
+对话框有「区分大小写」checkbox（配置键 match_case）——两个查找入口对
+「什么是匹配」的答案不一致，勾选后用户在查找栏得不到一致行为。
+
+- vendor/CUI：`cui__ed_hit` / `cui__ed_find` 增加 match_case 参数
+  （命中时 memcmp 直比；默认 false 保持历史的不区分行为）。匹配跳转、
+  计数徽标（"3 of 7"）、正文高亮共用同一参数——三种呈现不会分叉。
+- 新 API `cui_code_editor_find_case(ui, id, query, match_case)`；旧的
+  `cui_code_editor_find` 保持兼容（等价 find_case(false)）。
+- app 层 `np_open_find` 改传 `a->match_case`：查找栏与替换对话框、
+  在文件中查找、np_replace_all 全部共用同一开关、同一配置键。
+- 回归新增第 6 项 `test_match`（提取 np_match 真实现，15 用例）：
+  两种大小写模式、UTF-8 续字节不得被 ASCII 折叠误伤（0xC3 0x89 vs
+  0xC3 0xA9 在 ci 模式必须不命中）、起点语义（np_match 是逐位置谓词，
+  用例从匹配偏移起传）与终止边界。顺带踩坑：MSVC 十六进制转义贪心
+  吞字符，"\xC3\x89a" 会被解析成 \x89a——用字符串拼接断开。
+
+MSVC 构建通过；六项回归全绿（check_config + 5 组单测）。
