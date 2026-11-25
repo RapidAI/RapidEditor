@@ -5168,7 +5168,8 @@ static void np_dir_refresh(notepad *a) {
 /* config persistence, backup and "open with system"                    */
 /* ------------------------------------------------------------------ */
 
-enum { TR_UPPER = 0, TR_LOWER, TR_SORT, TR_UNIQ, TR_STRIP, TR_NOEMPTY };
+enum { TR_UPPER = 0, TR_LOWER, TR_SORT, TR_UNIQ, TR_STRIP, TR_NOEMPTY,
+       TR_TAB2SP, TR_SP2TAB, TR_JOIN };
 
 static bool np_file_exists(const char *path) {
 #ifdef _WIN32
@@ -5826,6 +5827,49 @@ static int np_row_cmp(const void *x, const void *y) {
     return strcmp(*(const char *const *)x, *(const char *const *)y);
 }
 
+/* Expand every tab in row to spaces up to the next tab stop. Columns are
+ * counted in bytes, matching the editor's cui__ed_col semantics (UTF-8
+ * multibyte chars advance one column per byte). Returns bytes written. */
+static size_t np_row_tab2sp(const char *row, char *out, int tab) {
+    size_t o = 0;
+    int col = 0;
+    for (const char *p = row; *p; p++) {
+        if (*p == '\t') {
+            int stop = (col / tab + 1) * tab;
+            while (col < stop) { out[o++] = ' '; col++; }
+        } else {
+            out[o++] = *p;
+            col++;
+        }
+    }
+    return o;
+}
+
+/* Rewrite leading whitespace with tabs aligned to tab stops; spaces beyond
+ * the body are left alone. A tab absorbs the pending partial run of spaces
+ * before it (same final alignment), trailing runs shorter than a stop are
+ * re-emitted as spaces. Returns bytes written. */
+static size_t np_row_sp2tab(const char *row, char *out, int tab) {
+    size_t o = 0;
+    int col = 0, pend = 0;
+    const char *p = row;
+    while (*p == ' ' || *p == '\t') {
+        if (*p == ' ') {
+            col++;
+            if (++pend == tab) { out[o++] = '\t'; pend = 0; }
+        } else {
+            out[o++] = '\t';
+            pend = 0;
+            col = (col / tab + 1) * tab;
+        }
+        p++;
+    }
+    while (pend-- > 0) out[o++] = ' ';
+    size_t rest = strlen(p);
+    memcpy(out + o, p, rest);
+    return o + rest;
+}
+
 /* Sort / dedupe / trim / remove empty lines. Sort and dedupe need a
  * selection; trim and remove-empty fall back to the whole document. */
 static void np_line_transform(notepad *a, np_doc *d, int mode) {
@@ -5835,8 +5879,9 @@ static void np_line_transform(notepad *a, np_doc *d, int mode) {
         return;
     }
     if (d->caret == d->anchor) {
-        if (mode == TR_SORT || mode == TR_UNIQ) {
-            np_toast(a, "先选中要处理的行", "排序与去重作用于选中的行", CUI_TONE_INFO);
+        if (mode == TR_SORT || mode == TR_UNIQ || mode == TR_JOIN) {
+            np_toast(a, "先选中要处理的行", "合并与排序、去重一样作用于选中的行",
+                     CUI_TONE_INFO);
             return;
         }
         ls = 0; le = d->len;                /* whole document */
@@ -5858,6 +5903,7 @@ static void np_line_transform(notepad *a, np_doc *d, int mode) {
     }
     char *rows[NP_TL_MAX];
     int nr = 0;
+    char *scratch = NULL;               /* tab conversion backing buffer */
     rows[nr++] = work;
     for (int i = 0; i < span; i++)
         if (work[i] == '\n') { work[i] = 0; rows[nr++] = work + i + 1; }
@@ -5880,8 +5926,38 @@ static void np_line_transform(notepad *a, np_doc *d, int mode) {
         for (int i = 0; i < nr; i++)
             if (rows[i][0]) rows[w++] = rows[i];
         nr = w;
+    } else if (mode == TR_TAB2SP || mode == TR_SP2TAB) {
+        /* Rows live in work and must stay put for the rejoin below, so the
+         * converted rows are written to scratch and the pointers replaced. */
+        char *scr = (char *)malloc((size_t)span * 4 + 4);
+        if (!scr) {
+            np_toast(a, "内存不足", "无法分配转换缓冲区", CUI_TONE_WARNING);
+            return;
+        }
+        char *np2[NP_TL_MAX];
+        char *out = scr;
+        for (int i = 0; i < nr; i++) {
+            np2[i] = out;
+            if (mode == TR_TAB2SP) out += np_row_tab2sp(rows[i], out, 4);
+            else                   out += np_row_sp2tab(rows[i], out, 4);
+            *out++ = 0;
+        }
+        memcpy(rows, np2, sizeof rows[0] * (size_t)nr);
+        scratch = scr;
+    } else if (mode == TR_JOIN) {
+        int w = 0;
+        for (int i = 0; i < nr; i++) {
+            char *r = rows[i];
+            while (r[0] == ' ' || r[0] == '\t') r++;
+            size_t l = strlen(r);
+            while (l && (r[l - 1] == ' ' || r[l - 1] == '\t')) r[--l] = 0;
+            if (r[0]) rows[w++] = r;
+        }
+        if (w == 0) { rows[0] = (char *)""; w = 1; }
+        nr = w;                             /* empty rows drop out of the join */
     }
 
+    char sep = mode == TR_JOIN ? ' ' : '\n';
     bool had_nl = d->text[le - 1] == '\n';
     size_t total = 0;
     for (int i = 0; i < nr; i++) total += strlen(rows[i]) + 1;
@@ -5889,6 +5965,7 @@ static void np_line_transform(notepad *a, np_doc *d, int mode) {
     char *join = (char *)malloc(total + 1);
     if (!join) {
         np_toast(a, "内存不足", "无法分配转换缓冲区", CUI_TONE_WARNING);
+        free(scratch);
         return;
     }
     size_t o = 0;
@@ -5896,11 +5973,13 @@ static void np_line_transform(notepad *a, np_doc *d, int mode) {
         size_t l = strlen(rows[i]);
         memcpy(join + o, rows[i], l);
         o += l;
-        if (i + 1 < nr || had_nl) join[o++] = '\n';
+        if (i + 1 < nr) join[o++] = sep;    /* JOIN: space; else newline */
+        else if (had_nl) join[o++] = '\n';
     }
     join[o] = 0;
     np_splice(a, d, ls, le, join, o);
     free(join);
+    free(scratch);
 }
 
 /* Jump between matching (), [] and {} around the caret. */
@@ -9392,6 +9471,12 @@ static void np_frame(cui_ctx *ui, void *user) {
                     np_line_transform(a, d, TR_NOEMPTY);
                 if (cui_menu_item(ui, "剪裁行尾空白", .icon = CUI_ICON_SLIDERS_HORIZONTAL))
                     np_line_transform(a, d, TR_STRIP);
+                if (cui_menu_item(ui, "Tab 转空格", .icon = CUI_ICON_ALIGN_LEFT))
+                    np_line_transform(a, d, TR_TAB2SP);
+                if (cui_menu_item(ui, "行首空格转 Tab", .icon = CUI_ICON_GRIP_VERTICAL))
+                    np_line_transform(a, d, TR_SP2TAB);
+                if (cui_menu_item(ui, "合并选中的行", .icon = CUI_ICON_CHEVRON_DOWN))
+                    np_line_transform(a, d, TR_JOIN);
                 if (cui_menu_item(ui, "转到匹配的括号", .icon = CUI_ICON_CHEVRONS_UP_DOWN))
                     np_goto_bracket(a, d);
                 cui_menu_separator(ui);
