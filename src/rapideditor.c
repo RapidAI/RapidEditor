@@ -41,7 +41,7 @@
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.3.3"
+#define NP_APP_VERSION "1.3.4"
 
 #include <ctype.h>
 #include <errno.h>
