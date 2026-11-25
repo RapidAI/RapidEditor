@@ -1134,3 +1134,35 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
   会被 config 覆盖，第一次截图白跑）。
 - 验证：MSVC 构建 + 七项回归全绿。UI_PLAN #14/#15 标 ✅，P4 仅剩
   #17 连字评估（L，评估类）。
+
+## 第三十二批（P4 #17 连字评估 + 实验开关，vendor L 评估类）
+
+- 交付：CUI_TEXT_SHAPING 编译开关（CMake option，默认 OFF，顶层 CMakeLists
+  强制 ON 供本仓构建）+ 视图菜单「编程连字（实验）」勾选（editor_lig
+  持久化，默认关）+ cui_code_editor_opts.ligatures opt-in。
+- shaper 本体正确性回归（scripts/test_lig.c，run_tests 第八项）：内置
+  JetBrains Mono / Cascadia Code 两款字体的 -> => != === && abc 序列
+  glyph id 与总 advance 与 HarfBuzz（uharfbuzz 0.57）逐一对照断言，
+  十二项全 ok。两款字体的连字规则全部只在 calt（type 6 chained
+  context），JB 走 1:1 状态替换（SPC 占位 + lig glyph），Cascadia 走
+  .seq 渐进替换（2 glyph）——shaper 的 context fmt1/2/3 路径均正确。
+- 排查「代码区画不出连字」根因（探针法定位）：
+  - cui__tokenize 对标点逐字节发 token（EMIT(i,1,TK_PUNCT)），绘制段
+    每个 run 只见 1 字节，needs_shaping 的连字扫描（要求 len>=2）永不
+    触发；注释/字符串是整段 token 所以能 shape——与探针记录完全吻合。
+  - 修复：绘制循环里相邻同类 TK_PUNCT token 合并成一次 run（仅
+    p->lig 开启时，关闭零影响）。-> => != === <=> && || << >> :: 等
+    经典序列都是纯标点连续段，合并后正好成对进 shaper。
+  - TK_* 枚举从 cui_code.c 提升到 cui_internal.h（原有
+    TK_COUNT==CUI__TK_COUNT 静态断言保序）。
+- 截图实证（Cascadia Code + 开关开）：!= → ≠、=== → ≡、!== → ≢、
+  <= → ≤、>= → ≥、-> → →、=> → ⇒、<< → ≪、>> → ≫、<=> → ⇔、&&/||/::
+  全部连体；开关关逐字符独立，无回归。连字 glyph 总宽 = 字符宽度和
+  （JB 1200/2cell、Cascadia 2400/2cell），caret/命中测试网格不变。
+- 剩余缺口（后续可选）：整行 shape + cluster 定位绘制（L 级）才能
+  覆盖跨 token 上下文（如字符串边界处的序列、跨空白序列）以及非
+  内置字体；当前逐 token + 标点合并已覆盖内置字体全部常用连字。
+- 教训：调试探针的 cap（pd<6/12）会先被高频调用点吃满，导致 paint
+  阶段命中被静默漏记——排查绘制问题时先放大 cap 或按状态过滤。
+- 验证：MSVC 构建 + 八项回归全绿（原七项 + test_lig）。UI_PLAN #17
+  标 ✅，P4 全部完成。

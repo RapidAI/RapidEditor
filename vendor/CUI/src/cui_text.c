@@ -453,6 +453,24 @@ static bool cui__iter_next(cui__glyph_iter *it) {
 bool cui__text_needs_shaping(cui_ctx *ui, const char *text, int len) {
     if (ui->text_unshaped) return false;
     if (ui->text_paragraph) return true;
+    /* Experimental: programming ligatures (-> => == != ...). Only runs the
+     * shaper when two ligature characters sit together, so single-character
+     * width queries (the editor's hit testing) never take this path; the
+     * bundled mono faces keep ligature glyphs at the sum width of their
+     * characters, so both paths agree on positions. */
+    if (ui->text_ligatures && len >= 2) {
+        for (int q = 0; q + 1 < len; q++) {
+            char c = text[q];
+            if (c=='-'||c=='='||c=='<'||c=='>'||c=='!'||c=='&'||c=='|'||c=='*'||
+                c==':'||c=='.'||c=='~'||c=='?'||c=='/'||c=='+'||c=='^'||c=='%'||
+                c=='#' || c=='\\') {
+                char d = text[q+1];
+                if (d=='-'||d=='='||d=='<'||d=='>'||d=='!'||d=='&'||d=='|'||
+                    d=='*'||d==':'||d=='.'||d=='~'||d=='?'||d=='/'||d=='+'||
+                    d=='^'||d=='%'||d=='#'||d=='\\') return true;
+            }
+        }
+    }
     for (int p = 0; p < len;) {
         uint32_t cp;
         p += cui__utf8_decode(text + p, len - p, &cp);

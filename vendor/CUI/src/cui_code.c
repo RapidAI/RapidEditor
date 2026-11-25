@@ -6,7 +6,7 @@
 /* Tokenizer                                                                */
 /* ------------------------------------------------------------------------ */
 
-enum { TK_TEXT, TK_KEYWORD, TK_TYPE, TK_STRING, TK_NUMBER, TK_COMMENT, TK_FUNC, TK_PREPROC, TK_PUNCT, TK_CONST, TK_COUNT };
+/* the TK_* kinds live in cui_internal.h (shared with the editor's ligature run merging) */
 
 typedef char cui__tk_count_check[TK_COUNT == CUI__TK_COUNT ? 1 : -1];   /* cui__lang and cui__tok are in cui_internal.h */
 

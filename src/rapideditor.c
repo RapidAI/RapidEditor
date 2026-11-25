@@ -463,6 +463,7 @@ typedef struct notepad {
 
     bool boot_done, fonts_ready, dark, line_numbers, show_status, default_crlf;
     bool indent_guides;                 /* vertical indentation guides in the editor */
+    bool editor_lig;                    /* experimental programming ligatures (needs a ligature face) */
     int  whitespace;                    /* whitespace glyphs: 0 off, 1 leading, 2 all */
     bool quiet;                         /* no "opened" toasts while loading startup files */
     int  accent, font_size;
@@ -6895,6 +6896,7 @@ static void np_config_load(notepad *a) {
             if (v >= 0 && v <= 2) a->density = v;
         } else if (!strcmp(key, "line_numbers")) a->line_numbers = atoi(val) != 0;
         else if (!strcmp(key, "indent_guides")) a->indent_guides = atoi(val) != 0;
+        else if (!strcmp(key, "editor_lig")) a->editor_lig = atoi(val) != 0;
         else if (!strcmp(key, "whitespace")) {
             int v = atoi(val);
             if (v >= 0 && v <= 2) a->whitespace = v;
@@ -7048,9 +7050,9 @@ static void np_config_save(notepad *a) {
     }
     fprintf(f, "dark=%d\naccent=%d\nfont=%d\ndensity=%d\nstyle=%d\n",
             a->dark ? 1 : 0, a->accent, a->font_size, a->density, a->style);
-    fprintf(f, "line_numbers=%d\nindent_guides=%d\nwhitespace=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n"
+    fprintf(f, "line_numbers=%d\nindent_guides=%d\neditor_lig=%d\nwhitespace=%d\nshow_status=%d\nshow_sidebar=%d\nshow_output=%d\n"
                "show_preview=%d\npreview_ratio=%.4f\nshow_ai=%d\nai_ratio=%.4f\n",
-            a->line_numbers ? 1 : 0, a->indent_guides ? 1 : 0, a->whitespace,
+            a->line_numbers ? 1 : 0, a->indent_guides ? 1 : 0, a->editor_lig ? 1 : 0, a->whitespace,
             a->show_status ? 1 : 0,
             a->show_sidebar ? 1 : 0, a->show_output ? 1 : 0,
             a->show_preview ? 1 : 0, a->preview_ratio,
@@ -8040,6 +8042,7 @@ static void np_editor_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             .no_line_numbers = !a->line_numbers,
             .no_indent_guides = !a->indent_guides,
             .show_whitespace = a->whitespace,
+            .ligatures = a->editor_lig,
             .placeholder = "在这里输入文字…  Ctrl+N 新建标签，Ctrl+O 打开文件，Ctrl+S 保存",
             .read_only = false);
 
@@ -10571,6 +10574,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "缩进参考线", .checked = a->indent_guides,
                                   .disabled = d->is_hex))
                     a->indent_guides = !a->indent_guides;
+                if (cui_menu_item(ui, "编程连字（实验）",
+                                  .checked = a->editor_lig, .disabled = d->is_hex))
+                    a->editor_lig = !a->editor_lig;
                 if (cui_menu_item(ui,
                                   a->whitespace == 0 ? "空白字符：关"
                                   : a->whitespace == 1 ? "空白字符：仅缩进"

@@ -69,19 +69,30 @@ $tests = @(
     @{ name = "test_maclaw";  src = "scripts\test_maclaw.c";  link = @("src\np_maclaw.c") },
     @{ name = "test_match";   src = "scripts\test_match.c";    link = @() },
     @{ name = "test_hexfind"; src = "scripts\test_hexfind.c";  link = @() },
-    @{ name = "test_transform"; src = "scripts\test_transform.c"; link = @() }
+    @{ name = "test_transform"; src = "scripts\test_transform.c"; link = @() },
+    # shaper vs HarfBuzz reference (P4 #17); needs the repo root as cwd for assets/fonts
+    @{ name = "test_lig"; src = "scripts\test_lig.c"; link = @("vendor\CUI\src\cui_shape.c");
+       include = @("vendor\CUI\src"); runIn = "repo" }
 )
 
 $fail = 0
 foreach ($t in $tests) {
     Write-Host "== $($t.name) ==" -ForegroundColor Cyan
+    # Pass extra include dirs through the INCLUDE env var: PS 5.1 mangles
+    # quoting when an array of space-containing paths is expanded inline.
+    if ($t.include) {
+        $env:INCLUDE = "$env:INCLUDE;" + (($t.include | ForEach-Object { Join-Path $repo $_ }) -join ';')
+    }
     $srcs = @((Join-Path $repo $t.src)) + ($t.link | ForEach-Object { Join-Path $repo $_ })
     cl /nologo /utf-8 /W4 /I (Join-Path $repo "src") /I $out /Fe:"$($t.name).exe" @srcs |
         Select-String -Pattern "error|warning"
     if ($LASTEXITCODE -ne 0) { Write-Host "BUILD FAILED" -ForegroundColor Red; $fail++; continue }
-    & ".\$($t.name).exe"
+    $exe = ".\$($t.name).exe"
+    if ($t.runIn -eq "repo") { Push-Location $repo; $exe = Join-Path $out ($t.name + ".exe") }
+    & $exe
     if ($LASTEXITCODE -ne 0) { Write-Host "TEST FAILED" -ForegroundColor Red; $fail++ }
     else { Write-Host "PASSED" -ForegroundColor Green }
+    if ($t.runIn -eq "repo") { Pop-Location }
 }
 
 Pop-Location

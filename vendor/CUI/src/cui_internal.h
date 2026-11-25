@@ -590,6 +590,9 @@ struct cui_ctx {
     int text_paragraph_len;
     cui_direction text_direction;
 #endif
+#ifdef CUI_TEXT_SHAPING
+    bool text_ligatures;            /* allow latin programming ligatures (editor opt-in) */
+#endif
     bool text_unshaped;             /* editing keeps logical glyph positions */
     cui_font_data *fonts; int font_count, font_cap;
     cui_font roles[5];
@@ -805,7 +808,8 @@ typedef struct {
     const char *const *consts;         /* more words colored as constants, or NULL */
 } cui__lang;
 typedef struct { int start, len; uint8_t kind; } cui__tok;
-#define CUI__TK_COUNT 10   /* token kinds; colors from cui__syntax_colors */
+enum { TK_TEXT, TK_KEYWORD, TK_TYPE, TK_STRING, TK_NUMBER, TK_COMMENT, TK_FUNC, TK_PREPROC, TK_PUNCT, TK_CONST, TK_COUNT };
+#define CUI__TK_COUNT TK_COUNT   /* token kinds; colors from cui__syntax_colors */
 cui__lang cui__lang_for(const char *lang);
 /* Tokenize one line. *in_block carries an open block comment between lines. */
 int cui__tokenize(const cui__lang *L, bool json, const char *s, int n, bool *in_block, cui__tok *out, int cap);

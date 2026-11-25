@@ -39,6 +39,8 @@ set(CUI_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(CUI_PLATFORM       "auto" CACHE STRING "CUI window backend (auto/win32/cocoa/x11)")
 # PNG decoding is needed to show the LaTeX preview (xelatex -> PDF -> pdftoppm PNG).
 set(CUI_STB_IMAGE      ON  CACHE BOOL "" FORCE)
+# OpenType shaping (the editor's experimental ligature switch runs on it).
+set(CUI_TEXT_SHAPING   ON  CACHE BOOL "" FORCE)
 
 # Android: build SDL2 as a subproject (RE_SDL2_SOURCE points at an SDL2
 # source tree) so every ANDROID_ABI gets a matching libSDL2, and CUI's

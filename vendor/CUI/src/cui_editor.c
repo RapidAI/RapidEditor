@@ -648,6 +648,7 @@ typedef struct {
     int base, first, count, nl;
     const int *ls;              /* starts of the lines in view and the one after */
     bool in_block, json, empty, focused, show_line, ro, guides;
+    bool lig;                   /* opt-in programming ligatures (needs CUI_TEXT_SHAPING) */
     int ws;                     /* whitespace glyphs: 0 off, 1 leading, 2 all */
     cui__lang lang;
     int tab, cursor, anchor, caret_line, caret_col;
@@ -786,7 +787,15 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
     }
     if (r.h > p->view_h + 0.5f) cui_request_redraw(ui);   /* laid out taller than last frame: more lines next frame */
     bool unshaped = ui->text_unshaped;
-    ui->text_unshaped = true;
+    /* The editor usually keeps logical glyph positions (caret x = sum of the
+     * per-character advances). With the ligature opt-in the paint scope may
+     * run the shaper: bundled mono faces draw ligatures at the sum width of
+     * their characters, so positions stay the same and the caret still lands
+     * on the character grid. */
+#ifdef CUI_TEXT_SHAPING
+    ui->text_ligatures = p->lig;
+    ui->text_unshaped = !p->lig;
+#endif
     float fh = cui__font_line_height(ui, CUI_FONT_MONO, p->size);
     float ty = (p->lh - fh) * 0.5f;
     float gx = r.x + p->gutter;                     /* left edge of the code */
@@ -891,6 +900,18 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
         int nt = cui__tokenize(&p->lang, p->json, s + ls, nn, &block, toks, tok_cap);
         for (int t = 0; t < nt; t++) {
             int a = ls + toks[t].start, b = a + toks[t].len;
+            /* With ligatures on, adjacent punctuation tokens draw as one run
+             * so a sequence like "->" reaches the shaper as a pair (the
+             * tokenizer emits one token per symbol byte). Bundled mono faces
+             * keep ligature glyphs at the sum width of their characters, so
+             * the caret grid is unchanged. */
+#ifdef CUI_TEXT_SHAPING
+            if (p->lig && toks[t].kind == TK_PUNCT)
+                while (t + 1 < nt && toks[t + 1].kind == TK_PUNCT && ls + toks[t + 1].start == b) {
+                    t++;
+                    b = ls + toks[t].start + toks[t].len;
+                }
+#endif
             float xoff = cui__ed_span(ui, p->size, p->cw, p->tab, s, ls, a);
             if (xoff >= maxx) break;
             /* A plain-text token may start with whitespace and still contain text. */
@@ -953,6 +974,9 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
         }
     }
     cui_pop_clip(ui);
+#ifdef CUI_TEXT_SHAPING
+    ui->text_ligatures = false;
+#endif
     ui->text_unshaped = unshaped;
 }
 
@@ -1682,6 +1706,7 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     p->guides = !f->o->no_indent_guides;
     p->ws = f->o->show_whitespace;
     p->placeholder = f->o->placeholder;
+    p->lig = f->o->ligatures;
     p->size = f->size; p->lh = lh; p->cw = cw; p->gutter = f->gutter;
     p->view_h = f->known ? f->br.h : 0;
     p->sy = st->sy; p->max_sy = f->max_sy;

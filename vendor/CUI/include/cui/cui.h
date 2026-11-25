@@ -1787,6 +1787,7 @@ typedef struct cui_code_editor_opts {
      * editor so the cached line index is rebuilt. Both are optional (0). */
     int length;
     uint64_t revision;
+    bool ligatures;            /* experimental: programming ligatures when the face has them (needs CUI_TEXT_SHAPING) */
 } cui_code_editor_opts;
 typedef struct cui_code_editor_result {
     bool changed;              /* the text changed this frame */
