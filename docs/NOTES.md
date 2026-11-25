@@ -786,3 +786,18 @@ MSVC 构建通过；六项回归全绿（check_config + 5 组单测）。
   np_word_edge 引用 np_word_char，两者都要提取。
 
 MSVC 构建通过；六项回归全绿（test_match 现含 23 用例）。
+
+## 查找开关全面统一（第二十九批）
+
+「在文件中查找」此前有独立且不持久化的 ff_case——重启即丢，且与其
+他查找入口（match_case）语义分叉。统一后全部查找入口共用同一组
+持久化开关：
+
+- 删除 ff_case 字段；np_ff_scan_file 改用 a->match_case 并接入
+  np_word_edge（a->find_word），目录递归扫描与编辑器查找行为一致。
+- ff 对话框的「区分大小写」checkbox 直接绑 a->match_case，新增
+  「全词匹配」checkbox——与替换对话框、查找栏 Aa/W 三入口完全
+  镜像：任何一处改开关，其余两处立即生效并持久化。
+- ff_query 保持独立（目录搜索的查询词不与当前文档查找串扰）。
+
+MSVC 构建通过；六项回归全绿。

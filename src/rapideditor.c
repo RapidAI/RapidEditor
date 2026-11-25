@@ -578,8 +578,9 @@ typedef struct notepad {
     char llm_test_err[256];
 
     /* EditPlus-style find in files ------------------------------------ */
+    /* Case and whole-word toggles are the shared a->match_case /
+     * a->find_word, persisted with the rest of the settings. */
     bool dlg_find_files;
-    bool ff_case;
     char ff_query[256];
     char ff_pattern[256];
     char ff_dir[NP_PATH_CAP];
@@ -2985,7 +2986,8 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             cui_input(ui, "ff-pattern", a->ff_pattern, sizeof a->ff_pattern,
                       .label = "文件类型", .placeholder = "例如 *.c;*.h（留空=全部文件）",
                       .width = CUI_FILL);
-            cui_checkbox(ui, "区分大小写", &a->ff_case);
+            cui_checkbox(ui, "区分大小写", &a->match_case);
+            cui_checkbox(ui, "全词匹配", &a->find_word);
             cui_text(ui, "自动跳过 .git、node_modules、build 等构建目录。",
                      .size = 12, .color = CUI_COLOR_TEXT_MUTED);
             cui_text(ui, "想用自然语言找文件？填好上面的描述、目录和文件类型后，点「AI 语义搜索」；返回的是真实文件名、原文行和可跳转位置。",
@@ -5187,7 +5189,8 @@ static void np_ff_scan_file(notepad *a, const char *dir, const char *name) {
     int line = 1, hit_line = 0;
     size_t ls = 0;
     for (size_t i = 0; i + qlen <= n; i++) {
-        if (np_match(ffbuf + i, a->ff_query, qlen, a->ff_case) && line != hit_line) {
+        if (np_match(ffbuf + i, a->ff_query, qlen, a->match_case) &&
+            np_word_edge(ffbuf, n, i, qlen, a->find_word) && line != hit_line) {
             hit_line = line;
             if (file_idx < 0) {
                 if (a->ff_count < NP_FF_FILE_MAX) {
