@@ -152,6 +152,12 @@ bool cui__plat_init(cui_app *app) {
      * and on emulators (MuMu) mouse clicks there never reach the app - the
      * whole menu bar row is unclickable. */
     flags |= SDL_WINDOW_FULLSCREEN;
+    /* Phones and tablets run the editor in landscape.  Without this hint SDL
+     * resolves the orientation to SCREEN_ORIENTATION_FULL_USER at runtime,
+     * which obeys the system auto-rotate lock - on phones with rotation
+     * locked the app would stay portrait and drop below the 620px min width.
+     * SENSOR_LANDSCAPE follows the sensor to either landscape side. */
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
     const char *env = getenv("CUI_RENDERER");
     if (app->desc.renderer != CUI_RENDERER_SOFTWARE && !(env && strcmp(env, "software") == 0)) {

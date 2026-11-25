@@ -1216,3 +1216,20 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
   60 帧才打一行，采样时要注意帧数稀疏。
 - 验证：源码探针全部移除后 git diff 仅剩 acc_keys.py 与文档；构建 + 八项
   回归全绿。UI_PLAN 验收记录已加追记。
+
+## 第三十五批（Android/平板自动横屏）
+
+- 需求：手机/平板上自动横屏。此前 app 在系统关闭自动旋转时卡在竖屏
+  （竖屏逻辑宽度低于 min_width 620，编辑器基本不可用）。
+- 根因：SDL 在 Android 创建/切换窗口时调 Android_JNI_SetOrientation，
+  未设 SDL_HINT_ORIENTATIONS 且窗口 RESIZABLE → 运行时
+  setRequestedOrientation(FULL_USER)，覆盖 manifest 默认朝向；
+  FULL_USER 服从系统旋转锁。
+- 修复（双保险）：
+  1) cui_app_sdl2.c（__ANDROID__ 分支）SDL_SetHint(SDL_HINT_ORIENTATIONS,
+     "LandscapeLeft LandscapeRight") → SENSOR_LANDSCAPE，跟随传感器、
+     横屏两方向均可，无视系统锁；
+  2) AndroidManifest activity 加 android:screenOrientation="sensorLandscape"
+     作基线；resizeableActivity=true 使 DeX/分屏/PC 模式忽略它，不受影响。
+- 桌面不受影响：cui_app_sdl2.c 仅 CUI_PLATFORM=sdl2（Android）编译，
+  Windows 走 win32 平台层。
