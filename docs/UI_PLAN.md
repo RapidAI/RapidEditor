@@ -76,9 +76,14 @@
 - P3 ✅ 纯键盘流实测：Ctrl Shift P 开面板 → SendInput 输入「排序」精确过滤出
   「排序选中的行 (A→Z)」→ 回车执行（面板关闭）；执行效果用「显示行号」开关
   命令验证（回车后行号列消失）。工具：scripts/acc_keys.py（真实窗口 +
-  keybd_event/SendInput + PrintWindow）。
+  keybd_event/SendInput + 桌面 BitBlt 截屏）。
 - P4 ✅ 视觉清单抽 4 组合过目：极光蓝/浅/舒适、苔绿/浅/宽松、深海/深/紧凑、
   炭火/深/宽松——token 可辨、布局无错位、中文正常。
 - 备注：SendInput 注入中文需完整 40 字节 INPUT 结构（union 必须含 MOUSEINPUT），
   否则静默失败；KEYEVENTF_UNICODE 经 VK_PACKET → TranslateMessage → WM_CHAR
   通路被 CUI 正常接收（含代理对）。
+- 追记（2026-11-25 第三十四批）：验收时「排序」命令的 toast 提示两次抓拍未
+  出现，经查为 **PrintWindow 伪影**——它对本应用的 GL 窗口返回陈旧内容
+  （toast、甚至状态栏都缺失），并非应用缺陷。改用桌面 BitBlt（GetDC(0)）后
+  toast「先选中要处理的行」在真实屏幕上完整可见；acc_keys.py 已改用桌面
+  抓屏并声明 DPI awareness。

@@ -1195,3 +1195,24 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
 - 产物：验收 demo 文件 build-msvc/acc_plain.txt、acc_cjk.c 保留（build-msvc
   不入库）；acc_keys.py 入库备用；大目录与全部截图已清理。
 - 验证：构建 + 八项回归全绿。UI_PLAN 追加「验收记录」一节。
+
+## 第三十四批（第三十三批留观项排查：toast「未出现」）
+
+- 结论：**toast 功能完全正常，之前的失败是测量伪影**。留观项关闭。
+- 证据链（探针 + 三种捕获手段交叉验证）：
+  1) cui_toast_ex / cui__toasts_render 探针：面板路径执行「排序」确实创建
+     toast（CREATE @t=6.83s），渲染正常，4.16s 后过期移除（TTL 4s ✓）；
+  2) 真实窗口 GL framebuffer dump：toast 完整在画面里（右下角，探针样式）；
+  3) 桌面 BitBlt（GetDC(0)，DPI-aware 物理像素）：toast 存活期 vs 过期后的
+     差异 bbox 恰为右下角 toast 区域，卡片「先选中要处理的行 / 合并与排序、
+     去重一样作用于选中的行」肉眼可见——面板命令路径在真实屏幕上工作正常。
+- 根因：**PrintWindow（含 PW_RENDERFULLCONTENT）对本应用的 GL 窗口返回陈旧
+  内容**——不仅 toast 抓不到，部分抓拍连状态栏都缺。此前 acc_keys.py 用它
+  做 P3 验收截图，才产生了「toast 未出现」的假象。桌面抓屏是可信手段。
+- 工具：scripts/acc_keys.py 的 capture 已改桌面 BitBlt + SetProcessDpiAware
+  nessContext(PMv2)（物理像素对齐）；一次性诊断脚本 toast_probe.py 已删。
+- 排查中顺带确认：cui__plat_present_part 在 win32 恒走全量 blit（damage 不
+  是问题）；app 主循环按需渲染与 wakeup 均正常；按需渲染下 SIZES 类探针每
+  60 帧才打一行，采样时要注意帧数稀疏。
+- 验证：源码探针全部移除后 git diff 仅剩 acc_keys.py 与文档；构建 + 八项
+  回归全绿。UI_PLAN 验收记录已加追记。

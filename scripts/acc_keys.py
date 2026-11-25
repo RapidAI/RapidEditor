@@ -10,6 +10,13 @@ target_doc = REPO + r"\build-msvc\acc_cjk.c"
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
 
+# DPI-aware: window rects and desktop grabs both work in physical pixels
+try:
+    user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))   # PMv2
+except Exception:
+    try: user32.SetProcessDPIAware()
+    except Exception: pass
+
 def send_key(vk, mods=()):           # press mods, tap vk, release
     for m in mods: user32.keybd_event(m, 0, 0, 0)
     user32.keybd_event(vk, 0, 0, 0)
@@ -37,14 +44,18 @@ def type_unicode(s):
     print("SendInput ->", n, "of", len(inputs), "size", ctypes.sizeof(INPUT))
 
 def capture(p, hwnd, name):
+    # Desktop BitBlt cropped to the window rect. PrintWindow (even with
+    # PW_RENDERFULLCONTENT) returns stale content for this GL window — it can
+    # miss toasts and even the status bar — so grab the desktop instead.
+    # Requires a DPI-aware process so rect and pixels are both physical.
     rect = wt.RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(rect))
     w, hh = rect.right - rect.left, rect.bottom - rect.top
-    hdc = user32.GetWindowDC(hwnd)
-    mem = gdi32.CreateCompatibleDC(hdc)
-    bmp = gdi32.CreateCompatibleBitmap(hdc, w, hh)
+    sdc = user32.GetDC(0)
+    mem = gdi32.CreateCompatibleDC(sdc)
+    bmp = gdi32.CreateCompatibleBitmap(sdc, w, hh)
     gdi32.SelectObject(mem, bmp)
-    user32.PrintWindow(hwnd, mem, 2)
+    gdi32.BitBlt(mem, 0, 0, w, hh, sdc, rect.left, rect.top, 0x00CC0020)  # SRCCOPY
     class BIH(ctypes.Structure):
         _pack_ = 1
         _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
@@ -59,7 +70,7 @@ def capture(p, hwnd, name):
     img = Image.frombuffer("RGBA", (w, hh), buf, "raw", "BGRA", 0, 1).convert("RGB")
     out = os.path.join(outdir, name)
     img.save(out)
-    gdi32.DeleteObject(bmp); gdi32.DeleteDC(mem); user32.ReleaseDC(hwnd, hdc)
+    gdi32.DeleteObject(bmp); gdi32.DeleteDC(mem); user32.ReleaseDC(0, sdc)
     return out
 
 p = subprocess.Popen([exe, target_doc])
@@ -87,14 +98,25 @@ time.sleep(0.8)
 capture(p, hwnd, "acc_pal_open.png")
 
 # 2) type the query (Chinese, via KEYEVENTF_UNICODE)
-type_unicode("显示行号")
+type_unicode("排序")
 time.sleep(0.8)
 capture(p, hwnd, "acc_pal_query.png")
 
-# 3) Enter runs the top match — the line-number toggle has a visible effect
+# 3) Enter runs the top match — toast should pop at the bottom-right corner
 send_key(0x0D)                  # Enter
-time.sleep(0.6)
-capture(p, hwnd, "acc_pal_done.png")
+capture(p, hwnd, "acc_pre_enter.png")   # baseline right after Enter dispatch
+marks = (0.2, 0.5, 1.0, 2.0, 3.5, 4.6)
+prev = 0.0
+for i, t in enumerate(marks):
+    time.sleep(t - prev)
+    prev = t
+    capture(p, hwnd, f"acc_t{i}.png")
+
+from PIL import ImageChops
+base = Image.open(outdir + r"\acc_pre_enter.png").convert("RGB")
+for i in range(6):
+    im = Image.open(outdir + rf"\acc_t{i}.png").convert("RGB")
+    print(f"t{i} ({marks[i]}s) diff bbox:", ImageChops.difference(base, im).getbbox())
 
 p.terminate()
 print("done")
