@@ -1166,3 +1166,32 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
   阶段命中被静默漏记——排查绘制问题时先放大 cap 或按状态过滤。
 - 验证：MSVC 构建 + 八项回归全绿（原七项 + test_lig）。UI_PLAN #17
   标 ✅，P4 全部完成。
+
+## 第三十三批（UI_PLAN 全量验收，四项全过）
+
+计划 17 项全部 ✅ 后，把 P1–P4 各阶段写明的验收标准逐项实测（2026-11-25）：
+
+- P1 三极端场景缩进线：plain 文件（无语法着色）、紧凑密度 + 10pt 最小字号、
+  中文混排（acc_cjk.c 全角标点 + 五层 tab 缩进），截图放大逐层核对——参考线
+  与 tab stop 左缘对齐、与 tab 箭头/文本起始列一致、不穿字符。场景用 plain
+  模拟「关闭语法高亮」（产品无该开关，tokenize 的 L->plain 分支即此状态）。
+- P2 目录树性能 + 定位：构造 acc_bigtree（根 350 文件 + 30 子目录 × 90 文件 +
+  sub_07/d01..d05 深链 + target.c，共 3051 文件）。启动带深链目标文件，耗时
+  与小目录基线差 ≤40ms（噪声内）——np_tree_load 每目录仅扫一层、reveal 只
+  装 6 个祖先目录。无闪烁验证：CUI_SCREENSHOT_FRAMES=1 vs 20 两帧树区域
+  ImageChops 像素级相同，第 1 帧即最终状态（展开链 + 选中高亮 + 滚动定位）。
+- P3 纯键盘流：真实窗口 + keybd_event/SendInput + PrintWindow（新工具
+  scripts/acc_keys.py）。Ctrl Shift P 开面板 ✓；KEYEVENTF_UNICODE 注入
+  「排序」精确过滤出「排序选中的行 (A→Z)」✓；回车后面板关闭 ✓。执行效果
+  用「显示行号」开关命令验证（回车后行号列消失，状态切换可见）。
+  ⚠️ 两个坑：① SendInput 的 INPUT 结构 union 必须含 MOUSEINPUT 凑满 40 字节，
+  否则 cbSize 校验静默失败（返回 0）——第一轮输入没生效就是这个；
+  ② 中文经 VK_PACKET → TranslateMessage → WM_CHAR 通路，CUI 的代理对
+  处理正常接收。「排序」执行的 toast 提示未抓到（0.45s/1s 两拍都没有），
+  不确定是时机还是 toast 渲染范围问题——命令本身已确认执行，留观。
+- P4 视觉清单抽 4 组合：极光蓝/浅/舒适、苔绿/浅/宽松、深海/深/紧凑、
+  炭火/深/宽松。临时 env 开关（NP_ACC_STYLE/NP_ACC_DENSITY，已删）一次
+  构建跑四组：token 可辨、控件无错位重叠、中文正常。
+- 产物：验收 demo 文件 build-msvc/acc_plain.txt、acc_cjk.c 保留（build-msvc
+  不入库）；acc_keys.py 入库备用；大目录与全部截图已清理。
+- 验证：构建 + 八项回归全绿。UI_PLAN 追加「验收记录」一节。
