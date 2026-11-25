@@ -51,6 +51,7 @@ Extract-Fn "static void np_ai_strip_code_fence(char *buf, size_t cap)" (Join-Pat
 Extract-Fn "static char *np_inline_clean(char *buf)" (Join-Path $out "np_inline_clean.impl")
 Extract-Fn "static bool np_match(const char *p, const char *q, size_t n, bool match_case)" (Join-Path $out "np_match.impl")
 Extract-Fn "static bool np_word_char(unsigned char c)" (Join-Path $out "np_word_char.impl")
+Extract-Fn "static bool np_hex_parse_bytes(const char *s, bool ascii, unsigned char *out, int cap, int *out_n)" (Join-Path $out "np_hex_parse_bytes.impl")
 Extract-Fn "static bool np_word_edge(const char *text, size_t len, size_t i, size_t n, bool ww)" (Join-Path $out "np_word_edge.impl")
 
 # Static config-key consistency check (needs no compiler).
@@ -64,7 +65,8 @@ $tests = @(
     @{ name = "test_inline";  src = "scripts\test_inline.c";  link = @() },
     @{ name = "test_openai";  src = "scripts\test_openai.c";  link = @("src\np_openai.c") },
     @{ name = "test_maclaw";  src = "scripts\test_maclaw.c";  link = @("src\np_maclaw.c") },
-    @{ name = "test_match";   src = "scripts\test_match.c";    link = @() }
+    @{ name = "test_match";   src = "scripts\test_match.c";    link = @() },
+    @{ name = "test_hexfind"; src = "scripts\test_hexfind.c";  link = @() }
 )
 
 $fail = 0

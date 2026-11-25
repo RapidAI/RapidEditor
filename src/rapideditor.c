@@ -435,6 +435,11 @@ typedef struct notepad {
     uint64_t hits_rev, hits_key;
     bool dlg_hexgoto;
     char hexgoto_buf[24];
+    bool dlg_hexfind;                   /* binary search: hex bytes or ASCII */
+    char hexfind_buf[256];
+    bool hexfind_ascii;                 /* treat the query as text, not hex */
+    size_t hexfind_at;                  /* last hit offset; SIZE_MAX = none */
+    size_t hexfind_len;                 /* bytes of the last hit */
 
     /* Binary template (010 Editor style) ------------------------------- */
     bool dlg_bt;                        /* choose a binary template */
@@ -723,6 +728,7 @@ static void np_smart_paste_open(notepad *a);
 
 static bool np_any_dialog(const notepad *a) {
     return a->dlg_confirm || a->dlg_replace || a->dlg_goto || a->dlg_hexgoto ||
+           a->dlg_hexfind ||
            a->dlg_settings || a->dlg_help || a->dlg_about || a->dlg_lang || a->dlg_find_files ||
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
@@ -2404,9 +2410,15 @@ static void np_apply_md_snip(notepad *a, int i) {
 static void np_open_find(notepad *a) {
     np_doc *d = np_cur(a);
     if (!d) return;
+    if (d->is_hex) {
+        /* The hex view has no find bar of its own: Ctrl F opens the byte
+         * search dialog instead (was a silently dead shortcut). */
+        a->dlg_hexfind = true;
+        return;
+    }
     /* Seed the query with the current selection (capped), like most
      * editors do - Ctrl F right after selecting a word just works. */
-    if (d->caret != d->anchor && !d->is_hex) {
+    if (d->caret != d->anchor) {
         int s0 = NP_MIN(d->caret, d->anchor), s1 = NP_MAX(d->caret, d->anchor);
         int n = NP_MIN(s1 - s0, (int)sizeof a->find_query - 1);
         if (n > 0 && n < 128 && !memchr(d->text + s0, '\n', (size_t)n)) {
@@ -2475,6 +2487,90 @@ static void np_hex_do_goto(notepad *a) {
     }
     if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, off);
     a->dlg_hexgoto = false;
+}
+
+/* Parse the hex-find query. ASCII mode takes the whole string (trimmed) as
+ * the bytes to find; hex mode accepts "1F 2E CC", "1F2ECC" or "0x1F2ECC".
+ * Returns false on an odd digit count or an empty query. */
+static bool np_hex_parse_bytes(const char *s, bool ascii, unsigned char *out, int cap, int *out_n) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    if (ascii) {
+        if (n == 0 || (int)n > cap) return false;
+        memcpy(out, s, n);
+        *out_n = (int)n;
+        return true;
+    }
+    if (n > 1 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { s += 2; n -= 2; }
+    int val = -1, cnt = 0;              /* val: pending high nibble */
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        int d;
+        if (c == ' ' || c == '\t' || c == ',') continue;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        if (val < 0) {
+            val = d;
+        } else {
+            if (cnt >= cap) return false;
+            out[cnt++] = (unsigned char)((val << 4) | d);
+            val = -1;
+        }
+    }
+    if (val >= 0) return false;         /* odd digit count */
+    if (cnt == 0) return false;
+    *out_n = cnt;
+    return true;
+}
+
+/* Run the hex find: scan the buffer for the parsed query, jumping to and
+ * selecting the hit. next continues after the last hit and wraps once. */
+static void np_hex_find_run(notepad *a, bool next) {
+    np_doc *d = np_cur(a);
+    if (!d || !d->is_hex) return;
+    unsigned char pat[256];
+    int pn = 0;
+    if (!np_hex_parse_bytes(a->hexfind_buf, a->hexfind_ascii, pat,
+                            (int)sizeof pat, &pn)) {
+        np_toast(a, "查询格式不对",
+                 a->hexfind_ascii ? "请输入要查找的文本"
+                                  : "请输入十六进制字节，如 1F 2E CC",
+                 CUI_TONE_WARNING);
+        return;
+    }
+    const char *t = d->text;
+    size_t n = (size_t)d->len;
+    if (pn <= 0 || n < (size_t)pn) {
+        np_toast(a, "未找到", "文件中没有匹配的字节序列", CUI_TONE_INFO);
+        return;
+    }
+    if (a->hexfind_at == (size_t)-1 || a->hexfind_at >= n) next = false;
+    size_t from = next ? a->hexfind_at + (a->hexfind_len ? a->hexfind_len : 1) : 0;
+    for (int pass = 0; pass < 2; pass++) {
+        size_t lo = pass == 0 ? from : 0;
+        size_t hi = pass == 0 ? n - (size_t)pn + 1 : from;
+        for (size_t i = lo; i < hi; i++) {
+            if (t[i] != (char)pat[0]) continue;   /* cheap first-byte gate */
+            if (memcmp(t + i, pat, (size_t)pn) == 0) {
+                a->hexfind_at = i;
+                a->hexfind_len = (size_t)pn;
+                if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, i);
+                char msg[96];
+                snprintf(msg, sizeof msg, "0x%X 处命中 %d 字节",
+                         (unsigned)i, pn);
+                np_toast(a, next ? "下一个命中" : "已找到", msg, CUI_TONE_SUCCESS);
+                a->dlg_hexfind = false;
+                return;
+            }
+        }
+        if (pass == 0 && !next) break;    /* a fresh search never wraps */
+    }
+    a->hexfind_at = (size_t)-1;
+    a->hexfind_len = 0;
+    np_toast(a, "未找到", "文件中没有匹配的字节序列", CUI_TONE_INFO);
 }
 
 /* Copy the hex selection to the clipboard: as "AA BB CC" or as ASCII with
@@ -3049,6 +3145,27 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
         cui_dialog_footer(ui) {
             if (cui_button(ui, "取消")) a->dlg_hexgoto = false;
             if (cui_button(ui, "跳转", .variant = CUI_BUTTON_PRIMARY)) np_hex_do_goto(a);
+        }
+    }
+
+    cui_dialog(ui, "查找字节", &a->dlg_hexfind,
+               .description = "在十六进制视图中查找字节序列（下一个命中会滚动到视野内并选中）",
+               .width = 400) {
+        int flags = cui_input(ui, "hexfind-q", a->hexfind_buf, sizeof a->hexfind_buf,
+                              .label = "查找内容", .placeholder = "例如 1F 2E CC 或 0x1F2ECC",
+                              .width = CUI_FILL, .autofocus = true);
+        if (flags & CUI_SUBMITTED) np_hex_find_run(a, false);
+        cui_checkbox(ui, "按 ASCII 文本查找", &a->hexfind_ascii);
+        cui_text(ui, "十六进制模式忽略空格与逗号；勾选后把输入当作普通文本逐字节匹配。",
+                 .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "取消")) a->dlg_hexfind = false;
+            if (cui_button(ui, "下一个", .variant = CUI_BUTTON_GHOST,
+                           .disabled = !a->hexfind_buf[0]))
+                np_hex_find_run(a, true);
+            if (cui_button(ui, "查找", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->hexfind_buf[0]))
+                np_hex_find_run(a, false);
         }
     }
 
@@ -9074,6 +9191,13 @@ static void np_frame(cui_ctx *ui, void *user) {
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_B)) a->show_sidebar = !a->show_sidebar;
         if (cui_key_pressed(ui, CUI_KEY_F7)) a->show_output = !a->show_output;
         if (cui_key_pressed(ui, CUI_KEY_F11)) np_zen_set(a, !a->zen);
+        /* F3 repeats the hex byte search (the text find bar uses Enter). */
+        {
+            np_doc *cd = np_cur(a);
+            if (cd && cd->is_hex && a->hexfind_buf[0] &&
+                cui_key_pressed(ui, CUI_KEY_F3))
+                np_hex_find_run(a, true);
+        }
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P))
             a->show_preview = !a->show_preview;
         if (cui_key_pressed(ui, CUI_KEY_F1)) a->dlg_help = true;
@@ -9893,6 +10017,7 @@ int main(int argc, char **argv) {
     g.density = 0;
     g.match_case = false;
     g.find_word = false;
+    g.hexfind_at = (size_t)-1;
     g.pending_action = ACT_NONE;
     g.pending_doc = -1;
     g.show_sidebar = true;

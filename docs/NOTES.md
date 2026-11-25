@@ -801,3 +801,25 @@ MSVC 构建通过；六项回归全绿（test_match 现含 23 用例）。
 - ff_query 保持独立（目录搜索的查询词不与当前文档查找串扰）。
 
 MSVC 构建通过；六项回归全绿。
+
+## Hex 字节序列查找（第三十批）
+
+hex 视图此前只有「转到偏移」——Ctrl F 在 hex 模式下是对 code editor
+的静默无效调用（hex 用 cui_hex_view 组件，不读 find bar 状态）。
+
+- `np_hex_parse_bytes`：查询解析，两种模式——hex（"1F 2E CC" /
+  "1F2ECC" / "0x…" / 逗号分隔，奇数位或非 hex 字符报错）与 ASCII
+  （整串去首尾空白逐字节）。
+- `np_hex_find_run(next)`：首字节 memchr 式门 + memcmp，两段扫描
+  支持 wrap（next 从上次命中之后继续，绕回开头再找一次；全新查找
+  不绕）。命中走 cui_hex_view_goto——vendor 的 goto 自带选中与
+  滚动到视野（居中），vendor 层零改动。
+- Ctrl F 在 hex 文档改为打开「查找字节」对话框（修掉静默无效）；
+  F3 重复下一个；np_any_dialog 补 dlg_hexfind。
+- 回归新增第 7 项 test_hexfind（提取 np_hex_parse_bytes，15 用例）：
+  三种 hex 形式、小写、逗号、trim、奇数位/非法字符/空查询/超容量
+  拒绝、ASCII 与 trim。
+- 踩坑重申：提取式测试签名单行（np_hex_parse_bytes 初版折行，
+  提取失败后改单行）。
+
+MSVC 构建通过；七项回归全绿（check_config + 6 组单测）。
