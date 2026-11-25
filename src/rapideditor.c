@@ -743,6 +743,11 @@ typedef struct notepad {
      * is saved here and restored when the mode is left again. */
     bool zen;
     bool zen_prev_sidebar, zen_prev_output, zen_prev_preview;
+    float zen_chrome_h, zen_status_h;   /* natural heights for the F11 collapse easing */
+
+    /* Command palette (Ctrl+Shift+P / F1): one searchable list of every
+     * menu command plus recent files. */
+    bool palette_open;
 
     /* Embedded WebView2 (Win32, HTML preview only) --------------------- */
     bool wv_init_done;             /* np_webview_init() attempted once */
@@ -4061,9 +4066,10 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             "Ctrl F          查找（编辑器内置查找栏）",
             "Ctrl H          查找和替换",
             "Ctrl Shift F    在文件中查找（目录搜索）",
-            "F1              快捷键帮助  / F7 输出窗口",
+            "F1 / Ctrl Shift P  命令面板（搜索并执行全部命令、打开最近文件）",
+            "F7              输出窗口",
             "F11             沉浸式编辑（隐藏菜单栏/工具栏/状态栏，再按退出）",
-            "Ctrl Shift P    预览面板（Markdown 实时 / LaTeX·PDF 编译 / HTML Web）",
+            "Ctrl Alt P      预览面板（Markdown 实时 / LaTeX·PDF 编译 / HTML Web）",
             "Ctrl Shift L    在当前文件中列出所有匹配行",
             "Ctrl G          转到行",
             "F5              插入日期和时间",
@@ -9665,6 +9671,240 @@ static void np_ai_panel(cui_ctx *ui, notepad *a, np_doc *d) {
     }
 }
 
+/* ---- Command palette (#10/#11) --------------------------------------- */
+
+/* One table drives both Ctrl+Shift+P and F1: every stable menu command,
+ * searchable, with groups shown while the query is empty.  Indices are
+ * the dispatch contract for np_cmd_run below; the palette list is rebuilt
+ * each frame so dynamic titles (density, whitespace mode) stay in sync. */
+enum {
+    NP_CMD_NEW, NP_CMD_OPEN, NP_CMD_SAVE, NP_CMD_SAVE_AS, NP_CMD_SAVE_ALL,
+    NP_CMD_RELOAD, NP_CMD_CLOSE, NP_CMD_QUIT,
+    NP_CMD_SELECT_ALL, NP_CMD_STAMP, NP_CMD_UPPER, NP_CMD_LOWER,
+    NP_CMD_SORT, NP_CMD_UNIQ, NP_CMD_NOEMPTY, NP_CMD_STRIP,
+    NP_CMD_TAB2SP, NP_CMD_SP2TAB, NP_CMD_JOIN, NP_CMD_DUP_LINE,
+    NP_CMD_MOVE_UP, NP_CMD_MOVE_DOWN, NP_CMD_BRACKET, NP_CMD_CLEAR,
+    NP_CMD_FIND, NP_CMD_REPLACE, NP_CMD_GOTO, NP_CMD_FIND_HERE,
+    NP_CMD_FIND_FILES, NP_CMD_OUTPUT, NP_CMD_CLEAR_OUT,
+    NP_CMD_SIDEBAR, NP_CMD_PREVIEW, NP_CMD_FOLLOW, NP_CMD_RESCAN,
+    NP_CMD_PICK_DIR, NP_CMD_SETTINGS, NP_CMD_DARK, NP_CMD_SYS_THEME,
+    NP_CMD_ACCENT, NP_CMD_DENSITY, NP_CMD_ZOOM_IN, NP_CMD_ZOOM_OUT,
+    NP_CMD_ZOOM_RESET, NP_CMD_LINENUM, NP_CMD_GUIDES, NP_CMD_WS,
+    NP_CMD_STATUS, NP_CMD_ZEN,
+    NP_CMD_LANG, NP_CMD_LANG_AUTO, NP_CMD_CRLF, NP_CMD_ENC,
+    NP_CMD_SYS_OPEN, NP_CMD_SHOW_DIR, NP_CMD_AI, NP_CMD_MACLAW,
+    NP_CMD_BAK, NP_CMD_AUTOSAVE, NP_CMD_SESSION,
+    NP_CMD_HELP, NP_CMD_UPDATE, NP_CMD_ABOUT,
+    NP_CMD_COUNT
+};
+
+typedef struct { const char *title, *icon, *group, *shortcut; } np_cmd;
+
+static const np_cmd np_cmds[NP_CMD_COUNT] = {
+    /* 文件 */
+    { "新建标签",                 CUI_ICON_SQUARE_PEN,      "文件", "Ctrl N" },
+    { "打开…",                    CUI_ICON_FOLDER_OPEN,     "文件", "Ctrl O" },
+    { "保存",                     CUI_ICON_SAVE,            "文件", "Ctrl S" },
+    { "另存为…",                  NULL,                     "文件", "Ctrl Shift S" },
+    { "全部保存",                 CUI_ICON_LAYERS,          "文件", NULL },
+    { "从磁盘重新加载",           CUI_ICON_REFRESH_CW,      "文件", "Ctrl R" },
+    { "关闭当前标签",             CUI_ICON_X,               "文件", "Ctrl W" },
+    { "退出",                     CUI_ICON_LOG_OUT,         "文件", "Ctrl Q" },
+    /* 编辑 */
+    { "全选",                     NULL,                     "编辑", "Ctrl A" },
+    { "插入日期/时间",            CUI_ICON_CLOCK,           "编辑", "F5" },
+    { "转为大写",                 CUI_ICON_ARROW_UP,        "编辑", NULL },
+    { "转为小写",                 CUI_ICON_ARROW_DOWN,      "编辑", NULL },
+    { "排序选中的行 (A→Z)",       CUI_ICON_LIST,            "编辑", NULL },
+    { "去除相邻重复行",           CUI_ICON_CHECK_CHECK,     "编辑", NULL },
+    { "删除空行",                 CUI_ICON_MINUS,           "编辑", NULL },
+    { "剪裁行尾空白",             CUI_ICON_SLIDERS_HORIZONTAL, "编辑", NULL },
+    { "Tab 转空格",               CUI_ICON_ALIGN_LEFT,      "编辑", NULL },
+    { "行首空格转 Tab",           CUI_ICON_GRIP_VERTICAL,   "编辑", NULL },
+    { "合并选中的行",             CUI_ICON_CHEVRON_DOWN,    "编辑", NULL },
+    { "复制当前行",               CUI_ICON_COPY,            "编辑", "Ctrl D" },
+    { "上移选中的行",             CUI_ICON_ARROW_UP,        "编辑", "Alt Up" },
+    { "下移选中的行",             CUI_ICON_ARROW_DOWN,      "编辑", "Alt Down" },
+    { "转到匹配的括号",           CUI_ICON_CHEVRONS_UP_DOWN, "编辑", NULL },
+    { "清空内容",                 CUI_ICON_TRASH_2,         "编辑", NULL },
+    /* 搜索 */
+    { "查找…",                    CUI_ICON_SEARCH,          "搜索", "Ctrl F" },
+    { "查找和替换…",              CUI_ICON_REFRESH_CW,      "搜索", "Ctrl H" },
+    { "转到行…",                  CUI_ICON_ARROW_RIGHT,     "搜索", "Ctrl G" },
+    { "在当前文件中查找",         CUI_ICON_LIST,            "搜索", "Ctrl Shift L" },
+    { "在文件中查找…",            CUI_ICON_FOLDER_OPEN,     "搜索", "Ctrl Shift F" },
+    { "显示/隐藏输出窗口",        CUI_ICON_TERMINAL,        "搜索", "F7" },
+    { "清空输出",                 CUI_ICON_TRASH_2,         "搜索", NULL },
+    /* 视图 */
+    { "目录 / 工作区侧栏",        CUI_ICON_PANEL_LEFT,      "视图", "Ctrl B" },
+    { "预览面板",                 CUI_ICON_EYE,             "视图", "Ctrl Alt P" },
+    { "目录跟随当前文件",         CUI_ICON_BOOKMARK,        "视图", NULL },
+    { "刷新目录",                 CUI_ICON_REFRESH_CW,      "视图", NULL },
+    { "选择工作目录…",            CUI_ICON_FOLDER_OPEN,     "视图", NULL },
+    { "外观设置…",                CUI_ICON_PALETTE,         "视图", "Ctrl ," },
+    { "切换深色模式",             CUI_ICON_MOON,            "视图", NULL },
+    { "跟随系统主题",             NULL,                     "视图", NULL },
+    { "切换强调色",               CUI_ICON_PALETTE,         "视图", NULL },
+    { "切换界面密度",             CUI_ICON_SLIDERS_HORIZONTAL, "视图", NULL },
+    { "放大字号",                 CUI_ICON_ZOOM_IN,         "视图", "Ctrl +" },
+    { "缩小字号",                 CUI_ICON_ZOOM_OUT,        "视图", "Ctrl -" },
+    { "重置字号",                 NULL,                     "视图", "Ctrl 0" },
+    { "显示/隐藏行号",            NULL,                     "视图", NULL },
+    { "显示/隐藏缩进参考线",      NULL,                     "视图", NULL },
+    { "空白字符显示",             CUI_ICON_TYPE,            "视图", NULL },
+    { "显示/隐藏状态栏",          NULL,                     "视图", NULL },
+    { "沉浸式编辑",               CUI_ICON_MAXIMIZE_2,      "视图", "F11" },
+    /* 文档 */
+    { "选择语言…",                CUI_ICON_PALETTE,         "文档", NULL },
+    { "按扩展名重新识别语言",     CUI_ICON_REFRESH_CW,      "文档", NULL },
+    { "切换换行符 (LF/CRLF)",     NULL,                     "文档", NULL },
+    { "切换保存编码",             NULL,                     "文档", NULL },
+    /* 工具 */
+    { "用系统默认程序打开",       CUI_ICON_EXTERNAL_LINK,   "工具", NULL },
+    { "打开文件所在目录",         CUI_ICON_FOLDER,          "工具", NULL },
+    { "AI 助手",                  CUI_ICON_SPARKLES,        "工具", "Ctrl Alt A" },
+    { "maclaw 官方服务登录…",     CUI_ICON_SPARKLES,        "工具", NULL },
+    { "保存时创建 .bak 备份",     NULL,                     "工具", NULL },
+    { "自动保存（空闲 5 秒）",    NULL,                     "工具", NULL },
+    { "启动时恢复上次会话",       NULL,                     "工具", NULL },
+    /* 帮助 */
+    { "快捷键速查",               CUI_ICON_KEYBOARD,        "帮助", NULL },
+    { "在线更新…",                CUI_ICON_DOWNLOAD,        "帮助", NULL },
+    { "关于",                     CUI_ICON_INFO,            "帮助", NULL },
+};
+
+static void np_cmd_run(notepad *a, int i) {
+    np_doc *d = np_cur(a);
+    if (!d) return;
+    switch (i) {
+    case NP_CMD_NEW: if (np_doc_new(a)) np_activate(a, a->count - 1, true); break;
+    case NP_CMD_OPEN: np_open_dialog(a); break;
+    case NP_CMD_SAVE: np_save_current(a, d); break;
+    case NP_CMD_SAVE_AS: np_save_as(a, d); break;
+    case NP_CMD_SAVE_ALL: np_save_all(a); break;
+    case NP_CMD_RELOAD: np_request_reload(a); break;
+    case NP_CMD_CLOSE: np_request_close(a, a->active); break;
+    case NP_CMD_QUIT: np_request_quit(a); break;
+    case NP_CMD_SELECT_ALL:
+        if (!d->is_hex) cui_code_editor_select(a->ui, d->editor_id, 0, d->len);
+        break;
+    case NP_CMD_STAMP: {
+        if (d->is_hex) break;
+        char stamp[64];
+        time_t now = time(NULL);
+        struct tm *lt = localtime(&now);
+        if (lt && strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M", lt))
+            np_insert_at_caret(a, stamp);
+        break;
+    }
+    case NP_CMD_UPPER: if (!d->is_hex) np_case_transform(a, d, true); break;
+    case NP_CMD_LOWER: if (!d->is_hex) np_case_transform(a, d, false); break;
+    case NP_CMD_SORT: if (!d->is_hex) np_line_transform(a, d, TR_SORT); break;
+    case NP_CMD_UNIQ: if (!d->is_hex) np_line_transform(a, d, TR_UNIQ); break;
+    case NP_CMD_NOEMPTY: if (!d->is_hex) np_line_transform(a, d, TR_NOEMPTY); break;
+    case NP_CMD_STRIP: if (!d->is_hex) np_line_transform(a, d, TR_STRIP); break;
+    case NP_CMD_TAB2SP: if (!d->is_hex) np_line_transform(a, d, TR_TAB2SP); break;
+    case NP_CMD_SP2TAB: if (!d->is_hex) np_line_transform(a, d, TR_SP2TAB); break;
+    case NP_CMD_JOIN: if (!d->is_hex) np_line_transform(a, d, TR_JOIN); break;
+    case NP_CMD_DUP_LINE: if (!d->is_hex) np_duplicate_line(a, d); break;
+    case NP_CMD_MOVE_UP: if (!d->is_hex) np_move_lines(a, d, -1); break;
+    case NP_CMD_MOVE_DOWN: if (!d->is_hex) np_move_lines(a, d, 1); break;
+    case NP_CMD_BRACKET: if (!d->is_hex) np_goto_bracket(a, d); break;
+    case NP_CMD_CLEAR:
+        if (!d->is_hex && d->text[0]) {
+            d->text[0] = 0;
+            np_text_changed(a, d);
+            np_bump_editor(a, d);
+        }
+        break;
+    case NP_CMD_FIND: if (!d->is_hex) np_open_find(a); break;
+    case NP_CMD_REPLACE: if (!d->is_hex) a->dlg_replace = true; break;
+    case NP_CMD_GOTO: if (!d->is_hex) a->dlg_goto = true; break;
+    case NP_CMD_FIND_HERE:
+        if (!d->is_hex) {
+            a->show_output = true;
+            a->out_tab = 0;
+            a->hits_rev = 0;
+            if (!a->find_query[0]) np_open_find(a);
+        }
+        break;
+    case NP_CMD_FIND_FILES:
+        a->dlg_find_files = true;
+        if (!a->ff_dir[0]) np_dir_set(a, a->side_dir);
+        break;
+    case NP_CMD_OUTPUT: a->show_output = !a->show_output; break;
+    case NP_CMD_CLEAR_OUT:
+        a->msg_count = 0;
+        a->hit_count = 0;
+        a->hits_rev = 0;
+        a->ff_hit_count = 0;
+        a->ff_count = 0;
+        break;
+    case NP_CMD_SIDEBAR: a->show_sidebar = !a->show_sidebar; break;
+    case NP_CMD_PREVIEW: a->show_preview = !a->show_preview; break;
+    case NP_CMD_FOLLOW: a->follow_active = !a->follow_active; break;
+    case NP_CMD_RESCAN: a->side_reload = true; break;
+    case NP_CMD_PICK_DIR: {
+        char dir[NP_PATH_CAP];
+        if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                .kind = CUI_FILE_FOLDER, .title = "选择工作目录" },
+                dir, sizeof dir))
+            np_dir_set(a, dir);
+        break;
+    }
+    case NP_CMD_SETTINGS: a->dlg_settings = true; break;
+    case NP_CMD_DARK:
+        a->dark = !a->dark;
+        a->dark_valid = true;
+        a->style = -1;
+        cui_app_follow_system_theme(NULL, false);
+        cui_set_theme(a->ui, a->dark ? CUI_THEME_DARK : CUI_THEME_LIGHT);
+        break;
+    case NP_CMD_SYS_THEME:
+        a->dark_valid = false;
+        a->style = -1;
+        cui_app_follow_system_theme(NULL, true);
+        a->dark = cui_get_theme_mode(a->ui) == CUI_THEME_DARK;
+        break;
+    case NP_CMD_ACCENT:
+        a->accent = (a->accent + 1) % CUI_ACCENT_COUNT;
+        a->style = -1;
+        cui_set_accent(a->ui, (cui_accent)a->accent);
+        break;
+    case NP_CMD_DENSITY: a->density = (a->density + 1) % 3; break;
+    case NP_CMD_ZOOM_IN: a->font_size = NP_MIN(NP_FONT_MAX, a->font_size + 1); break;
+    case NP_CMD_ZOOM_OUT: a->font_size = NP_MAX(NP_FONT_MIN, a->font_size - 1); break;
+    case NP_CMD_ZOOM_RESET: a->font_size = NP_FONT_DEF; break;
+    case NP_CMD_LINENUM: a->line_numbers = !a->line_numbers; break;
+    case NP_CMD_GUIDES: if (!d->is_hex) a->indent_guides = !a->indent_guides; break;
+    case NP_CMD_WS: if (!d->is_hex) a->whitespace = (a->whitespace + 1) % 3; break;
+    case NP_CMD_STATUS: a->show_status = !a->show_status; break;
+    case NP_CMD_ZEN: np_zen_set(a, !a->zen); break;
+    case NP_CMD_LANG: if (!d->is_hex) np_open_lang_dialog(a); break;
+    case NP_CMD_LANG_AUTO:
+        if (!d->is_hex) {
+            d->lang = np_detect_lang(d->path, d->text);
+            d->lang_manual = false;
+        }
+        break;
+    case NP_CMD_CRLF: if (!d->is_hex) d->crlf = !d->crlf; break;
+    case NP_CMD_ENC: if (!d->is_hex) d->enc = (d->enc + 1) % 3; break;
+    case NP_CMD_SYS_OPEN: if (d->path[0]) np_system_open(a, d->path, false); break;
+    case NP_CMD_SHOW_DIR: if (d->path[0]) np_system_open(a, d->path, true); break;
+    case NP_CMD_AI: a->show_ai = !a->show_ai; break;
+    case NP_CMD_MACLAW: a->dlg_maclaw = true; break;
+    case NP_CMD_BAK: a->make_backup = !a->make_backup; break;
+    case NP_CMD_AUTOSAVE: a->auto_save = !a->auto_save; break;
+    case NP_CMD_SESSION: a->session_restore = !a->session_restore; break;
+    case NP_CMD_HELP: a->dlg_help = true; break;
+    case NP_CMD_UPDATE:
+        a->dlg_update = true;
+        np_updater_start_check();
+        break;
+    case NP_CMD_ABOUT: a->dlg_about = true; break;
+    }
+}
+
 static void np_frame(cui_ctx *ui, void *user) {
     notepad *a = (notepad *)user;
     a->ui = ui;
@@ -9914,9 +10154,15 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_key_pressed(ui, CUI_KEY_F3))
                 np_hex_find_run(a, true);
         }
+        /* Ctrl+Shift+P is the command palette (#10); the preview panel
+         * moves to Ctrl+Alt+P and stays reachable from the palette too. */
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_P))
+            a->palette_open = true;
+        if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_ALT, CUI_KEY_P))
             a->show_preview = !a->show_preview;
-        if (cui_key_pressed(ui, CUI_KEY_F1)) a->dlg_help = true;
+        /* F1 opens the same palette (#11): the shortcut column plus fuzzy
+         * search replaces the static help listing. */
+        if (cui_key_pressed(ui, CUI_KEY_F1)) a->palette_open = true;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_COMMA)) a->dlg_settings = true;
         if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_F)) {
             a->dlg_find_files = true;
@@ -9959,8 +10205,18 @@ static void np_frame(cui_ctx *ui, void *user) {
                .bg = CUI_COLOR_BACKGROUND, .gap = 0) {
         /* Brand identity lives in the OS title bar / window icon now; the
          * density and help controls remain in the View menu and toolbar. */
-        if (!a->zen) {
-        cui_column(ui, .width = CUI_FILL, .bg = CUI_COLOR_SURFACE, .gap = 0) {
+        /* Chrome collapse easing (#12): F11 folds the menu/toolbar strip
+         * away with a 150 ms height animation instead of a hard cut.  The
+         * natural height is re-measured whenever the strip renders freely. */
+        {
+            float vis = cui_animate_spring(ui, cui_make_id(ui, "#np-chrome-vis"),
+                                           a->zen ? 0.0f : 1.0f, 0.15f, 0.0f);
+            bool measure = a->zen_chrome_h <= 0 || (!a->zen && vis > 0.995f);
+            if (vis > 0.01f) {
+        cui_column(ui, .id = "#np-chrome", .width = CUI_FILL,
+                   .max_height = measure ? 1e6f : a->zen_chrome_h * vis,
+                   .clip = !measure,
+                   .bg = CUI_COLOR_SURFACE, .gap = 0) {
         cui_menu_bar(ui, "menubar", .no_border = true) {
             cui_menu_bar_menu(ui, "文件") {
                 if (cui_menu_item(ui, "新建标签", .icon = CUI_ICON_SQUARE_PEN, .shortcut = "Ctrl N")) {
@@ -10198,7 +10454,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                     char pv[96];
                     snprintf(pv, sizeof pv, "预览面板（%s）", np_preview_kind_name(np_preview_for_doc(a, d)));
                     if (cui_menu_item(ui, pv, .icon = CUI_ICON_EYE,
-                                      .shortcut = "Ctrl Shift P", .checked = a->show_preview))
+                                      .shortcut = "Ctrl Alt P", .checked = a->show_preview))
                         a->show_preview = !a->show_preview;
                 }
                 if (cui_menu_item(ui, "目录跟随当前文件", .icon = CUI_ICON_BOOKMARK,
@@ -10533,7 +10789,7 @@ static void np_frame(cui_ctx *ui, void *user) {
             cui_toolbar_button(ui, CUI_ICON_TERMINAL, .tooltip = "输出窗口  F7",
                                .toggle = &a->show_output);
             cui_toolbar_button(ui, CUI_ICON_EYE,
-                               .tooltip = "预览面板  Ctrl Shift P（Markdown/LaTeX/PDF/Web）",
+                               .tooltip = "预览面板  Ctrl Alt P（Markdown/LaTeX/PDF/Web）",
                                .toggle = &a->show_preview);
             cui_toolbar_separator(ui);
             if (cui_toolbar_button(ui, CUI_ICON_ZOOM_OUT, .tooltip = "缩小字号"))
@@ -10548,7 +10804,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                                    .tooltip = "外观设置…（界面风格 / 主题）"))
                 a->dlg_settings = true;
             if (cui_toolbar_button(ui, CUI_ICON_KEYBOARD,
-                                   .tooltip = "快捷键帮助  F1"))
+                                   .tooltip = "快捷键速查（F1 打开命令面板）"))
                 a->dlg_help = true;
             if (cui_toolbar_button(ui, a->dark ? CUI_ICON_SUN : CUI_ICON_MOON,
                                    .tooltip = a->dark ? "浅色模式" : "深色模式")) {
@@ -10560,7 +10816,10 @@ static void np_frame(cui_ctx *ui, void *user) {
             }
         }
         }   /* top chrome surface */
-        }   /* !zen: menu bar + toolbar hidden in immersive edit mode */
+        if (measure)
+            a->zen_chrome_h = cui_get_rect(ui, cui_make_id(ui, "#np-chrome")).h;
+        }
+        }   /* zen chrome easing: menu bar + toolbar fold with F11 */
 
         /* Main workspace: directory pane | (tabs + editor + output pane),
          * with the AI assistant docked on the far right when open (it sits
@@ -10593,7 +10852,15 @@ static void np_frame(cui_ctx *ui, void *user) {
         }
 
         /* Status bar -------------------------------------------------- */
-        if (a->show_status && !a->zen) {
+        {   /* same F11 easing as the top chrome strip */
+            float svis = cui_animate_spring(ui, cui_make_id(ui, "#np-status-vis"),
+                                            (a->show_status && !a->zen) ? 1.0f : 0.0f,
+                                            0.15f, 0.0f);
+            bool smeasure = a->zen_status_h <= 0 || (a->show_status && !a->zen && svis > 0.995f);
+            if (svis > 0.01f) {
+            cui_box(ui, .id = "#np-status", .width = CUI_FILL,
+                    .max_height = smeasure ? 1e6f : a->zen_status_h * svis,
+                    .clip = !smeasure, .gap = 0) {
             cui_status_bar(ui, "status") {
                 if (d->dirty)
                     cui_status_bar_text(ui, "未保存", .icon = CUI_ICON_DOT, .tone = CUI_TONE_WARNING);
@@ -10622,7 +10889,7 @@ static void np_frame(cui_ctx *ui, void *user) {
                          "");
                 if (!a->show_sidebar && !a->show_output && !a->show_preview && !a->show_ai)
                     snprintf(panes, sizeof panes, "单栏###panes");
-                if (cui_status_bar_item(ui, panes, .tooltip = "点击：切换侧栏；Ctrl+B 侧栏 / F7 输出 / Ctrl Shift P 预览 / Ctrl Alt A AI"))
+                if (cui_status_bar_item(ui, panes, .tooltip = "点击：切换侧栏；Ctrl+B 侧栏 / F7 输出 / Ctrl Alt P 预览 / Ctrl Alt A AI"))
                     a->show_ai = !a->show_ai;
                 cui_status_bar_spacer(ui);
                 if (d->is_hex) {
@@ -10688,7 +10955,51 @@ static void np_frame(cui_ctx *ui, void *user) {
                 snprintf(fs, sizeof fs, "%d pt###font", a->font_size);
                 if (cui_status_bar_item(ui, fs, .tooltip = "点击重置字号"))
                     a->font_size = NP_FONT_DEF;
-            }
+            }   /* cui_status_bar */
+            }   /* cui_box (height easing wrapper) */
+            if (smeasure)
+                a->zen_status_h = cui_get_rect(ui, cui_make_id(ui, "#np-status")).h;
+            }   /* svis > 0.01 */
+        }   /* status bar easing */
+    }
+
+    /* Command palette (#10/#11): static table + recent files, rebuilt every
+     * frame so dynamic titles stay fresh; the call itself runs every frame
+     * to keep the exit transition visible. */
+    {
+        static const char *dens[3] = { "舒适", "紧凑", "宽松" };
+        static const char *wsm[3] = { "关", "仅缩进", "全部" };
+        char dyn[2][48];
+        snprintf(dyn[0], sizeof dyn[0], "界面密度：%s", dens[a->density]);
+        snprintf(dyn[1], sizeof dyn[1], "空白字符显示：%s", wsm[a->whitespace]);
+        char rt[NP_RECENT_MAX][NP_PATH_CAP];
+        cui_command cmds[NP_CMD_COUNT + NP_RECENT_MAX];
+        int n = NP_CMD_COUNT;
+        for (int i = 0; i < NP_CMD_COUNT; i++) {
+            cmds[i].title = np_cmds[i].title;
+            cmds[i].icon = np_cmds[i].icon;
+            cmds[i].group = np_cmds[i].group;
+            cmds[i].shortcut = np_cmds[i].shortcut;
+        }
+        cmds[NP_CMD_DENSITY].title = dyn[0];
+        cmds[NP_CMD_WS].title = dyn[1];
+        for (int i = 0; i < a->recent_count && i < NP_RECENT_MAX; i++) {
+            snprintf(rt[i], NP_PATH_CAP, "打开 %s", np_base(a->recent[i]));
+            cmds[n].title = rt[i];
+            cmds[n].icon = CUI_ICON_CLOCK;
+            cmds[n].group = "最近文件";
+            cmds[n].shortcut = NULL;
+            n++;
+        }
+        int pick = cui_command_palette_ex(ui, &a->palette_open, cmds, n,
+                                          &(cui_palette_opts){
+                .placeholder = "输入命令或搜索…",
+                .hint_nav = "选择", .hint_select = "执行", .hint_close = "关闭",
+                .no_results = "没有匹配的命令",
+        });
+        if (pick >= 0) {
+            if (pick < NP_CMD_COUNT) np_cmd_run(a, pick);
+            else np_open_path(a, a->recent[pick - NP_CMD_COUNT], true);
         }
     }
 

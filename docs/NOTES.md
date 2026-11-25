@@ -1043,3 +1043,28 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
   基线同样暴露；Visualizer 截图链路不可靠时 CUI_SCREENSHOT 是稳定
   替代。g.out_tab 默认值 1（消息 tab）在 main 初始化块，勿当 bug 排查。
 - 验证：MSVC 构建 + 七项回归全绿。
+
+## UI_PLAN P3：命令面板与键盘流（#10 #11 #12）
+
+- 命令面板（Ctrl+Shift+P）启用 vendor cui_command_palette：静态命令表
+  np_cmds（63 条，enum 索引即分发契约）+ 每帧重建的最近文件条目（组名
+  「最近文件」，标题「打开 xxx」）；动态标题（界面密度/空白字符档位）
+  每帧覆写。np_cmd_run 单点分发，文本模式专属命令内部 guard is_hex。
+- 改键：Ctrl+Shift+P → 命令面板；预览面板 → Ctrl+Alt+P（菜单、工具栏
+  tooltip、状态栏 tooltip、帮助对话框四处文案同步）。
+- F1 → 同一面板（#11）：快捷键列 + fuzzy 搜索替代静态帮助列表；「快捷键
+  速查」对话框保留在帮助菜单与工具栏按钮。
+- vendor cui_palette_opts 兼容扩展（ex 变体，旧签名 wrapper 保 ABI）：
+  placeholder/hint_nav/hint_select/hint_close/no_results 五条本地化，
+  app 全部中文化。
+- #12 沉浸模式缓动：cui_animate_spring(id, zen?0:1, 0.15s, bounce 0) 驱动
+  chrome（菜单+工具栏列）与状态栏的 max_height 折叠 + clip；自然高度用
+  cui_get_rect(.id 显式命名) 在自由渲染帧测量（cui_last_rect 不可靠——
+  容器不更新 last_id）。折叠完成后（vis≤0.01）整块跳过渲染。
+- 视觉验证走 CUI_SCREENSHOT 自绘链路：面板布局、中文占位符、分组标题、
+  图标+快捷键行、中文 footer、消息徽标全部截图实证；临时 palette_open
+  初始值验后清除。
+- 教训：嵌套 scope 改造（状态栏外包 cui_box）要数清 opens/closes——
+  少一个收括号导致 np_frame 吞掉后续函数，C1075 报在函数开头，用
+  python 花括号深度扫描逐行定位（3 分钟）比肉眼快。
+- 验证：MSVC 构建 + 七项回归全绿。

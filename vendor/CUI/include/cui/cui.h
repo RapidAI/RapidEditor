@@ -1184,6 +1184,16 @@ typedef struct cui_command {
 /* Spotlight style command palette. Returns the index of the chosen command,
  * or -1. Open it with a shortcut: if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_K)) open = true; */
 CUI_API int cui_command_palette(cui_ctx *ui, bool *open, const cui_command *commands, int count);
+/* Localizable variant: every string defaults to the English one when NULL. */
+typedef struct cui_palette_opts {
+    int _;
+    const char *placeholder;   /* search input placeholder */
+    const char *hint_nav;      /* footer: up/down keys */
+    const char *hint_select;   /* footer: enter key */
+    const char *hint_close;    /* footer: escape key */
+    const char *no_results;    /* empty search result line */
+} cui_palette_opts;
+CUI_API int cui_command_palette_ex(cui_ctx *ui, bool *open, const cui_command *commands, int count, const cui_palette_opts *o);
 
 /* ------------------------------------------------------------------------ */
 /* More components                                                          */

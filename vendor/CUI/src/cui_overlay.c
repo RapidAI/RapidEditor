@@ -1619,7 +1619,7 @@ static int cui__fuzzy(const char *text, const char *q) {
 }
 
 /** Keep the exit transition visible without accepting commands from it. */
-int cui_command_palette(cui_ctx *ui, bool *open, const cui_command *cmds, int count) {
+int cui_command_palette_ex(cui_ctx *ui, bool *open, const cui_command *cmds, int count, const cui_palette_opts *o) {
     cui_id id = cui_make_id(ui, "#command-palette");
     cui__palette_state *st = cui_state(ui, id, sizeof *st);
     bool is_open = open && *open;
@@ -1666,7 +1666,7 @@ int cui_command_palette(cui_ctx *ui, bool *open, const cui_command *cmds, int co
     cui__open(ui, sr);
     cui_input_opts io;
     memset(&io, 0, sizeof io);
-    io.placeholder = "Type a command or search";
+    io.placeholder = o && o->placeholder ? o->placeholder : "Type a command or search";
     io.size = CUI_SIZE_LG;
     cui_id qid = cui_make_id(ui, "#query");
     if (is_open) ui->focus = qid;
@@ -1750,7 +1750,7 @@ int cui_command_palette(cui_ctx *ui, bool *open, const cui_command *cmds, int co
         ui->nodes[e].pad[0] = ui->nodes[e].pad[2] = 28;
         ui->nodes[e].align = CUI_ALIGN_CENTER;
         cui__open(ui, e);
-        cui__text_node(ui, "No results found", -1, CUI_FONT_BODY, cui__fs(ui, ui->theme.text_body), CUI_C(ui, TEXT_MUTED), false);
+        cui__text_node(ui, o && o->no_results ? o->no_results : "No results found", -1, CUI_FONT_BODY, cui__fs(ui, ui->theme.text_body), CUI_C(ui, TEXT_MUTED), false);
         cui__close(ui);
     }
     cui__scroll_end_ex(ui);
@@ -1764,7 +1764,11 @@ int cui_command_palette(cui_ctx *ui, bool *open, const cui_command *cmds, int co
     ui->nodes[foot].bg = CUI_C(ui, SURFACE_MUTED);
     ui->nodes[foot].radius.bl = ui->nodes[foot].radius.br = ui->theme.radius_panel - 1;
     cui__open(ui, foot);
-    const char *hints[3][2] = { { "\xe2\x86\x91 \xe2\x86\x93", "Navigate" }, { "\xe2\x86\xb5", "Select" }, { "Esc", "Close" } };
+    const char *hints[3][2] = {
+        { "\xe2\x86\x91 \xe2\x86\x93", o && o->hint_nav ? o->hint_nav : "Navigate" },
+        { "\xe2\x86\xb5", o && o->hint_select ? o->hint_select : "Select" },
+        { "Esc", o && o->hint_close ? o->hint_close : "Close" },
+    };
     for (int k = 0; k < 3; k++) {
         int hrow = cui__node_new(ui, 0);
         ui->nodes[hrow].dir = CUI_ROW; ui->nodes[hrow].gap = 6;
@@ -1781,6 +1785,10 @@ int cui_command_palette(cui_ctx *ui, bool *open, const cui_command *cmds, int co
     cui__float_end(ui);
     if (chosen >= 0 && open) { *open = false; ui->kpressed[CUI_KEY_ENTER] = 0; }
     return chosen;
+}
+
+int cui_command_palette(cui_ctx *ui, bool *open, const cui_command *cmds, int count) {
+    return cui_command_palette_ex(ui, open, cmds, count, NULL);
 }
 
 /* ------------------------------------------------------------------------ */
