@@ -547,6 +547,9 @@ typedef struct notepad {
     bool hexfind_ascii;                 /* treat the query as text, not hex */
     size_t hexfind_at;                  /* last hit offset; SIZE_MAX = none */
     size_t hexfind_len;                 /* bytes of the last hit */
+    size_t hexfind_hits[400];           /* all hits of the last query: scrollbar ticks */
+    int hexfind_hit_count;
+    unsigned hexfind_doc_uid;           /* the hits belong to this document */
 
     /* Binary template (010 Editor style) ------------------------------- */
     bool dlg_bt;                        /* choose a binary template */
@@ -2707,15 +2710,20 @@ static void np_hex_find_run(notepad *a, bool next) {
             if (t[i] != (char)pat[0]) continue;   /* cheap first-byte gate */
             if (memcmp(t + i, pat, (size_t)pn) == 0) {
                 /* count every match and which one this is, so the toast
-                 * reads "2 of 7" like the text find bar does */
-                int total = 0, index = 0;
+                 * reads "2 of 7" like the text find bar does; also keep
+                 * them all for the scrollbar ticks (capped) */
+                int total = 0, index = 0, kept = 0;
                 for (size_t j = 0; j + (size_t)pn <= n; j++) {
                     if (t[j] != (char)pat[0]) continue;
                     if (memcmp(t + j, pat, (size_t)pn) == 0) {
                         total++;
                         if (j == i) index = total;
+                        if (kept < (int)(sizeof a->hexfind_hits / sizeof a->hexfind_hits[0]))
+                            a->hexfind_hits[kept++] = j;
                     }
                 }
+                a->hexfind_hit_count = kept;
+                a->hexfind_doc_uid = d->uid;
                 a->hexfind_at = i;
                 a->hexfind_len = (size_t)pn;
                 if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, i);
@@ -2731,6 +2739,7 @@ static void np_hex_find_run(notepad *a, bool next) {
     }
     a->hexfind_at = (size_t)-1;
     a->hexfind_len = 0;
+    a->hexfind_hit_count = 0;
     np_toast(a, "未找到", "文件中没有匹配的字节序列", CUI_TONE_INFO);
 }
 
@@ -8316,9 +8325,19 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                      .size = 11, .color = CUI_COLOR_TEXT_MUTED);
         }
 
-        /* Build highlight ranges from the template fields (frame-stable). */
+        /* Build highlight ranges from the template fields (frame-stable),
+         * then append the hex find's hits: they show both as in-view tints
+         * and as scrollbar ticks (capped to the room the array has left). */
         static cui_hex_range ranges[512];
         int nr = np_bt_ranges(d, ranges, 512);
+        for (int i = 0; nr < 512 && i < a->hexfind_hit_count
+                       && a->hexfind_doc_uid == d->uid; i++) {
+            ranges[nr].offset = a->hexfind_hits[i];
+            ranges[nr].length = (size_t)(a->hexfind_len ? a->hexfind_len : 1);
+            ranges[nr].tone = CUI_TONE_INFO;
+            ranges[nr].label = NULL;
+            nr++;
+        }
 
         if (d->bt_show_tree && d->bt_name[0] && d->bt_result.ok) {
             if (d->bt_ratio < 0.2f || d->bt_ratio > 0.85f) d->bt_ratio = 0.58f;

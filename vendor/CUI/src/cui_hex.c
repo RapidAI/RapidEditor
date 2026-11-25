@@ -143,6 +143,7 @@ typedef struct {
     size_t sel_lo, sel_hi, cursor;
     int64_t hover;
     const cui__hex_mark *marks; int nmarks;
+    const cui_scroll_tick *ticks; int nticks;   /* scrollbar hit markers, from the ranges */
     cui_color fg, muted, secondary, sel, hover_c, bar, line;
 } cui__hex_paint;
 
@@ -265,6 +266,13 @@ static void cui__paint_hex(cui_ctx *ui, cui_node *n, void *data) {
         }
     }
     cui_pop_clip(ui);
+    if (p->max_top > 0 && p->nticks > 0 && p->ticks) {   /* hit markers on the track: always visible, the thumb fades in over them */
+        float track_h = area.h - 6;
+        for (int i = 0; i < p->nticks; i++) {
+            float ty = area.y + 3 + p->ticks[i].at * track_h;
+            cui_draw_rect(ui, (cui_rect){ r.x + r.w - 7, ty, 4, 2 }, CUI_CORNERS(1), p->ticks[i].c);
+        }
+    }
     if (p->max_top > 0 && p->bar_t > 0.01f) {
         float track_h = area.h - 6;
         double total = p->view_rows + p->max_top;
@@ -530,6 +538,22 @@ static void cui__hxf_visible(cui__hxf *f, cui__hex_paint *p, cui_color fg, bool 
         nm++;
     }
     p->marks = marks; p->nmarks = nm;
+    /* scrollbar hit markers: one tick per range, wherever it sits in the file
+     * (unlike the in-view marks above). Capped so a pathological find never
+     * allocates without end. */
+    int nt = 0;
+    cui_scroll_tick *ticks = o->range_count > 0 && o->ranges && f->rows > 0
+                           ? cui__frame_alloc(ui, sizeof *ticks * (size_t)CUI_MIN(o->range_count, 4096)) : NULL;
+    for (int i = 0; ticks && i < o->range_count && nt < 4096; i++) {
+        const cui_hex_range *rg = &o->ranges[i];
+        if (rg->length == 0 || rg->offset >= size) continue;
+        size_t row = rg->offset / bpr;
+        if (row >= f->rows) row = f->rows - 1;
+        ticks[nt].at = (float)((double)row / (double)f->rows);
+        ticks[nt].c = cui_alpha(cui__tone_color(ui, rg->tone), dark ? 0.9f : 0.8f);
+        nt++;
+    }
+    p->ticks = ticks; p->nticks = nt;
 }
 
 /* the rows' node and its paint data */

@@ -1335,6 +1335,15 @@ void cui__paint_scrollbars(cui_ctx *ui, cui_node *n, cui_rect clip) {
     if (max_y > 0.5f) {
         cui_rect zone = { r.x + r.w - CUI__BAR_ZONE, r.y, CUI__BAR_ZONE, r.h };
         cui__paint_add_hit(ui, n->id ^ 0x5C5C5C5Cu, cui__rect_intersect(zone, clip), CUI_NF_INTERACTIVE);
+        if (st->nticks > 0 && st->ticks) {   /* find hits along the track: always visible, the thumb fades in over them */
+            float thumb_h = CUI_MAX(28.0f, r.h * r.h / st->content_h);
+            float track = r.h - thumb_h - 6;
+            for (int i = 0; i < st->nticks; i++) {
+                float ty = r.y + 3 + st->ticks[i].at * track;
+                cui_draw_rect(ui, (cui_rect){ r.x + r.w - 7, ty, 4, 2 }, CUI_CORNERS(1),
+                              cui_alpha(st->ticks[i].c, 0.6f));
+            }
+        }
         if (st->bar_t > 0.01f) {
             float thumb_h = CUI_MAX(28.0f, r.h * r.h / st->content_h);
             float track = r.h - thumb_h - 6;

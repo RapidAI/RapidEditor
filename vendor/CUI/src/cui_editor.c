@@ -58,6 +58,15 @@ typedef struct {
     char *ghost;               /* inline suggestion shown after the caret (owned) */
     int ghost_len;             /* 0 = no suggestion */
     int ghost_cursor;          /* caret the suggestion belongs to; any move clears */
+
+    /* scrollbar hit markers for the find query: cached line numbers, rebuilt
+     * when the query, its toggles or the text changes */
+    int *tk_line;              /* owned, released by the dtor */
+    int tk_cap, tk_n;
+    uint64_t tk_rev;
+    int tk_len;
+    bool tk_case, tk_word, tk_valid;
+    char tk_query[128];
 } cui__ed_state;
 
 static void cui__ed_dtor(cui_ctx *ui, void *data) {
@@ -69,6 +78,7 @@ static void cui__ed_dtor(cui_ctx *ui, void *data) {
     for (int i = 0; i < CUI__UNDO_MAX; i++) cui__free(ui, s->ed.undo[i]);
     cui__free(ui, s->li);
     cui__free(ui, s->ghost);
+    cui__free(ui, s->tk_line);
 }
 
 /* One frame of editing: the caller's buffer and the line index. */
@@ -648,6 +658,7 @@ typedef struct {
     bool qcase;                 /* find matches honour letter case */
     bool qword;                 /* find matches whole words only */
     const cui_text_mark *marks; int nmarks;   /* the app's marks that reach the lines in view */
+    const int *tick_lines; int nticks;        /* find hits on the scrollbar, cached line numbers */
     cui_color mark_colors[7];
     const char *placeholder;
     float size, lh, cw, gutter, view_h;
@@ -656,7 +667,7 @@ typedef struct {
     int bar_big;                /* 1 vertical thumb held or hovered, 2 horizontal */
     double caret_phase;
     cui_color colors[CUI__TK_COUNT];
-    cui_color num, num_on, band, sel, match, match_edge, brk, brk_edge, caret, muted, line, bar;
+    cui_color num, num_on, band, sel, match, match_edge, brk, brk_edge, caret, muted, line, bar, tick;
     cui_color guide, guide_on;  /* indent guides; guide_on marks the caret's line */
     cui_color ws_glyph, ws_end; /* whitespace glyphs; ws_end marks trailing */
     int vc0, vc1;               /* columns in view */
@@ -919,13 +930,21 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
     }
     cui_pop_clip(ui);
     /* scrollbars */
-    if (p->bar_t > 0.01f) {
-        if (p->max_sy > 0) {
-            float at, len, w = p->bar_big == 1 ? 8 : 6;
-            cui__ed_thumb(r.h - 6, r.h, p->max_sy, p->sy, &at, &len);
+    if (p->max_sy > 0) {
+        float at, len, w = p->bar_big == 1 ? 8 : 6;
+        cui__ed_thumb(r.h - 6, r.h, p->max_sy, p->sy, &at, &len);
+            if (p->nticks > 0 && p->tick_lines) {   /* find hits along the track: always visible, the thumb fades in over them */
+                double total = (double)r.h + p->max_sy;
+                for (int i = 0; i < p->nticks; i++) {
+                    float ty = r.y + 3 + (float)((double)p->tick_lines[i] * p->lh / total) * (r.h - 6);
+                    cui_draw_rect(ui, (cui_rect){ r.x + r.w - 7, ty, 4, 2 }, CUI_CORNERS(1), p->tick);
+                }
+            }
+        if (p->bar_t > 0.01f)
             cui_draw_rect(ui, (cui_rect){ r.x + r.w - w - 3, r.y + 3 + at, w, len }, CUI_CORNERS(w * 0.5f),
                           cui_alpha(p->bar, (p->bar_big == 1 ? 0.38f : 0.26f) * p->bar_t));
-        }
+    }
+    if (p->bar_t > 0.01f) {
         if (p->max_sx > 0) {
             float at, len, h = p->bar_big == 2 ? 8 : 6, track = code.w - 6 - (p->max_sy > 0 ? CUI__ED_BAR : 0);
             cui__ed_thumb(track, code.w, p->max_sx, p->sx, &at, &len);
@@ -1587,6 +1606,42 @@ static void cui__edf_follow_caret(cui__edf *f) {
     st->sx = cui__clampf(st->sx, 0, f->max_sx);
 }
 
+/* scrollbar hit markers for the find query: cached line numbers, rebuilt when
+ * the query, its toggles or the text changes. The scan is capped to
+ * CUI__ED_TICK_SCAN bytes and CUI__ED_TICK_MAX hits, so a find on a huge file
+ * or a very common query never stalls a frame; past a cap the ticks are
+ * simply left out. */
+#define CUI__ED_TICK_SCAN (2u << 20)   /* 2 MB of text scanned at most */
+#define CUI__ED_TICK_MAX  1024
+static void cui__edf_ticks(cui__ed *E) {
+    cui__ed_state *st = E->st;
+    if (st->mode != 1 || !st->query[0]) { st->tk_valid = false; st->tk_n = 0; return; }
+    if (st->tk_valid && st->tk_rev == E->rev && st->tk_len == E->len &&
+        st->tk_case == st->find_case && st->tk_word == st->find_word &&
+        strcmp(st->tk_query, st->query) == 0) return;   /* cache is current */
+    st->tk_valid = true;
+    st->tk_rev = E->rev; st->tk_len = E->len;
+    st->tk_case = st->find_case; st->tk_word = st->find_word;
+    snprintf(st->tk_query, sizeof st->tk_query, "%s", st->query);
+    st->tk_n = 0;
+    int qn = (int)strlen(st->query);
+    if (qn <= 0 || E->len > (int)CUI__ED_TICK_SCAN) return;
+    if (st->tk_cap == 0) {
+        st->tk_cap = CUI__ED_TICK_MAX;
+        st->tk_line = (int *)cui__alloc(E->ui, sizeof(int) * (size_t)st->tk_cap);
+    }
+    int line = 0;
+    const char *s = E->buf;
+    for (int i = 0; i + qn <= E->len; i++) {
+        while (line + 1 < E->nl && E->ls[line + 1] <= i) line++;   /* the line i sits on */
+        if (cui__ed_hit(s, E->len, i, st->query, qn, st->find_case, st->find_word)) {
+            st->tk_line[st->tk_n++] = line;
+            if (st->tk_n >= CUI__ED_TICK_MAX) break;
+            i += qn - 1;
+        }
+    }
+}
+
 /* the editor's lines: one node whose paint draws the lines in view, copied into frame memory */
 static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, bool dark) {
     cui__ed *E = f->E;
@@ -1605,7 +1660,9 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     int first = (int)CUI_MAX(0.0, floor((st->sy - CUI__ED_INSET) / lh));
     int last = (int)CUI_MIN((double)E->nl, ceil((st->sy + f->view_h + 2 * CUI__ED_INSET) / lh) + 1);
     if (first > last) first = last;
+    cui__edf_ticks(E);   /* scrollbar hit markers for the find query */
     p->first = first; p->count = last - first; p->nl = E->nl;
+    p->tick_lines = st->tk_line; p->nticks = st->tk_n;   /* lives as long as the editor state */
     int a = E->ls[first], b = last > first ? cui__ed_end(E, last - 1) : a;
     p->base = a;
     p->text = cui__frame_strdup(ui, E->buf + a, b - a);   /* the caller may change the buffer before painting */
@@ -1684,6 +1741,7 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     if (!focused && !p->show_line) p->sel = cui_alpha(fg, dark ? 0.12f : 0.08f);   /* resting: a quiet selection */
     p->match = cui_alpha(acc, 0.12f);
     p->match_edge = cui_alpha(acc, dark ? 0.55f : 0.45f);
+    p->tick = cui_alpha(acc, dark ? 0.8f : 0.7f);   /* scrollbar hit markers: solid enough to read at 2px */
     p->brk = cui_alpha(fg, dark ? 0.10f : 0.06f);
     p->brk_edge = cui_alpha(CUI_C(ui, TEXT_MUTED), 0.55f);
     p->caret = ui->accent == CUI_ACCENT_NEUTRAL ? fg : CUI_C(ui, ACCENT);

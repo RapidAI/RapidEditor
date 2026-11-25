@@ -343,6 +343,12 @@ typedef struct cui_node {
 /* placement values beyond cui_placement for floating roots */
 enum { CUI__PLACE_FULL = 100, CUI__PLACE_CENTER = 101, CUI__PLACE_POINT = 102 };
 
+/* A hit marker drawn on a scrollbar's track: find matches (cui_code_editor,
+ * cui_hex_view) and friends. `at` is 0 at the top of the track and 1 at the
+ * bottom, linear in the content. Pointed at frame memory; whoever set it
+ * must refresh it every frame it paints. */
+typedef struct { float at; cui_color c; } cui_scroll_tick;
+
 typedef struct cui_scroll_state {
     float x, y;                 /* current offset */
     float tx, ty;               /* target offset */
@@ -353,6 +359,7 @@ typedef struct cui_scroll_state {
     bool drag_y, drag_x;
     float drag_grab;
     bool hover_bar;
+    const cui_scroll_tick *ticks; int nticks;   /* hit markers on the vertical track, NULL none */
     cui_color fade;             /* edge fade color, alpha 0 for none */
 } cui_scroll_state;
 

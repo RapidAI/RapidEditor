@@ -1068,3 +1068,34 @@ UI_PLAN P2 第六项落地（侧栏目录树，P2 主体完成）：
   少一个收括号导致 np_frame 吞掉后续函数，C1075 报在函数开头，用
   python 花括号深度扫描逐行定位（3 分钟）比肉眼快。
 - 验证：MSVC 构建 + 七项回归全绿。
+
+## UI_PLAN P4：颜色 token 清查（#13）与滚动条命中刻度（#16）
+
+- #13 清查结论：app 层零改动达标。全部颜色走 token（CUI_COLOR_*、
+  CUI_TONE_*、theme->colors、SERIES_*）；raw 色仅三处功能性使用——
+  QR 码黑白（扫描语义）、图片绘制白色 tint（无调制）、HEX 图标
+  foreground 0.55 alpha（随主题）。vendor 层唯一例外是取色器预设色板
+  （展示可选颜色本身，属功能定义）。清查方法：grep CUI_RGB/cui_rgba/
+  cui_oklch/0xRRGGBB 定长模式。
+- #16 滚动条命中刻度，两条数据通路：
+  - 文本编辑器：st->query（cui_code_editor_find）全文档扫描建刻度缓存
+    （st->tk_line 持久 owned 数组，dtor 释放；query/case/word/rev/len 任一
+    变化重扫；扫描上限 2MB、刻度上限 1024）。cui__edf_ticks 在 build_lines
+    调用（E 全量行索引可用），paint 在 thumb 之下画 4x2px 刻度。
+  - hex 视图：np_hex_find_run 成功时顺带收集全部命中（cap 400，记
+    hexfind_doc_uid 防跨文档错位）合并进 cui_hex_view 的 ranges（tone
+    INFO）；vendor hxf_visible 从 ranges 全量构建 cui_scroll_tick
+    （at=row/rows，cap 4096），hex 自绘滚动条段画刻度。
+  - 设计决定：刻度常驻（不乘 bar_t）——覆盖式滚动条平时隐藏，若刻度
+    跟随淡出，用户滚动前看不到命中分布，功能价值尽失；透明度 0.6~0.8
+    保持安静。
+  - 共享滚动条（cui__paint_scrollbars）也加了 ticks 支持（cui_scroll_state
+    新增 ticks/nticks，cui_scroll_tick{at,c}），供通用滚动容器未来使用；
+    hex 走自己的绘制路径。
+- 视觉验证（CUI_SCREENSHOT）：编辑器刻度（query=int，1024 个，密集连片
+  符合预期）+ hex 刻度（"This program" 2 命中，INFO 蓝清晰可辨）截图实证。
+- 教训：hex 与编辑器一样自绘滚动条——cui__paint_scrollbars 只服务走
+  CUI_NF_SCROLL 的通用容器；给「自绘滚动条的组件」加刻度必须进它自己的
+  绘制段。验证时的临时注入要在 a->ui 赋值之后（先崩过一次空指针），
+  且文档存在后才触发（首帧 np_cur 为 NULL）。
+- 验证：MSVC 构建 + 七项回归全绿。
