@@ -168,18 +168,27 @@ int cui__tokenize(const cui__lang *L, bool json, const char *s, int n, bool *in_
     return count;
 }
 
-void cui__syntax_colors(cui_ctx *ui, cui_color *c) {
-    bool dark = ui->mode == CUI_THEME_DARK;
-    c[TK_TEXT] = CUI_C(ui, FOREGROUND);
+void cui__syntax_colors_ex(const cui_theme *t, bool dark, cui_color *c) {
+    /* Token colors must hold WCAG 4.5:1 against every preset's editor surface
+     * (audited by scripts/audit_contrast.c, which calls this function). */
+    c[TK_TEXT] = t->colors[CUI_TOKEN_FOREGROUND];
     c[TK_KEYWORD] = dark ? cui_oklch(0.76f, 0.14f, 305, 1) : cui_oklch(0.52f, 0.20f, 305, 1);
     c[TK_TYPE] = dark ? cui_oklch(0.80f, 0.11f, 195, 1) : cui_oklch(0.52f, 0.11f, 200, 1);
     c[TK_STRING] = dark ? cui_oklch(0.80f, 0.13f, 145, 1) : cui_oklch(0.52f, 0.14f, 150, 1);
-    c[TK_NUMBER] = dark ? cui_oklch(0.80f, 0.13f, 60, 1) : cui_oklch(0.58f, 0.16f, 50, 1);
-    c[TK_COMMENT] = CUI_C(ui, TEXT_MUTED);
+    /* numbers/constants: 0.58 L lands at ~4.2:1 on the light surfaces */
+    c[TK_NUMBER] = dark ? cui_oklch(0.80f, 0.13f, 60, 1) : cui_oklch(0.55f, 0.16f, 50, 1);
+    /* comments reuse the theme's muted text in dark (it clears 4.5:1 there);
+     * in light the muted token sits at ~4.2:1, so comments carry their own
+     * slightly darker grey-blue */
+    c[TK_COMMENT] = dark ? t->colors[CUI_TOKEN_TEXT_MUTED] : cui_oklch(0.53f, 0.06f, 255, 1);
     c[TK_FUNC] = dark ? cui_oklch(0.78f, 0.12f, 250, 1) : cui_oklch(0.50f, 0.17f, 255, 1);
     c[TK_PREPROC] = dark ? cui_oklch(0.76f, 0.12f, 350, 1) : cui_oklch(0.52f, 0.18f, 355, 1);
-    c[TK_PUNCT] = CUI_C(ui, TEXT_SECONDARY);
-    c[TK_CONST] = dark ? cui_oklch(0.80f, 0.13f, 60, 1) : cui_oklch(0.58f, 0.16f, 50, 1);
+    c[TK_PUNCT] = t->colors[CUI_TOKEN_TEXT_SECONDARY];
+    c[TK_CONST] = dark ? cui_oklch(0.80f, 0.13f, 60, 1) : cui_oklch(0.55f, 0.16f, 50, 1);
+}
+
+void cui__syntax_colors(cui_ctx *ui, cui_color *c) {
+    cui__syntax_colors_ex(&ui->theme, ui->mode == CUI_THEME_DARK, c);
 }
 
 /* the highlighter by language name, for other components (the diff viewer) */

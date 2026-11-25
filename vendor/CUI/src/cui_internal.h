@@ -803,6 +803,7 @@ int cui__tokenize(const cui__lang *L, bool json, const char *s, int n, bool *in_
 /* The same, by language name as the code block takes it ("c", "py", "json"...). */
 int cui__tokenize_lang(const char *lang, const char *s, int n, bool *in_block, cui__tok *out, int cap);
 void cui__syntax_colors(cui_ctx *ui, cui_color *c);   /* CUI__TK_COUNT colors, by token kind */
+void cui__syntax_colors_ex(const cui_theme *t, bool dark, cui_color *c);   /* ui-free form, for audits */
 /* One line of code in the mono font at (x, y), highlighted when lang is set, stopping past
  * max_x; *in_block carries a block comment to the next line. Returns the x after it. */
 float cui__draw_code_line(cui_ctx *ui, const char *lang, const char *s, int n, bool *in_block, float x, float y, float size, const cui_color *colors, float max_x);

@@ -947,3 +947,24 @@ UI_PLAN P1 第三、五项落地（行号区打磨 + 选区/高亮层级）：
   top = s0 > als || als == 0；bot = s1 <= ale + 1（含选中换行的情形）。
 
 MSVC 构建通过；八项回归全绿。RDP 仍断开，视觉验证受限（同上批）。
+
+UI_PLAN P1 第四项落地（语法配色审查，P1 全部完成）：
+
+- 新增 scripts/audit_contrast.c：离线审查工具，进程内对 9 套风格
+  预设逐一套 cui__theme_build_ex 构建主题、按 cui_editor.c 同款公式
+  推导编辑器表面色，再调 cui__syntax_colors_ex 取真实 token 色，
+  计算 WCAG 对比度（阈值 4.5:1）与 token 间 OKLab 距离（阈值 0.07，
+  number/const 同色是设计意图、排除）。退出码 = 违规数，可挂 CI。
+- cui__syntax_colors 重构出 ui 无关的 _ex 版本（单一事实来源，审查
+  工具与运行时永不漂移）；ui 版变成一行包装。
+- 审查发现并修复（浅色 5 套风格各 3 项不达标，深色全部通过）：
+  - number/const：oklch 0.58→0.55 L（4.16-4.22 → 4.75-4.88:1）
+  - comment：浅色从沿用 TEXT_MUTED（4.19-4.22:1）改为专属灰蓝
+    oklch(0.53, 0.06, 255) = #546e8e（4.82-4.88:1）；与 punct 的
+    OKLab 距离 0.042→0.08+，可辨性同步解决。深色 comment 仍用
+    TEXT_MUTED（5.38-5.42:1 达标）。
+- 终态：9 套风格 × 10 种 token 0 failures、0 too-close pairs。
+  密度三档只改字号/行距，调色板同一套，可辨性结论直接适用。
+- 工具构建：cl /MD scripts/audit_contrast.c /I vendor/CUI/include
+  /I vendor/CUI/src /link cui.lib + win32 系统库（cui.lib 静态库按
+  /MD CRT 构建，缺 /MD 会报 __imp_cbrtf 未解析）。
