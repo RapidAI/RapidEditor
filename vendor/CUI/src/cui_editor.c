@@ -638,6 +638,7 @@ typedef struct {
     int base, first, count, nl;
     const int *ls;              /* starts of the lines in view and the one after */
     bool in_block, json, empty, focused, show_line, ro, guides;
+    int ws;                     /* whitespace glyphs: 0 off, 1 leading, 2 all */
     cui__lang lang;
     int tab, cursor, anchor, caret_line, caret_col;
     float caret_px;             /* caret in real text pixels, not grid columns */
@@ -657,6 +658,7 @@ typedef struct {
     cui_color colors[CUI__TK_COUNT];
     cui_color num, num_on, band, sel, match, match_edge, brk, brk_edge, caret, muted, line, bar;
     cui_color guide, guide_on;  /* indent guides; guide_on marks the caret's line */
+    cui_color ws_glyph, ws_end; /* whitespace glyphs; ws_end marks trailing */
     int vc0, vc1;               /* columns in view */
     const char *ghost;          /* inline suggestion drawn after the caret, or NULL */
     int ghost_len;
@@ -707,6 +709,48 @@ static void cui__ed_run(cui_ctx *ui, const cui__ed_paint *p, const char *s,
             cui__draw_text_line(ui, CUI_FONT_MONO, p->size, x0 + x2, y, c, s + i2, j2 - i2, true);
         x += cui__text_width(ui, CUI_FONT_MONO, p->size, s + i, j - i, true);
         i = j;
+    }
+}
+
+/* Whitespace glyphs: a mid dot per space, an arrow per tab. In leading mode
+ * the walk stops at the line's first text byte; otherwise every space and
+ * tab draws. The bytes after the last text byte count as trailing and draw
+ * in the warm end color (an all-whitespace line is all trailing). The x
+ * advances mirror the text runs, so glyphs sit exactly in their cells. */
+static void cui__ed_paint_ws(cui_ctx *ui, const cui__ed_paint *p, const char *s,
+                             int ls, int le, bool lead, float x0, float y) {
+    static const char dot[] = "\xc2\xb7", arrow[] = "\xe2\x86\x92";
+    float minx = (float)p->vc0 * p->cw;
+    float maxx = (float)(p->vc1 + 1) * p->cw;
+    int end = le;   /* first byte of the trailing whitespace, or le if none */
+    while (end > ls && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r')) end--;
+    float x = 0, stop = (float)p->tab * p->cw;
+    float dw = cui__text_width(ui, CUI_FONT_MONO, p->size, dot, 2, true);
+    for (int i = ls; i < le && !(lead && i >= end); ) {
+        if (s[i] == '\t') {
+            if (x >= minx - p->cw && x <= maxx)
+                cui__draw_text_line(ui, CUI_FONT_MONO, p->size, x0 + x + 0.5f, y,
+                                    i >= end ? p->ws_end : p->ws_glyph, arrow, 3, true);
+            x = (floorf(x / stop) + 1.0f) * stop;
+            i++;
+        } else if (s[i] == ' ') {
+            if (x >= minx - p->cw && x <= maxx)
+                cui__draw_text_line(ui, CUI_FONT_MONO, p->size, x0 + x + (p->cw - dw) * 0.5f, y,
+                                    i >= end ? p->ws_end : p->ws_glyph, dot, 2, true);
+            x += p->cw;
+            i++;
+        } else if (s[i] == '\r') {
+            i++;   /* a carriage return stays invisible */
+        } else {
+            int j = i;
+            while (j < le && s[j] != '\t' && s[j] != ' ' && s[j] != '\r') {
+                uint32_t cp;
+                int n = cui__utf8_decode(s + j, le - j, &cp);
+                j += n > 0 ? n : 1;
+            }
+            x += cui__text_width(ui, CUI_FONT_MONO, p->size, s + i, j - i, true);
+            i = j;
+        }
     }
 }
 
@@ -793,6 +837,10 @@ static void cui__paint_editor(cui_ctx *ui, cui_node *n, void *data) {
                                   CUI_CORNERS(0), gc);
             }
         }
+        /* whitespace glyphs: a dot per space, an arrow per tab; the app
+         * picks leading-only or all, trailing whitespace draws warm */
+        if (p->ws > 0 && le > ls)
+            cui__ed_paint_ws(ui, p, s, ls, le, p->ws == 1, x0, y + ty);
         /* the app's marks, behind the find matches */
         for (int m = 0; m < p->nmarks; m++) {
             const cui_text_mark *mk = &p->marks[m];
@@ -1571,6 +1619,7 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     p->ro = E->ro;
     p->empty = E->len == 0;
     p->guides = !f->o->no_indent_guides;
+    p->ws = f->o->show_whitespace;
     p->placeholder = f->o->placeholder;
     p->size = f->size; p->lh = lh; p->cw = cw; p->gutter = f->gutter;
     p->view_h = f->known ? f->br.h : 0;
@@ -1635,6 +1684,8 @@ static void cui__edf_build_lines(cui__edf *f, const cui__lang *L, bool json, boo
     p->line = CUI_C(ui, BORDER);
     p->guide = cui_alpha(fg, dark ? 0.11f : 0.08f);
     p->guide_on = cui_alpha(acc, dark ? 0.45f : 0.38f);
+    p->ws_glyph = cui_alpha(fg, dark ? 0.30f : 0.24f);
+    p->ws_end = cui_alpha(cui_oklch(0.62f, 0.16f, 35, 1), dark ? 0.45f : 0.40f);
     p->bar = ui->accent == CUI_ACCENT_NEUTRAL ? fg : CUI_C(ui, ACCENT);
     /* the scrollbars show while scrolling, while hovered or held */
     bool recent = st->last_activity > 0 && ui->time - st->last_activity < 0.9;

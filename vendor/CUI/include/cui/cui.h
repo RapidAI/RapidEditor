@@ -1761,6 +1761,7 @@ typedef struct cui_code_editor_opts {
     bool read_only;
     bool no_line_numbers;      /* hides the gutter of line numbers */
     bool no_indent_guides;     /* hides the vertical indentation guides */
+    int show_whitespace;       /* 0 off, 1 the leading whitespace only, 2 all */
     bool autofocus;
     const char *placeholder;   /* shown while the text is empty */
     const cui_text_mark *marks;   /* ranges to highlight (search results, regex matches), sorted by start */
