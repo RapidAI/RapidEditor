@@ -1849,6 +1849,33 @@ static int np_replace_all(notepad *a) {
 static void np_splice(notepad *a, np_doc *d, int s, int e,
                       const char *ins, size_t n);
 
+/* Replace the first match at or after the caret (wrapping once to the
+ * top), then move the caret past the inserted text so the next call
+ * finds the following match. np_splice writes through the editor's undo
+ * history, so one Ctrl+Z reverts one replacement. */
+static bool np_replace_next(notepad *a) {
+    np_doc *d = np_cur(a);
+    if (!d || d->is_hex) return false;
+    size_t qlen = strlen(a->find_query);
+    if (!qlen) return false;
+    size_t n = (size_t)d->len;
+    if (n < qlen) return false;
+    int start = NP_MAX(0, NP_MIN(d->caret, (int)n));
+    for (int pass = 0; pass < 2; pass++) {
+        int lo = pass == 0 ? start : 0;
+        int hi = pass == 0 ? (int)(n - qlen) + 1 : start;
+        for (int i = lo; i < hi; i++) {
+            if (np_match(d->text + i, a->find_query, qlen, a->match_case) &&
+                np_word_edge(d->text, n, (size_t)i, qlen, a->find_word)) {
+                np_splice(a, d, i, i + (int)qlen, a->replace_with,
+                          strlen(a->replace_with));
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void np_insert_at_caret(notepad *a, const char *ins) {
     np_doc *d = np_cur(a);
     if (!d) return;
@@ -3066,6 +3093,12 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             if (cui_button(ui, "查找", .variant = CUI_BUTTON_GHOST)) {
                 a->dlg_replace = false;
                 np_open_find(a);
+            }
+            if (cui_button(ui, "替换", .variant = CUI_BUTTON_GHOST,
+                           .disabled = !a->find_query[0])) {
+                if (!np_replace_next(a))
+                    np_toast(a, "没有找到匹配", "文档中没有可替换的匹配",
+                             CUI_TONE_INFO);
             }
             if (cui_button(ui, "全部替换", .variant = CUI_BUTTON_PRIMARY,
                            .disabled = !a->find_query[0])) {

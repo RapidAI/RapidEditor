@@ -832,3 +832,20 @@ np_hex_find_run 命中后补一遍全扫统计：toast 文案升级为
 约 0.2 s，只在命中时做，可接受。
 
 MSVC 构建通过；七项回归全绿。
+
+## 替换下一个（第三十二批）
+
+「查找和替换」对话框此前只有「全部替换」——逐个确认的替换流程
+缺失（EditPlus / VS Code 的标配）。
+
+- `np_replace_next`：从光标处向后找第一个匹配（尊重 match_case /
+  find_word，与全部替换同一谓词），命中即 np_splice 替换——splice
+  写入编辑器 undo 历史，一次 Ctrl Z 回退一处替换；替换后光标落在
+  插入文本之后，下一次调用自然找到再下一个。两段扫描支持 wrap
+  到文首。
+- 对话框 footer 在「查找」与「全部替换」之间加「替换」按钮
+  （ghost，查询为空时禁用）；找不到匹配 toast 提示。
+- 定义位置注意：np_splice 的前向声明在 np_replace_all 之后，
+  np_replace_next 必须放在声明之后（否则 implicit declaration）。
+
+MSVC 构建通过；七项回归全绿。
