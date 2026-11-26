@@ -130,6 +130,12 @@ static int test_byte_flow(void) {
     CHECK(h->u.byte.offset == 1 && h->u.byte.len == 2 && h->u.byte.bytes_len == 2);
     CHECK(h->u.byte.bytes[0] == 0xCA && h->u.byte.bytes[1] == 0xFE);
 
+    /* 回归：值带 0x 前缀（曾是 '0'+'x' 凑不成对 → 静默产出 0x00 单字节） */
+    CHECK(np_composer_submit(c, "0x1 改成 0xCA 0xFE") == NP_SUBMIT_OK);
+    h = np_patch_set_hunk(np_composer_patch(c), 0);
+    CHECK(h != NULL && h->u.byte.offset == 1 && h->u.byte.bytes_len == 2);
+    CHECK(h->u.byte.bytes[0] == 0xCA && h->u.byte.bytes[1] == 0xFE);
+
     char why[200];
     CHECK(np_composer_verify_citations(c, why, sizeof(why)));
 

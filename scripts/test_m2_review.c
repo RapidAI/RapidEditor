@@ -141,6 +141,27 @@ static int test_byte_flow(void) {
         np_review_destroy(rv3);
     }
 
+    /* M3/B1 → B3 汇合：np_review_import_byte 从字节轨 patch_set 导入 */
+    {
+        np_review_t *rv4 = np_review_create(NP_TRACK_BINARY, 0);
+        np_patch_set_t *ps4 = np_patch_set_create(0);
+        CHECK(ps4 != NULL);
+        CHECK(np_patch_add_byte(ps4, NP_OP_REPLACE, 8, 7,
+                                (const unsigned char *)"IMPORTD", 7) == NP_PATCH_OK);
+        CHECK(np_patch_add_byte(ps4, NP_OP_INSERT, 0, 0,
+                                (const unsigned char *)"AA", 2) == NP_PATCH_OK);
+        /* 头 8 字节保护区：两个 hunk 都导入；插入 @0 扩进保护区 → 标红 */
+        CHECK(np_review_import_byte(rv4, ps4, &sig, 1) == 2);
+        CHECK(np_review_count(rv4) == 2);
+        /* 保护区 hunk 标红不可提交 */
+        int blocked = 0;
+        for (size_t i = 0; i < np_review_count(rv4); ++i)
+            if (np_review_hunk(rv4, i)->guard_blocked) blocked++;
+        CHECK(blocked == 1);
+        np_patch_set_destroy(ps4);
+        np_review_destroy(rv4);
+    }
+
     np_bytepatch_destroy(bp);
     np_review_destroy(rv);
     return 0;

@@ -42,6 +42,9 @@ int np_plan_ui_selected_table(const np_plan_ui_t *pu);
 /* 选中表的上下文片段（写入 buf，返回长度）。 */
 size_t np_plan_ui_snippet(const np_plan_ui_t *pu, char *buf, size_t cap);
 
+/* 选中节点的 Citation 串（B5: file#表/列；无选中返回 false）。 */
+bool np_plan_ui_citation(const np_plan_ui_t *pu, char *buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

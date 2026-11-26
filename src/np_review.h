@@ -55,6 +55,11 @@ void np_review_destroy(np_review_t *rv);
 /* 从 patch set 导入全部文本 hunk（复制）。返回导入数。 */
 size_t np_review_import_text(np_review_t *rv, const np_patch_set_t *ps);
 
+/* 从字节轨 patch set 导入全部字节 hunk（复制；逐 hunk 过 H2 保护区预检）。
+ * prot 可为 NULL。返回导入数。 */
+size_t np_review_import_byte(np_review_t *rv, const np_patch_set_t *ps,
+                             const np_protected_t *prot, size_t nprot);
+
 /* 从字节编辑会话导入单个字节操作（H1 splice 描述）。 */
 bool np_review_add_byte(np_review_t *rv, size_t off, size_t len,
                         const unsigned char *bytes, size_t bytes_len,

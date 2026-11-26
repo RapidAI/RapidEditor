@@ -142,6 +142,15 @@ size_t np_plan_ui_snippet(const np_plan_ui_t *pu, char *buf, size_t cap) {
     return strlen(buf);
 }
 
+bool np_plan_ui_citation(const np_plan_ui_t *pu, char *buf, size_t cap) {
+    if (!pu || !buf || cap == 0 || pu->cite_str[0] == '\0') {
+        if (buf && cap) buf[0] = '\0';
+        return false;
+    }
+    snprintf(buf, cap, "%s", pu->cite_str);
+    return true;
+}
+
 np_planui_action_t np_plan_ui_draw(np_plan_ui_t *pu, cui_ctx *ui) {
     if (!pu) return NP_PLANUI_NONE;
     np_planui_action_t act = NP_PLANUI_NONE;

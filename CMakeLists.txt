@@ -77,8 +77,8 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                src/np_sqlite.c src/np_review.c src/np_review_panel.c
                # M4 B2计划卡 + F3 schema 树汇合（模型无 CUI，UI 独立文件）
                src/np_plancard.c src/np_plancard_ui.c
-               # M3 B1 Composer → Job → PatchSet（模型无 CUI，UI 后续接线）
-               src/np_composer.c)
+               # M3 B1 Composer → Job → PatchSet（模型无 CUI，UI 独立文件）
+               src/np_composer.c src/np_composer_ui.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)

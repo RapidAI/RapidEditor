@@ -39,6 +39,7 @@
 #include "np_openai.h"
 #include "np_review_panel.h"   /* M2/B3: 统一 Patch Review 面板 */
 #include "np_plancard_ui.h"    /* M4/B2: 计划卡面板（X2 工具路由 + F3 schema 树） */
+#include "np_composer_ui.h"    /* M3/B1: AI 工作台（意图表单 → Job 卡 → B3） */
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -532,6 +533,7 @@ typedef struct notepad {
     bool show_ai;                   /* AI assistant docked as a side panel */
     bool show_review;               /* B3 补丁审查面板（与 AI 面板互斥显示） */
     bool show_plan;                 /* B2 计划卡面板（X2 路由预告 + F3 schema 树） */
+    bool show_workbench;            /* B1 AI 工作台（Composer 意图表单） */
     bool review_allow_write;        /* H8 写入开关持久位（每文件独立由面板管理） */
     bool zen_prev_ai;
     int  last_active;               /* to make the directory pane follow tab switches */
@@ -539,6 +541,7 @@ typedef struct notepad {
     float ai_ratio;                 /* workspace share when the AI panel is docked */
     float review_ratio;             /* workspace share when the review panel is docked */
     float plan_ratio;               /* workspace share when the plan card is docked */
+    float workbench_ratio;          /* workspace share when the workbench is docked */
     int  side_tab, out_tab;         /* 目录/文档/最近 · 查找结果/消息 */
     char side_dir[NP_PATH_CAP];
     bool side_reload;               /* rebuild the sidebar tree next frame */
@@ -843,6 +846,8 @@ static bool np_ai_apply(notepad *a);
 static void np_llm_models_start(notepad *a, int prov_idx);
 static void np_llm_test_start(notepad *a, int prov_idx);
 static void np_ai_quick(notepad *a, int task);
+static size_t np_hexdump_snippet(const unsigned char *p, size_t n,
+                                 char *out, size_t cap);
 static void np_ai_fix_compile(notepad *a);
 static void np_sem_start(notepad *a);
 static void np_config_save(notepad *a);
@@ -4583,6 +4588,7 @@ static bool np_ai_is_rewrite(int task) {
  * out of the workers means all three backends describe the same content. */
 static void np_ai_context_label(const np_doc *d, char *out, size_t cap) {
     if (!d) { snprintf(out, cap, "文本"); return; }
+    if (d->is_hex) { snprintf(out, cap, "二进制（hexdump 字节片段）"); return; }
     if (np_doc_is_latex(d)) snprintf(out, cap, "LaTeX 源码");
     else if (np_doc_is_markdown(d)) snprintf(out, cap, "Markdown 文档");
     else if (d->lang == np_lang_index("json")) snprintf(out, cap, "JSON 数据");
@@ -4635,12 +4641,25 @@ static void np_ai_refresh_sources(notepad *a) {
                        "--- 其他已打开标签页 ---\n");
         for (int i = 0; i < a->count; i++) {
             np_doc *t = a->docs[i];
-            if (!t || t == cur || t->is_hex || !t->text) continue;
+            if (!t || t == cur || !t->text) continue;
             if (t->path[0] && np_ignore_check(ign_root, "", np_base(t->path), false)) {
                 nign++;              /* private file: never send it to the AI */
                 continue;
             }
             const char *name = t->path[0] ? t->path : t->tab_title;
+            if (t->is_hex) {
+                /* 二进制轨标签页：贡献带偏移的 hexdump 字节片段（M3 按轨路由） */
+                size_t hn = (size_t)t->len < 256 ? (size_t)t->len : 256;
+                char hx[4096];
+                np_hexdump_snippet((const unsigned char *)t->text, hn,
+                                   hx, sizeof hx);
+                o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
+                               "【%s】(二进制 · 前 %zu 字节)\n%s\n",
+                               name, hn, hx);
+                ntabs++;
+                if (o >= sizeof a->ai_ctx_sources - 256) { cut = true; break; }
+                continue;
+            }
             size_t n = strlen(t->text);
             if (n > 4000) { n = 4000; cut = true; }
             o = np_ctx_app(a->ai_ctx_sources, sizeof a->ai_ctx_sources, o,
@@ -5060,10 +5079,64 @@ static void np_llm_test_start(notepad *a, int prov_idx) {
 }
 
 /* Prepare and launch an AI request from the dialog state. */
+/* 按轨路由（M3 清理）：二进制文档的 AI 不再一刀切跳过 —— 只读任务
+ * （解释/检查/自定义回答）照常可用，上下文用带偏移的 hexdump 片段；
+ * 改写/补全类任务没有文本编辑器落点，引导走 AI 工作台 → B3 审查。 */
+static size_t np_hexdump_snippet(const unsigned char *p, size_t n,
+                                 char *out, size_t cap) {
+    /* 每行最多 8("0x%04zX:") + 16*3(hex) + 3("  |") + 16(ASCII) + 2("|\n")
+     * ≈ 77 字节 + NUL。所有写入前先验剩余空间，杜绝 o 越过 cap。
+     * （旧实现的 `o < cap - 80` 只在行首检查、ASCII 区 break 后仍无条件
+     * 写 '|''\n'，cap 小或行中溢出时会 out[cap] 越界写一字节。） */
+    size_t o = 0;
+    if (!out || cap < 16) { if (out && cap) out[0] = 0; return 0; }
+    size_t rows = (n + 15) / 16;
+    for (size_t r = 0; r < rows; ++r) {
+        size_t from = r * 16;
+        size_t to = NP_MIN(from + 16, n);
+        int w = snprintf(out + o, cap - o, "0x%04zX:", from);
+        if (w <= 0) break;
+        o += (size_t)w;
+        if (o >= cap) o = cap - 1;   /* snprintf 截断时 w 是"本应写入"长度 */
+        if (o + 1 >= cap) break;
+        for (size_t i = from; i < to; ++i) {
+            w = snprintf(out + o, cap - o, " %02X", p[i]);
+            if (w <= 0) goto done;
+            o += (size_t)w;
+            if (o >= cap) o = cap - 1;
+            if (o + 1 >= cap) goto done;
+        }
+        /* ASCII 区 + 行尾 "|" "\n" 至少要 4 字节余量（含 NUL） */
+        if (o + 4 >= cap) goto done;
+        w = snprintf(out + o, cap - o, "  |");
+        if (w <= 0) break;
+        o += (size_t)w;
+        if (o >= cap) o = cap - 1;
+        for (size_t i = from; i < to; ++i) {
+            unsigned char c = p[i];
+            if (o + 4 >= cap) break;   /* 剩余字符 + '|' + '\n' + NUL */
+            out[o++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+        }
+        out[o++] = '|';
+        out[o++] = '\n';
+    }
+done:
+    out[o] = 0;
+    return o;
+}
+
 static void np_ai_start(notepad *a) {
     if (a->ai_done == 1) return;                 /* already running */
     np_doc *d = np_cur(a);
-    if (!d || d->is_hex) return;
+    if (!d) return;
+    if (d->is_hex) {
+        if (np_ai_is_rewrite(a->ai_task) || a->ai_task == 5) {
+            np_toast(a, "二进制文档",
+                     "字节改动请走「AI 工作台」生成补丁并经补丁审查写入；此处仅支持解释/检查等只读任务",
+                     CUI_TONE_WARNING);
+            return;
+        }
+    }
     a->ai_cancel = false;
     a->ai_stream_len = 0;
     a->ai_staged[0] = 0;
@@ -5074,7 +5147,18 @@ static void np_ai_start(notepad *a) {
     int s0 = NP_MIN(d->caret, d->anchor), s1 = NP_MAX(d->caret, d->anchor);
     s0 = NP_MAX(0, NP_MIN(s0, d->len)); s1 = NP_MAX(s0, NP_MIN(s1, d->len));
     bool src_truncated = false;
-    if (a->ai_task == 5) {
+    if (d->is_hex) {
+        /* 二进制轨上下文：带偏移的 hexdump（选区优先，否则头 4KB）。
+         * 结果只作回答展示，不回写 —— 见 np_ai_apply 的按轨路由。 */
+        size_t from = (a->ai_ctx == 0 && s1 > s0) ? (size_t)s0 : 0;
+        size_t to = (a->ai_ctx == 0 && s1 > s0) ? (size_t)s1
+                                                : (size_t)NP_MIN(d->len, 4096);
+        if (to > from + 4096) { to = from + 4096; src_truncated = true; }
+        np_hexdump_snippet((const unsigned char *)d->text + from, to - from,
+                           a->ai_orig, sizeof a->ai_orig);
+        a->ai_target_s = (int)from;
+        a->ai_target_e = (int)to;
+    } else if (a->ai_task == 5) {
         /* Completion: feed the text around the caret, and insert the result
          * AT THE CARET. Using s0 here would insert at the selection's start
          * when the user selected backwards/forwards and then asked to
@@ -5103,8 +5187,9 @@ static void np_ai_start(notepad *a) {
         a->ai_target_e = src_truncated ? (int)n : d->len;
     }
     if (src_truncated)
-        np_toast(a, "内容超过 64 KB",
-                 "仅发送前 64 KB；结果只会替换已发送的部分，其余内容保留。建议缩小选区。",
+        np_toast(a, d->is_hex ? "字节数超限" : "内容超过 64 KB",
+                 d->is_hex ? "仅发送部分字节的 hexdump；建议缩小选区。"
+                           : "仅发送前 64 KB；结果只会替换已发送的部分，其余内容保留。建议缩小选区。",
                  CUI_TONE_WARNING);
     snprintf(a->ai_target_path, sizeof a->ai_target_path, "%s", d->path);
     a->ai_target_uid = d->uid;
@@ -5194,8 +5279,15 @@ static bool np_ai_apply(notepad *a) {
     for (int i = 0; i < a->count; i++) {
         if (a->docs[i] && a->docs[i]->uid == a->ai_target_uid) { d = a->docs[i]; break; }
     }
-    if (!d || d->is_hex || d != np_cur(a)) {
+    if (!d || d != np_cur(a)) {
         np_toast(a, "文档已切换", "AI 结果对应的文档不再是当前标签，已取消写入", CUI_TONE_WARNING);
+        return false;
+    }
+    if (d->is_hex) {
+        /* 按轨路由：二进制改动不直接写，引导走 AI 工作台 → B3 审查 */
+        np_toast(a, "二进制文档",
+                 "字节改动请走「AI 工作台」→「送入补丁审查」，经人工确认后写入",
+                 CUI_TONE_WARNING);
         return false;
     }
     if (d->content_rev != a->ai_target_rev || d->len != a->ai_target_len) {
@@ -8315,6 +8407,10 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             if (flags & CUI_SUBMITTED) np_hex_do_goto(a);
             if (cui_button(ui, "跳转", .size = CUI_SIZE_SM)) np_hex_do_goto(a);
             cui_spacer(ui);
+            if (cui_button(ui, "AI 解释选区", .size = CUI_SIZE_SM,
+                           .icon = CUI_ICON_SPARKLES,
+                           .tooltip = "把当前字节选区的 hexdump 发给 AI 解释（只读，不写入）"))
+                np_ai_quick(a, 3);
             if (cui_button(ui, d->bt_name[0] ? "模板…" : "应用模板…",
                            .size = CUI_SIZE_SM, .icon = CUI_ICON_CODE)) {
                 a->dlg_bt = true;
@@ -9950,14 +10046,29 @@ static void np_cmd_run(notepad *a, int i) {
     }
 }
 
-/* ---- B3 补丁审查面板接线（M2）：主程序只做绑定与写回，逻辑在面板内 ---- */
+/* ---- B3 补丁审查面板接线（M2/M3）：主程序只做绑定与写回，逻辑在面板内 ----
+ * M3 起双轨：文本轨 hunk 来自 Composer 注入，写回走编辑器（Ctrl+Z 可撤销）；
+ * 字节轨保持 M2 行为（捕获选区 + 单一撤销组）。 */
 static void np_review_write_back(notepad *a, np_doc *d,
                                  const unsigned char *data, size_t n) {
-    if (!d || !d->is_hex || !data) return;
+    if (!d || !data) return;
     if (!np_ensure_cap(d, n + 2)) return;
-    memcpy(d->text, data, n);
-    d->text[n] = 0;
-    d->len = (int)n;
+    if (d->is_hex) {
+        memcpy(d->text, data, n);
+        d->text[n] = 0;
+        d->len = (int)n;
+    } else {
+        /* 文本轨：整体替换经编辑器执行，保持 CUI delta history 有效
+         * （直接 memcpy 会让下一次 Ctrl+Z 编辑到错误位置，见 np_ai_apply）。 */
+        int applied_len = d->len;
+        if (!cui_code_editor_replace_external(a->ui, d->editor_id,
+                                              d->text, d->cap, d->len,
+                                              0, d->len, (const char *)data,
+                                              (int)n, &applied_len) ||
+            applied_len != (int)n)
+            return;
+        d->len = applied_len;
+    }
     d->file_size = n;
     d->dirty = true;
     d->rev++;
@@ -9968,19 +10079,22 @@ static void np_review_write_back(notepad *a, np_doc *d,
 
 static void np_review_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
     np_review_ui_t *rui = np_review_ui_get();
-    if (d && d->is_hex && d->len > 0) {
-        np_review_ui_bind(rui, d->path, (const unsigned char *)d->text,
-                          (size_t)d->len, a->review_allow_write);
-        np_review_ui_set_selection(rui, d->hexsel.start, d->hexsel.length);
+    if (d && d->len > 0) {
+        np_review_ui_bind_ex(rui, d->path, (const unsigned char *)d->text,
+                             (size_t)d->len, a->review_allow_write,
+                             d->is_hex ? NP_TRACK_BINARY : NP_TRACK_TEXT);
+        if (d->is_hex)
+            np_review_ui_set_selection(rui, d->hexsel.start, d->hexsel.length);
     } else {
-        np_review_ui_bind(rui, "", NULL, 0, a->review_allow_write);
+        np_review_ui_bind_ex(rui, "", NULL, 0, a->review_allow_write,
+                             NP_TRACK_BINARY);
     }
     np_rvui_action_t act = np_review_ui_draw(rui, ui);
     if (act == NP_RVUI_CLOSED) {
         a->show_review = false;
         return;
     }
-    if ((act == NP_RVUI_APPLY || act == NP_RVUI_UNDO) && d && d->is_hex) {
+    if ((act == NP_RVUI_APPLY || act == NP_RVUI_UNDO) && d && d->len > 0) {
         size_t n = 0;
         const unsigned char *nd = np_review_ui_data(rui, &n);
         if (nd) {
@@ -9988,6 +10102,42 @@ static void np_review_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
                     act == NP_RVUI_APPLY ? "补丁已应用" : "补丁已撤销",
                     np_base(d->path), n);
             np_review_write_back(a, d, nd, n);
+        }
+    }
+}
+
+/* ---- B1 AI 工作台接线（M3）：意图表单 → Job 卡 → 送入 B3 ---- */
+static void np_composer_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
+    np_composer_ui_t *cpu = np_composer_ui_get();
+    np_track_t track = (d && d->is_hex) ? NP_TRACK_BINARY : NP_TRACK_TEXT;
+    if (d && d->len > 0) {
+        size_t off0, off1;
+        if (d->is_hex) {
+            off0 = (size_t)d->hexsel.start;
+            off1 = off0 + (size_t)d->hexsel.length;
+        } else {
+            off0 = (size_t)NP_MIN(d->caret, d->anchor);
+            off1 = (size_t)NP_MAX(d->caret, d->anchor);
+        }
+        np_composer_ui_bind(cpu, d->path, track, d->rev,
+                            (const unsigned char *)d->text, (size_t)d->len);
+        np_composer_ui_set_selection(cpu, off0, off1);
+    } else {
+        np_composer_ui_bind(cpu, "", track, 0, NULL, 0);
+    }
+    np_cpui_action_t act = np_composer_ui_draw(cpu, ui);
+    if (act == NP_CPUI_CLOSED) {
+        a->show_workbench = false;
+        return;
+    }
+    if (act == NP_CPUI_SEND_REVIEW && d) {
+        const np_patch_set_t *ps = np_composer_ui_patch(cpu);
+        if (ps) {
+            /* 面板立即深拷贝（与 Composer 生命周期解耦），同源文档才导入 */
+            np_review_ui_inject_text(np_review_ui_get(), ps, d->path);
+            a->show_workbench = false;
+            a->show_review = true;      /* 自动弹出 B3 审查 */
+            np_logf(a, "补丁已送入审查 · %s", np_base(d->path));
         }
     }
 }
@@ -10534,6 +10684,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "AI 助手", .icon = CUI_ICON_SPARKLES,
                                   .checked = a->show_ai))
                     a->show_ai = !a->show_ai;
+                if (cui_menu_item(ui, "AI 工作台（任务表单）", .icon = CUI_ICON_SPARKLES,
+                                  .checked = a->show_workbench))
+                    a->show_workbench = !a->show_workbench;
                 if (cui_menu_item(ui, "maclaw 官方服务登录…", .icon = CUI_ICON_SPARKLES))
                     a->dlg_maclaw = true;
                 cui_menu_separator(ui);
@@ -10949,6 +11102,23 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_split_next(ui);
                 np_ai_panel(ui, a, d);
             }
+        } else if (a->show_workbench) {
+            /* B1 AI 工作台 dock（Composer 意图表单；与 AI/计划卡/审查面板互斥） */
+            cui_split(ui, "np_wb_split", &a->workbench_ratio,
+                      .min_first = 400, .min_second = 260) {
+                if (a->show_sidebar) {
+                    cui_split(ui, "np_main_split", &a->side_ratio,
+                              .min_first = 175, .min_second = 400) {
+                        np_sidebar(ui, a);
+                        cui_split_next(ui);
+                        d = np_workspace(ui, a, busy);
+                    }
+                } else {
+                    d = np_workspace(ui, a, busy);
+                }
+                cui_split_next(ui);
+                np_composer_panel_dock(ui, a, d);
+            }
         } else if (a->show_plan) {
             /* B2 计划卡面板 dock（与 AI/审查面板互斥：show_ai > show_plan > show_review） */
             cui_split(ui, "np_plan_split", &a->plan_ratio,
@@ -11230,6 +11400,7 @@ int main(int argc, char **argv) {
     g.ai_ratio = 0.72f;
     g.review_ratio = 0.72f;
     g.plan_ratio = 0.72f;
+    g.workbench_ratio = 0.72f;
     g.inline_delay = 1;
     g.out_ratio = 0.76f;
     g.side_tab = 0;

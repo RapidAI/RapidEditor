@@ -205,7 +205,12 @@ static bool parse_byte_intent(const char *s, size_t *off,
     while (*q && n < NP_COMPOSER_MAX_BYTES) {
         int hi = hex_digit((unsigned char)*q);
         if (hi < 0) { ++q; continue; }
-        if (hex_digit((unsigned char)q[1]) < 0) break;
+        if (hex_digit((unsigned char)q[1]) < 0) {
+            /* "0x"/"0X" 前缀 token：跳过而不是终止（"改成 0x90 EA"
+             * 否则 '0' 与 'x' 凑不成对 → 静默产出错误字节） */
+            if (hi == 0 && (q[1] == 'x' || q[1] == 'X')) { q += 2; continue; }
+            break;
+        }
         int lo = hex_digit((unsigned char)q[1]);
         bytes[n++] = (unsigned char)((hi << 4) | lo);
         q += 2;

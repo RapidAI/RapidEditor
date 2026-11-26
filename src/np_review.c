@@ -134,6 +134,24 @@ size_t np_review_import_text(np_review_t *rv, const np_patch_set_t *ps) {
     return imported;
 }
 
+size_t np_review_import_byte(np_review_t *rv, const np_patch_set_t *ps,
+                             const np_protected_t *prot, size_t nprot) {
+    if (!rv || !ps || rv->track != NP_TRACK_BINARY) return 0;
+    size_t n = np_patch_set_count(ps);
+    size_t imported = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const np_patch_hunk_t *h = np_patch_set_hunk(ps, i);
+        if (!h || h->track != NP_TRACK_BINARY) continue;
+        const unsigned char *bytes =
+            (h->op != NP_OP_DELETE && h->u.byte.bytes) ? h->u.byte.bytes : NULL;
+        size_t blen = bytes ? h->u.byte.bytes_len : 0;
+        if (np_review_add_byte(rv, h->u.byte.offset, h->u.byte.len,
+                               bytes, blen, prot, nprot))
+            imported++;
+    }
+    return imported;
+}
+
 bool np_review_add_byte(np_review_t *rv, size_t off, size_t len,
                         const unsigned char *bytes, size_t bytes_len,
                         const np_protected_t *prot, size_t nprot) {
