@@ -38,6 +38,7 @@
 #include "np_maclaw.h"
 #include "np_openai.h"
 #include "np_review_panel.h"   /* M2/B3: 统一 Patch Review 面板 */
+#include "np_plancard_ui.h"    /* M4/B2: 计划卡面板（X2 工具路由 + F3 schema 树） */
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -530,12 +531,14 @@ typedef struct notepad {
     bool show_sidebar, show_output, follow_active;
     bool show_ai;                   /* AI assistant docked as a side panel */
     bool show_review;               /* B3 补丁审查面板（与 AI 面板互斥显示） */
+    bool show_plan;                 /* B2 计划卡面板（X2 路由预告 + F3 schema 树） */
     bool review_allow_write;        /* H8 写入开关持久位（每文件独立由面板管理） */
     bool zen_prev_ai;
     int  last_active;               /* to make the directory pane follow tab switches */
     float side_ratio, out_ratio;    /* first pane's share of each split */
     float ai_ratio;                 /* workspace share when the AI panel is docked */
     float review_ratio;             /* workspace share when the review panel is docked */
+    float plan_ratio;               /* workspace share when the plan card is docked */
     int  side_tab, out_tab;         /* 目录/文档/最近 · 查找结果/消息 */
     char side_dir[NP_PATH_CAP];
     bool side_reload;               /* rebuild the sidebar tree next frame */
@@ -9989,6 +9992,19 @@ static void np_review_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
     }
 }
 
+/* ---- B2 计划卡面板接线（M4）：主程序只做绑定，逻辑在面板内 ---- */
+static void np_plan_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
+    (void)a;
+    np_plan_ui_t *pui = np_plan_ui_get();
+    if (d && d->len > 0)
+        np_plan_ui_bind(pui, d->path, (const unsigned char *)d->text,
+                        (size_t)d->len);
+    else
+        np_plan_ui_bind(pui, "", NULL, 0);
+    if (np_plan_ui_draw(pui, ui) == NP_PLANUI_CLOSED)
+        a->show_plan = false;
+}
+
 static void np_frame(cui_ctx *ui, void *user) {
     notepad *a = (notepad *)user;
     a->ui = ui;
@@ -10544,6 +10560,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "补丁审查面板", .icon = CUI_ICON_EYE,
                                   .checked = a->show_review))
                     a->show_review = !a->show_review;
+                if (cui_menu_item(ui, "计划卡面板", .icon = CUI_ICON_SPARKLES,
+                                  .checked = a->show_plan))
+                    a->show_plan = !a->show_plan;
                 if (cui_menu_item(ui, "目录跟随当前文件", .icon = CUI_ICON_BOOKMARK,
                                   .checked = a->follow_active))
                     a->follow_active = !a->follow_active;
@@ -10930,6 +10949,23 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_split_next(ui);
                 np_ai_panel(ui, a, d);
             }
+        } else if (a->show_plan) {
+            /* B2 计划卡面板 dock（与 AI/审查面板互斥：show_ai > show_plan > show_review） */
+            cui_split(ui, "np_plan_split", &a->plan_ratio,
+                      .min_first = 400, .min_second = 260) {
+                if (a->show_sidebar) {
+                    cui_split(ui, "np_main_split", &a->side_ratio,
+                              .min_first = 175, .min_second = 400) {
+                        np_sidebar(ui, a);
+                        cui_split_next(ui);
+                        d = np_workspace(ui, a, busy);
+                    }
+                } else {
+                    d = np_workspace(ui, a, busy);
+                }
+                cui_split_next(ui);
+                np_plan_panel_dock(ui, a, d);
+            }
         } else if (a->show_review) {
             /* B3 补丁审查面板 dock 在最右（与 AI 面板互斥：show_ai 优先） */
             cui_split(ui, "np_review_split", &a->review_ratio,
@@ -11193,6 +11229,7 @@ int main(int argc, char **argv) {
     g.side_ratio = 0.22f;
     g.ai_ratio = 0.72f;
     g.review_ratio = 0.72f;
+    g.plan_ratio = 0.72f;
     g.inline_delay = 1;
     g.out_ratio = 0.76f;
     g.side_tab = 0;

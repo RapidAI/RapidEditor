@@ -85,7 +85,9 @@ $tests = @(
     @{ name = "test_s1_toolinstall"; src = "scripts\test_s1_toolinstall.c"; link = @("src\np_toolinstall.c","src\np_toolchain.c","src\np_integrity.c") },
     @{ name = "test_s1_skillmgr";  src = "scripts\test_s1_skillmgr.c";  link = @("src\np_skillmgr.c","src\np_texttools.c","src\np_capability.c","src\np_patch.c","src\np_job.c","src\np_integrity.c") },
     @{ name = "test_m1_sqlite";    src = "scripts\test_m1_sqlite.c";    link = @("src\np_sqlite.c","src\np_probe.c"); runIn = "repo" },
-    @{ name = "test_m2_review";    src = "scripts\test_m2_review.c";    link = @("src\np_review.c","src\np_patch.c","src\np_bytepatch.c","src\np_filesafety.c","src\np_integrity.c","src\np_job.c") }
+    @{ name = "test_m2_review";    src = "scripts\test_m2_review.c";    link = @("src\np_review.c","src\np_patch.c","src\np_bytepatch.c","src\np_filesafety.c","src\np_integrity.c","src\np_job.c") },
+    @{ name = "test_m4_plancard";  src = "scripts\test_m4_plancard.c";  link = @("src\np_plancard.c","src\np_texttools.c","src\np_capability.c","src\np_patch.c","src\np_job.c","src\np_probe.c","src\np_sqlite.c","src\np_toolinstall.c","src\np_toolchain.c","src\np_integrity.c","src\np_citation.c"); runIn = "repo" },
+    @{ name = "test_m3_composer";  src = "scripts\test_m3_composer.c";  link = @("src\np_composer.c","src\np_review.c","src\np_patch.c","src\np_bytepatch.c","src\np_filesafety.c","src\np_integrity.c","src\np_job.c","src\np_capability.c","src\np_texttools.c","src\np_context.c","src\np_citation.c"); runIn = "repo" }
 )
 
 $fail = 0

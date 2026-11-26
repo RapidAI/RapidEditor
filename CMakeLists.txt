@@ -74,7 +74,11 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                src/np_context.c src/np_citation.c src/np_index.c
                # S1 工作流：探测路由 + 工具链自动供给 + Skill/MCP 管理 + 原生文本工具
                src/np_probe.c src/np_toolinstall.c src/np_skillmgr.c src/np_texttools.c
-               src/np_sqlite.c src/np_review.c src/np_review_panel.c)
+               src/np_sqlite.c src/np_review.c src/np_review_panel.c
+               # M4 B2计划卡 + F3 schema 树汇合（模型无 CUI，UI 独立文件）
+               src/np_plancard.c src/np_plancard_ui.c
+               # M3 B1 Composer → Job → PatchSet（模型无 CUI，UI 后续接线）
+               src/np_composer.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)
