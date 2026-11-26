@@ -90,6 +90,7 @@ $tests = @(
     @{ name = "test_h7_bytediff";   src = "scripts\test_h7_bytediff.c";   link = @("src\np_bytediff.c","src\np_integrity.c") },
     @{ name = "test_x9_searchprofile"; src = "scripts\test_x9_searchprofile.c"; link = @("src\np_searchprofile.c"); runIn = "repo" },
     @{ name = "test_x6_mcp"; src = "scripts\test_x6_mcp.c"; link = @("src\np_mcp.c"); runIn = "repo" },
+    @{ name = "test_x10_kbidx"; src = "scripts\test_x10_kbidx.c"; link = @("src\np_kbidx.c", "src\np_searchprofile.c", "src\np_integrity.c"); runIn = "repo" },
     @{ name = "test_m2_review";    src = "scripts\test_m2_review.c";    link = @("src\np_review.c","src\np_patch.c","src\np_bytepatch.c","src\np_filesafety.c","src\np_integrity.c","src\np_job.c") },
     @{ name = "test_m4_plancard";  src = "scripts\test_m4_plancard.c";  link = @("src\np_plancard.c","src\np_texttools.c","src\np_capability.c","src\np_patch.c","src\np_job.c","src\np_probe.c","src\np_sqlite.c","src\np_toolinstall.c","src\np_toolchain.c","src\np_integrity.c","src\np_citation.c"); runIn = "repo" },
     @{ name = "test_m3_composer";  src = "scripts\test_m3_composer.c";  link = @("src\np_composer.c","src\np_review.c","src\np_patch.c","src\np_bytepatch.c","src\np_filesafety.c","src\np_integrity.c","src\np_job.c","src\np_capability.c","src\np_texttools.c","src\np_context.c","src\np_citation.c"); runIn = "repo" }

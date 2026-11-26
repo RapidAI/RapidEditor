@@ -88,6 +88,7 @@ size_t np_whitelist_load_builtin(np_whitelist_t *wl);
 
 bool np_whitelist_add(np_whitelist_t *wl, const np_tool_entry_t *e);
 const np_tool_entry_t *np_whitelist_find(const np_whitelist_t *wl, const char *id);
+const np_tool_entry_t *np_whitelist_at(const np_whitelist_t *wl, size_t i);
 size_t np_whitelist_count(const np_whitelist_t *wl);
 
 /* T2 hard rule: only HTTPS + whitelisted official domains. Returns true if

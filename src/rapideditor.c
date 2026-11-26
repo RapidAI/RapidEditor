@@ -47,6 +47,7 @@
 #include "np_bytediff.h"       /* H7: 字节 Diff（对照文件 → B3 审查） */
 #include "np_searchprofile.h"  /* X9: 可配置知识搜索接口（SearchProfile） */
 #include "np_mcp.h"            /* X6: MCP 工具服务器（动态发现/健康检查/不可信输出） */
+#include "np_kbidx.h"          /* X10: 混合知识索引与 Context Pack */
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -726,6 +727,43 @@ typedef struct notepad {
     /* X6: MCP 工具服务器 — 动态发现/健康检查（工具输出不可信） ----------- */
     np_mcp_store_t *mcp_store;          /* 配置注册表（懒加载） */
     bool dlg_mcp;                       /* 扩展管理器对话框 */
+
+    /* X10: 混合知识索引与 Context Pack ------------------------------- */
+    np_kb_store_t *kb_store;            /* 懒加载，存 kbindex.kb */
+    bool dlg_kb;                        /* 知识索引对话框 */
+    np_kb_doc_t kb_form;                /* 新增/编辑表单 */
+    int kb_edit;                        /* -1 无；-2 新增；>=0 索引 */
+    char kb_query[NP_KB_QUERY_CAP];     /* 检索词 */
+    bool kb_filter_on;                  /* 过滤器开关 */
+    char kb_f_allow[256];               /* 域名白名单 */
+    char kb_f_type[24];                 /* 来源类型 */
+    char kb_f_tag[64];                  /* 标签 */
+    int kb_f_minq;                      /* 最低质量 */
+    char kb_hits_show[2048];            /* 搜索结果展示缓冲 */
+    bool kb_search_done;
+    char kb_pack[NP_KB_PACK_CAP];       /* 生成的 Context Pack */
+    bool kb_pack_done;
+    np_kb_pack_stats_t kb_pack_stats;
+    int kb_budget;                      /* token 预算 */
+
+    /* T3/T4 UI: 分析工具安装入口（白名单下载+SHA-256+隔离安装） */
+    bool dlg_ti;
+    np_whitelist_t *ti_wl;              /* T2 白名单（懒加载内置表） */
+    np_platform_t ti_plat;              /* T1 平台探测（懒执行） */
+    bool ti_plat_done;
+    int ti_sel;                         /* 选中的白名单条目索引 */
+    char ti_sel_id[48];                 /* 选中 id 快照（worker 安全） */
+    char ti_bin_rel[260];               /* 包内可执行相对路径 */
+    bool ti_strip_root;                 /* 去掉 GitHub 常见顶层目录 */
+    volatile long ti_state;             /* 0=idle 1=running 2=done */
+    np_ti_zip_status_t ti_status;
+    np_ti_install_result_t ti_result;
+    char ti_err[512];
+    volatile long ti_hc_state;          /* 健康检查 0=idle 1=running 2=done */
+    char ti_version_arg[64];
+    np_ti_health_t ti_health;
+    bool ti_health_done;
+    char ti_pick_show[2048];            /* T7 降级链展示 */
     int  mcp_edit;                      /* -1 无表单 / -2 新增 / >=0 编辑索引 */
     np_mcp_server_t mcp_form;           /* 编辑缓冲 */
     char mcp_test_result[512];          /* 发现/健康检查输出（脱敏后） */
@@ -899,7 +937,7 @@ static bool np_any_dialog(const notepad *a) {
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
            a->dlg_math_preview || a->dlg_maclaw || a->dlg_reload ||
            a->dlg_llm_prov || a->dlg_ai_actions || a->dlg_smart_paste ||
-           a->dlg_searchprof || a->dlg_mcp;
+           a->dlg_searchprof || a->dlg_mcp || a->dlg_kb || a->dlg_ti;
 }
 
 /* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
@@ -3237,6 +3275,8 @@ static void np_smart_paste_dialog(cui_ctx *ui, notepad *a) {
 
 static void np_searchprof_dialog(notepad *a, cui_ctx *ui); /* X9: 定义在 np_config_path 之后 */
 static void np_mcp_dialog(notepad *a, cui_ctx *ui);        /* X6: 定义在 np_config_path 之后 */
+static void np_kb_dialog(notepad *a, cui_ctx *ui);         /* X10: 定义在 np_mcp_dialog 之后 */
+static void np_ti_dialog(notepad *a, cui_ctx *ui);         /* T3/T4: 定义在 np_kb_dialog 之后 */
 
 static void np_dialogs(notepad *a, cui_ctx *ui) {
     np_settings_dialog(ui, a);
@@ -4329,6 +4369,8 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
 
     np_searchprof_dialog(a, ui);   /* X9: 知识搜索源配置（只召回，不写） */
     np_mcp_dialog(a, ui);          /* X6: MCP 工具服务器管理（发现/健康/不可信输出） */
+    np_kb_dialog(a, ui);           /* X10: 知识索引与 Context Pack */
+    np_ti_dialog(a, ui);           /* T3/T4: 分析工具安装 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -7278,6 +7320,374 @@ static void np_mcp_dialog(notepad *a, cui_ctx *ui) {
         cui_dialog_footer(ui) {
             if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY))
                 a->dlg_mcp = false;
+        }
+    }
+}
+
+/* X10: 知识索引配置存放在配置目录 kbindex.kb（行格式，正文转义）。 */
+static void np_kb_cfg_path(char *out, size_t cap) {
+    char dir[NP_PATH_CAP];
+    np_config_dir(dir, sizeof dir);
+#ifdef _WIN32
+    snprintf(out, cap, "%s\\kbindex.kb", dir);
+#else
+    snprintf(out, cap, "%s/kbindex.kb", dir);
+#endif
+}
+static np_kb_store_t *np_kb_store_get(notepad *a) {
+    if (!a->kb_store) {
+        a->kb_store = np_kb_store_create();
+        char path[NP_PATH_CAP];
+        np_kb_cfg_path(path, sizeof path);
+        np_kb_load(a->kb_store, path);
+    }
+    return a->kb_store;
+}
+static void np_kb_store_persist(notepad *a) {
+    if (!a->kb_store) return;
+    char path[NP_PATH_CAP];
+    np_kb_cfg_path(path, sizeof path);
+    if (!np_kb_save(a->kb_store, path))
+        np_toast(a, "保存知识索引失败", "配置目录可能不可写", CUI_TONE_WARNING);
+}
+/* 检索过滤器：由 UI 过滤区字段组装。allow 为空时 web 来源 fail-closed。 */
+static void np_kb_ui_filter(const notepad *a, np_kb_filter_t *f) {
+    np_kb_filter_defaults(f);
+    if (!a->kb_filter_on) return;
+    snprintf(f->domains_allow, sizeof f->domains_allow, "%s", a->kb_f_allow);
+    snprintf(f->source_type, sizeof f->source_type, "%s", a->kb_f_type);
+    snprintf(f->tag, sizeof f->tag, "%s", a->kb_f_tag);
+    f->min_quality = a->kb_f_minq;
+}
+static void np_kb_dialog(notepad *a, cui_ctx *ui) {
+    if (!a->dlg_kb) return;
+    np_kb_store_t *st = np_kb_store_get(a);
+    cui_dialog(ui, "知识索引与 Context Pack（混合检索）", &a->dlg_kb,
+               .description = "本地混合索引（BM25 倒排 + 可选向量）：按来源/标签/质量/域名过滤，"
+                              "生成带 token 预算、Citation 与 provenance 的 Context Pack。"
+                              "安全红线：未读回正文的条目永不进包（仅计数拦截）；正文先 PII 脱敏；"
+                              "web 来源域名白名单为空即拒绝（黑名单优先）。",
+               .width = 800) {
+        cui_text(ui, "已索引的文档", .size = 13, .font = CUI_FONT_MEDIUM);
+        size_t cnt = np_kb_count(st);
+        if (cnt == 0)
+            cui_empty_state(ui, "索引为空", .compact = true, .icon = CUI_ICON_SEARCH,
+                            .description = "点击「新增文档」录入或粘贴已读回的正文。");
+        for (size_t i = 0; i < cnt; ++i) {
+            const np_kb_doc_t *d = np_kb_at(st, i);
+            if (!d) continue;
+            char line[600];
+            snprintf(line, sizeof line, "%s  ·  %s  ·  质量 %d  ·  %s  ·  %s",
+                     d->id, d->source_type, d->quality,
+                     d->domain[0] ? d->domain : "本地",
+                     d->has_body ? "已读回✓" : "仅摘要（不进包）");
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                cui_text(ui, line, .size = 12, .width = CUI_FILL);
+                if (cui_button(ui, "删除", .size = CUI_SIZE_SM)) {
+                    np_kb_remove(st, d->id);
+                    np_kb_store_persist(a);
+                    if (a->kb_edit == (int)i) a->kb_edit = -1;
+                    break;
+                }
+            }
+        }
+        if (cui_button(ui, "＋ 新增文档", .size = CUI_SIZE_SM)) {
+            memset(&a->kb_form, 0, sizeof a->kb_form);
+            a->kb_form.quality = 1;
+            a->kb_edit = -2;
+        }
+
+        cui_separator(ui);
+
+        if (a->kb_edit >= -2) {
+            np_kb_doc_t *fm = &a->kb_form;
+            cui_text(ui, a->kb_edit == -2 ? "新增文档" : "编辑文档",
+                     .size = 13, .font = CUI_FONT_MEDIUM);
+            cui_input(ui, "kb-id", fm->id, sizeof fm->id,
+                      .label = "文档 ID", .placeholder = "maclaw-readme", .width = CUI_FILL);
+            cui_input(ui, "kb-src", fm->source, sizeof fm->source,
+                      .label = "来源（URL / 路径，provenance）",
+                      .placeholder = "https://docs.example.com/readme", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                cui_input(ui, "kb-type", fm->source_type, sizeof fm->source_type,
+                          .label = "类型", .placeholder = "web/file/note", .width = CUI_FILL);
+                cui_input(ui, "kb-dom", fm->domain, sizeof fm->domain,
+                          .label = "域名（web 来源必填）", .placeholder = "docs.example.com",
+                          .width = CUI_FILL);
+            }
+            cui_input(ui, "kb-tags", fm->tags, sizeof fm->tags,
+                      .label = "标签（逗号分隔）", .placeholder = "rag,core", .width = CUI_FILL);
+            cui_input(ui, "kb-title", fm->title, sizeof fm->title,
+                      .label = "标题", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                char lb[64];
+                snprintf(lb, sizeof lb, "质量 %d（0 低 / 1 中 / 2 高）", fm->quality);
+                cui_text(ui, lb, .size = 12);
+                if (cui_button(ui, "−", .size = CUI_SIZE_SM)) fm->quality = NP_MAX(0, fm->quality - 1);
+                if (cui_button(ui, "＋", .size = CUI_SIZE_SM)) fm->quality = NP_MIN(2, fm->quality + 1);
+                cui_checkbox(ui, "正文已读回（不勾选则永不进包）", &fm->has_body);
+            }
+            cui_input(ui, "kb-body", fm->body, sizeof fm->body,
+                      .label = "正文（已读回全文；生成包时 PII 脱敏）", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, "保存文档", .variant = CUI_BUTTON_PRIMARY)) {
+                    if (fm->id[0] && np_kb_add(st, fm)) {
+                        np_kb_store_persist(a);
+                        a->kb_edit = -1;
+                    } else {
+                        np_toast(a, "保存失败", "文档 ID 不能为空", CUI_TONE_WARNING);
+                    }
+                }
+                if (cui_button(ui, "取消")) a->kb_edit = -1;
+            }
+        }
+
+        cui_separator(ui);
+
+        cui_text(ui, "检索", .size = 13, .font = CUI_FONT_MEDIUM);
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            cui_input(ui, "kb-q", a->kb_query, sizeof a->kb_query,
+                      .placeholder = "检索词（空格分词；支持中文单字）", .width = CUI_FILL);
+            if (cui_button(ui, "搜索", .size = CUI_SIZE_SM)) {
+                np_kb_filter_t f;
+                np_kb_ui_filter(a, &f);
+                np_kb_hit_t hits[16];
+                size_t nh = np_kb_search(st, a->kb_query, &f, NULL, hits, 16);
+                size_t at = 0;
+                a->kb_hits_show[0] = 0;
+                if (nh == 0) {
+                    at += (size_t)snprintf(a->kb_hits_show + at, sizeof a->kb_hits_show - at,
+                                           "无命中（zero-match 不返回）");
+                } else {
+                    for (size_t h = 0; h < nh && at < sizeof a->kb_hits_show - 64; ++h)
+                        at += (size_t)snprintf(a->kb_hits_show + at, sizeof a->kb_hits_show - at,
+                                               "%s%s  分数 %.3f（BM25 %.3f）",
+                                               h ? "\n" : "", hits[h].id, hits[h].score, hits[h].bm25);
+                }
+                a->kb_search_done = true;
+            }
+            if (cui_checkbox(ui, "过滤器", &a->kb_filter_on)) a->kb_search_done = false;
+        }
+        if (a->kb_filter_on) {
+            cui_input(ui, "kb-fallow", a->kb_f_allow, sizeof a->kb_f_allow,
+                      .label = "域名白名单（空 = 拒绝全部 web 来源）",
+                      .placeholder = "docs.example.com,*.example.org", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                cui_input(ui, "kb-ftype", a->kb_f_type, sizeof a->kb_f_type,
+                          .label = "来源类型", .placeholder = "web", .width = CUI_FILL);
+                cui_input(ui, "kb-ftag", a->kb_f_tag, sizeof a->kb_f_tag,
+                          .label = "标签", .placeholder = "rag", .width = CUI_FILL);
+                char lb[48];
+                snprintf(lb, sizeof lb, "最低质量 %d", a->kb_f_minq);
+                cui_text(ui, lb, .size = 12);
+                if (cui_button(ui, "−", .size = CUI_SIZE_SM)) a->kb_f_minq = NP_MAX(-1, a->kb_f_minq - 1);
+                if (cui_button(ui, "＋", .size = CUI_SIZE_SM)) a->kb_f_minq = NP_MIN(2, a->kb_f_minq + 1);
+            }
+        }
+        if (a->kb_search_done)
+            cui_text(ui, a->kb_hits_show, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+
+        cui_separator(ui);
+
+        cui_text(ui, "Context Pack", .size = 13, .font = CUI_FONT_MEDIUM);
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            char lb[64];
+            snprintf(lb, sizeof lb, "token 预算 %d", a->kb_budget);
+            cui_text(ui, lb, .size = 12);
+            if (cui_button(ui, "−", .size = CUI_SIZE_SM)) a->kb_budget = NP_MAX(64, a->kb_budget - 128);
+            if (cui_button(ui, "＋", .size = CUI_SIZE_SM)) a->kb_budget = NP_MIN(16000, a->kb_budget + 128);
+            if (cui_button(ui, "生成 Pack", .size = CUI_SIZE_SM)) {
+                np_kb_filter_t f;
+                np_kb_ui_filter(a, &f);
+                size_t inc = np_kb_pack_build(st, a->kb_query[0] ? a->kb_query : "knowledge",
+                                              &f, NULL, (size_t)a->kb_budget,
+                                              a->kb_pack, sizeof a->kb_pack,
+                                              &a->kb_pack_stats);
+                (void)inc;
+                a->kb_pack_done = true;
+            }
+        }
+        if (a->kb_pack_done) {
+            char stat[200];
+            snprintf(stat, sizeof stat,
+                     "候选 %zu · 未读回拦截 %zu · 进包 %zu · 约 %zu/%zu tokens",
+                     a->kb_pack_stats.considered, a->kb_pack_stats.blocked_no_body,
+                     a->kb_pack_stats.included, a->kb_pack_stats.tokens_used,
+                     a->kb_pack_stats.tokens_budget);
+            cui_text(ui, stat, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_text(ui, a->kb_pack, .size = 12, .width = CUI_FILL);
+        }
+
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY))
+                a->dlg_kb = false;
+        }
+    }
+}
+
+/* T3/T4 UI: 分析工具安装。安全链与单测完全一致：
+ *   T2 白名单（仅 HTTPS 官方域名）→ T3 下载 + SHA-256（不匹配隔离，绝不执行）
+ *   → T4 zip 隔离解包 + bin_rel 校验 → T5 健康检查（"装上了≠能跑"）→ T7 降级链。
+ * 网络与解包在 worker 线程执行（复用 NP_BEGIN_THREAD 模式），UI 只镜像状态；
+ * worker 只碰启动前已填好的稳定缓冲与 volatile 标志，不碰 CUI 状态。 */
+static void np_ti_install_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    const np_tool_entry_t *e = np_whitelist_find(a->ti_wl, a->ti_sel_id);
+    if (!e) {
+        a->ti_status = NP_TI_ZIP_ERR_ARG;
+        snprintf(a->ti_err, sizeof a->ti_err, "白名单条目不存在");
+        a->ti_state = 2;
+        return;
+    }
+    a->ti_status = np_ti_fetch_and_install(e, a->ti_bin_rel, a->ti_strip_root,
+                                           NULL, NULL, NULL,
+                                           &a->ti_result, a->ti_err, sizeof a->ti_err);
+    a->ti_state = 2;
+}
+static void np_ti_health_worker(void *arg) {
+    notepad *a = (notepad *)arg;
+    np_ti_health_check(a->ti_result.bin_path, a->ti_version_arg, &a->ti_health);
+    a->ti_hc_state = 2;
+}
+/* T7 纯决策展示：不下载不安装，只选层并解释原因。 */
+static void np_ti_refresh_pick(notepad *a) {
+    np_ti_pick_t p1, p2;
+    char *at = a->ti_pick_show;
+    size_t left = sizeof a->ti_pick_show;
+    a->ti_pick_show[0] = 0;
+    if (np_ti_pick(&a->ti_plat, "disasm", NP_ARCH_X64, a->ti_plat.has_capstone_v6,
+                   "objdump", &p1))
+        snprintf(at, left, "disasm → %s（%s）\n", np_ti_tier_name(p1.tier), p1.reason);
+    else
+        snprintf(at, left, "disasm → 无可用层\n");
+    left -= strlen(at); at += strlen(at);
+    if (np_ti_pick(&a->ti_plat, "decompile", NP_ARCH_X64, false, "objdump", &p2))
+        snprintf(at, left, "decompile → %s（%s）\n", np_ti_tier_name(p2.tier), p2.reason);
+    else
+        snprintf(at, left, "decompile → 无可用层\n");
+}
+static void np_ti_dialog(notepad *a, cui_ctx *ui) {
+    if (!a->dlg_ti) return;
+    if (!a->ti_wl) {
+        a->ti_wl = np_whitelist_create();
+        np_whitelist_load_builtin(a->ti_wl);
+        np_toolchain_probe(&a->ti_plat, NULL);
+        a->ti_plat_done = true;
+        a->ti_sel = 0;
+        a->ti_strip_root = true;
+        np_ti_refresh_pick(a);
+    }
+    cui_dialog(ui, "分析工具安装（T3 下载校验 + T4 隔离安装）", &a->dlg_ti,
+               .description = "从 T2 白名单官方 HTTPS 源下载：SHA-256 不匹配即隔离、绝不执行未验包；"
+                              "解包进隔离工具目录并校验 bin_rel，仅进程级环境注入，不改全局 PATH/注册表；"
+                              "T5 健康检查验证\"装上了且能跑\"；T7 失败自动降级（内置→已安装→系统→离线提示）。",
+               .width = 800) {
+        if (a->ti_plat_done) {
+            char plat[256];
+            snprintf(plat, sizeof plat, "本机：%s / %s · JDK %s · objdump %s · Capstone v6 %s",
+                     np_os_name(a->ti_plat.os), np_arch_name(a->ti_plat.arch),
+                     a->ti_plat.has_jdk ? a->ti_plat.jdk_version : "✗",
+                     a->ti_plat.has_objdump ? "✓" : "✗",
+                     a->ti_plat.has_capstone_v6 ? "✓" : "✗");
+            cui_text(ui, plat, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        }
+        cui_text(ui, "T2 白名单（仅这些官方源可下载）", .size = 13, .font = CUI_FONT_MEDIUM);
+        {
+            size_t n2 = np_whitelist_count(a->ti_wl);
+            for (size_t i = 0; i < n2; ++i) {
+                const np_tool_entry_t *e = np_whitelist_at(a->ti_wl, i);
+                if (!e) continue;
+                bool sel = a->ti_sel == (int)i;
+                char line[600];
+                snprintf(line, sizeof line, "%s%s  ·  v%s  ·  %s  ·  %s  ·  ~%llu KB%s",
+                         sel ? "● " : "○ ", e->id, e->version, e->purpose, e->license,
+                         (unsigned long long)e->approx_size_kb,
+                         np_tool_supports(e, a->ti_plat.arch, a->ti_plat.os)
+                             ? "  ·  支持本机✓" : "  ·  不支持本机架构");
+                cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                    cui_text(ui, line, .size = 12, .width = CUI_FILL);
+                    if (!sel && a->ti_state != 1 &&
+                        cui_button(ui, "选择", .size = CUI_SIZE_SM)) {
+                        a->ti_sel = (int)i;
+                        np_ti_refresh_pick(a);
+                    }
+                }
+                if (sel) {
+                    cui_text(ui, e->source_url, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+                    snprintf(a->ti_sel_id, sizeof a->ti_sel_id, "%s", e->id);
+                }
+            }
+            if (a->ti_sel >= (int)n2) a->ti_sel = n2 ? (int)n2 - 1 : 0;
+        }
+
+        cui_separator(ui);
+
+        cui_text(ui, "安装", .size = 13, .font = CUI_FONT_MEDIUM);
+        cui_input(ui, "ti-binrel", a->ti_bin_rel, sizeof a->ti_bin_rel,
+                  .label = "包内可执行相对路径（bin_rel）",
+                  .placeholder = "ghidra_11.x/support/analyzeHeadless.bat", .width = CUI_FILL);
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            cui_checkbox(ui, "去掉 zip 顶层目录（GitHub Release 包）", &a->ti_strip_root);
+            if (a->ti_state == 1) {
+                cui_text(ui, "下载校验/解包中…", .size = 12, .color = CUI_COLOR_WARNING);
+                cui_request_redraw(ui);
+            } else if (cui_button(ui, "下载校验并安装", .variant = CUI_BUTTON_PRIMARY,
+                                  .disabled = !a->ti_bin_rel[0] || !a->ti_sel_id[0])) {
+                a->ti_state = 1;
+                a->ti_err[0] = 0;
+                a->ti_health_done = false;
+                a->ti_hc_state = 0;
+                NP_BEGIN_THREAD(np_ti_install_worker, a);
+            }
+        }
+        if (a->ti_state == 2) {
+            char res[700];
+            if (a->ti_status == NP_TI_ZIP_OK && a->ti_result.installed) {
+                snprintf(res, sizeof res,
+                         "安装成功：%s\n  tool_dir: %s\n  bin_path: %s\n  env_patch: %s",
+                         np_ti_zip_status_name(a->ti_status),
+                         a->ti_result.tool_dir, a->ti_result.bin_path,
+                         a->ti_result.env_patch);
+                cui_text(ui, res, .size = 12, .color = CUI_COLOR_SUCCESS);
+                cui_separator(ui);
+                cui_input(ui, "ti-verarg", a->ti_version_arg, sizeof a->ti_version_arg,
+                          .label = "健康检查参数", .placeholder = "--version", .width = CUI_FILL);
+                cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                    if (a->ti_hc_state == 1) {
+                        cui_text(ui, "运行中…", .size = 12, .color = CUI_COLOR_WARNING);
+                        cui_request_redraw(ui);
+                    } else if (cui_button(ui, "T5 健康检查（验证能跑）", .size = CUI_SIZE_SM)) {
+                        if (!a->ti_version_arg[0])
+                            snprintf(a->ti_version_arg, sizeof a->ti_version_arg, "--version");
+                        a->ti_hc_state = 1;
+                        NP_BEGIN_THREAD(np_ti_health_worker, a);
+                    }
+                }
+                if (a->ti_hc_state == 2) {
+                    a->ti_health_done = true;
+                    char hc[512];
+                    snprintf(hc, sizeof hc, "%s：%s",
+                             a->ti_health.runnable ? "健康 ✓" : "不可运行 ✗",
+                             a->ti_health.runnable ? a->ti_health.version : a->ti_health.error);
+                    cui_text(ui, hc, .size = 12,
+                             .color = a->ti_health.runnable ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
+                }
+            } else {
+                snprintf(res, sizeof res, "安装失败：%s\n%s",
+                         np_ti_zip_status_name(a->ti_status),
+                         a->ti_err[0] ? a->ti_err : "（详见 T3/T4 状态名）");
+                cui_text(ui, res, .size = 12, .color = CUI_COLOR_WARNING);
+            }
+        }
+
+        cui_separator(ui);
+
+        cui_text(ui, "T7 降级链（当前本机选择）", .size = 13, .font = CUI_FONT_MEDIUM);
+        cui_text(ui, a->ti_pick_show, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY))
+                a->dlg_ti = false;
         }
     }
 }
@@ -11338,6 +11748,10 @@ static void np_frame(cui_ctx *ui, void *user) {
                     a->dlg_searchprof = true;
                 if (cui_menu_item(ui, "MCP 工具服务器…", .icon = CUI_ICON_SERVER))
                     a->dlg_mcp = true;
+                if (cui_menu_item(ui, "知识索引与 Context Pack…", .icon = CUI_ICON_SEARCH))
+                    a->dlg_kb = true;
+                if (cui_menu_item(ui, "安装分析工具…", .icon = CUI_ICON_SERVER))
+                    a->dlg_ti = true;
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "保存时创建 .bak 备份", .checked = a->make_backup))
                     a->make_backup = !a->make_backup;
@@ -12096,6 +12510,11 @@ int main(int argc, char **argv) {
     g.llm_prov_edit = -1;
     g.sp_edit = -1;              /* X9: -1 = 无编辑表单 */
     g.mcp_edit = -1;             /* X6: -1 = 无编辑表单 */
+    g.kb_edit = -1;              /* X10: -1 = 无编辑表单 */
+    g.kb_f_minq = -1;            /* X10: -1 = 不过滤质量 */
+    g.kb_budget = 1500;          /* X10: 默认 token 预算 */
+    g.ti_state = 0;              /* T3/T4 UI: 安装 worker 状态 */
+    g.ti_hc_state = 0;           /* T5 健康检查 worker 状态 */
 #ifdef _WIN32
     g.default_crlf = true;
 #endif

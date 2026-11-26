@@ -89,7 +89,9 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                # X9 SearchProfile 可配置知识搜索接口（模型无 CUI）
                src/np_searchprofile.c
                # X6 MCP 工具服务器：动态发现/健康检查/不可信输出清洗（模型无 CUI，传输注入）
-               src/np_mcp.c)
+               src/np_mcp.c
+               # X10 混合知识索引与 Context Pack（自研 BM25 + 注入式向量）
+               src/np_kbidx.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)

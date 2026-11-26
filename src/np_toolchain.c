@@ -217,6 +217,10 @@ const np_tool_entry_t *np_whitelist_find(const np_whitelist_t *wl, const char *i
 
 size_t np_whitelist_count(const np_whitelist_t *wl) { return wl ? wl->count : 0; }
 
+const np_tool_entry_t *np_whitelist_at(const np_whitelist_t *wl, size_t i) {
+    return (wl && i < wl->count) ? &wl->entries[i] : NULL;
+}
+
 bool np_whitelist_url_allowed(const char *url) {
     if (!url) return false;
     if (strncmp(url, "https://", 8) != 0) return false; /* HTTPS only */
