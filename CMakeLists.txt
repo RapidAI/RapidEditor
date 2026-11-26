@@ -67,7 +67,13 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                src/np_synctex.c src/np_bt.c src/np_bt_templates.c
                src/np_latex_table.c src/np_latex_tidy.c src/np_font_scan.c
                src/np_ai.c src/np_qr.c src/np_maclaw.c src/np_openai.c
-               src/np_latex_html.c)
+               src/np_latex_html.c
+               # S0 AI-native底座：三轨任务/补丁/上下文 + 二进制守卫 + AI能力层 + 工具链 + 索引
+               src/np_job.c src/np_patch.c src/np_bytepatch.c src/np_integrity.c
+               src/np_filesafety.c src/np_capability.c src/np_toolchain.c
+               src/np_context.c src/np_citation.c src/np_index.c
+               # S1 工作流：探测路由 + 工具链自动供给 + Skill/MCP 管理 + 原生文本工具
+               src/np_probe.c src/np_toolinstall.c src/np_skillmgr.c src/np_texttools.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)

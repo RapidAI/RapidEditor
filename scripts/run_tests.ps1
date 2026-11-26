@@ -72,7 +72,18 @@ $tests = @(
     @{ name = "test_transform"; src = "scripts\test_transform.c"; link = @() },
     # shaper vs HarfBuzz reference (P4 #17); needs the repo root as cwd for assets/fonts
     @{ name = "test_lig"; src = "scripts\test_lig.c"; link = @("vendor\CUI\src\cui_shape.c");
-       include = @("vendor\CUI\src"); runIn = "repo" }
+       include = @("vendor\CUI\src"); runIn = "repo" },
+    # S0 AI-native底座 (A1/A3/A2/B5/H1/H2/H8/X1/X2/T1/T2/A4) - each test links only its modules
+    @{ name = "test_s0_job";       src = "scripts\test_s0_job.c";       link = @("src\np_job.c") },
+    @{ name = "test_s0_patch";     src = "scripts\test_s0_patch.c";     link = @("src\np_patch.c") },
+    @{ name = "test_s0_binary";    src = "scripts\test_s0_binary.c";    link = @("src\np_bytepatch.c","src\np_integrity.c","src\np_filesafety.c") },
+    @{ name = "test_s0_capability";src = "scripts\test_s0_capability.c";link = @("src\np_capability.c") },
+    @{ name = "test_s0_toolchain"; src = "scripts\test_s0_toolchain.c"; link = @("src\np_toolchain.c") },
+    @{ name = "test_s0_context";   src = "scripts\test_s0_context.c";   link = @("src\np_context.c","src\np_citation.c","src\np_integrity.c","src\np_job.c") },
+    @{ name = "test_s0_index";     src = "scripts\test_s0_index.c";     link = @("src\np_index.c","src\np_integrity.c") },
+    @{ name = "test_s1_probe";     src = "scripts\test_s1_probe.c";     link = @("src\np_probe.c") },
+    @{ name = "test_s1_toolinstall"; src = "scripts\test_s1_toolinstall.c"; link = @("src\np_toolinstall.c","src\np_toolchain.c","src\np_integrity.c") },
+    @{ name = "test_s1_skillmgr";  src = "scripts\test_s1_skillmgr.c";  link = @("src\np_skillmgr.c","src\np_texttools.c","src\np_capability.c","src\np_patch.c","src\np_job.c","src\np_integrity.c") }
 )
 
 $fail = 0
