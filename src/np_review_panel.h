@@ -63,6 +63,21 @@ void np_review_ui_bind_ex(np_review_ui_t *rv, const char *path,
 void np_review_ui_inject_text(np_review_ui_t *rv, const np_patch_set_t *ps,
                               const char *src_path);
 
+/* H7: 注入两个字节版本之间的 Diff 到字节审查会话。
+ * before = 当前文档字节（审查基线），after = 对照版本字节（目标）。
+ * 内部用 np_bytediff 计算按偏移对齐的 hunk，构造字节 patch_set 深拷贝注入；
+ * 仅当绑定同源文档（src_path）时导入。返回导入的 hunk 数（0 表示相同/失败）。
+ * 同时记录长度与 CRC32 前后值供页脚显示（H2：不一致禁止写入由 gate 处理）。 */
+size_t np_review_ui_inject_byte(np_review_ui_t *rv,
+                                const unsigned char *before, size_t blen,
+                                const unsigned char *after, size_t alen,
+                                const char *src_path);
+
+/* H7 页脚：最近一次字节 Diff 的长度与 CRC32 前后值（未注入时返回 false）。 */
+bool np_review_ui_diff_footer(const np_review_ui_t *rv,
+                              size_t *len_before, size_t *len_after,
+                              uint32_t *crc_before, uint32_t *crc_after);
+
 /* 传入选区（hex 视图当前选区，可为空）。 */
 void np_review_ui_set_selection(np_review_ui_t *rv, size_t off, size_t sel_len);
 

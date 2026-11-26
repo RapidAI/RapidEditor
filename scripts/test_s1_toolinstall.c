@@ -1,5 +1,6 @@
 /* test_s1_toolinstall.c — S1: T3/T4/T5/T7 单元测试（无网络依赖）. */
 #include "np_toolinstall.h"
+#include "np_toolinstall_zip.h"
 #include "np_integrity.h"
 
 #include <stdio.h>
@@ -13,6 +14,13 @@ static int failures = 0;
 } while (0)
 
 /* 计算内存数据的 sha256 hex */
+static bool file_readable(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
 static void mem_hex(const void *d, size_t n, char out[65]) {
     unsigned char dg[32];
     np_sha256(d, n, dg);
@@ -156,6 +164,37 @@ static int test_download_flow(void) {
     return 0;
 }
 
+static int test_default_downloader(void) {
+    printf("== T3: 默认下载器注册（主程序注入点） ==\n");
+    const char *payload = "via-default-downloader";
+    char expect[65];
+    mem_hex(payload, strlen(payload), expect);
+    g_payload = payload; g_payload_len = strlen(payload); g_mode = 0; g_calls = 0;
+
+    np_ti_download_t plan;
+    memset(&plan, 0, sizeof(plan));
+    snprintf(plan.url, sizeof(plan.url), "%s",
+             "https://github.com/NationalSecurityAgency/ghidra/releases/pkg.zip");
+    snprintf(plan.dest_path, sizeof(plan.dest_path), "%s", ".s1test_root/pkg.zip");
+    snprintf(plan.expected_sha256, sizeof(plan.expected_sha256), "%s", expect);
+
+    /* 未注册：NULL downloader → NETWORK（单测路径，无网络依赖） */
+    np_ti_set_default_downloader(NULL);
+    char final[300];
+    CHECK(np_ti_download_and_verify(&plan, ".s1test_root", NULL, NULL,
+                                    final, sizeof(final)) == NP_TI_DL_ERR_NETWORK);
+    CHECK(g_calls == 0);
+
+    /* 注册后：NULL downloader → 走注册的默认下载器 */
+    np_ti_set_default_downloader(fake_download);
+    CHECK(np_ti_download_and_verify(&plan, ".s1test_root", NULL, NULL,
+                                    final, sizeof(final)) == NP_TI_DL_OK);
+    CHECK(g_calls == 1);
+    np_ti_set_default_downloader(NULL);  /* 还原，不影响后续用例 */
+    remove(".s1test_root/pkg.zip");
+    return 0;
+}
+
 static int test_plan_install(void) {
     printf("== T4: 隔离安装规划 ==\n");
     np_tool_entry_t e = make_entry();
@@ -166,6 +205,89 @@ static int test_plan_install(void) {
     /* T4 红线：只产出进程级 env_patch，不改全局 PATH/注册表 */
     CHECK(ins.env_patch[0] != '\0');
     CHECK(ins.installed == false);
+    return 0;
+}
+
+static int test_install_package(void) {
+    printf("== T4: zip 解包安装 ==\n");
+    const char *zip = "tests/golden/toolinstall_fixture.zip";
+    np_tool_entry_t e = make_entry();
+    np_ti_install_result_t ins;
+    char err[240];
+
+    /* 正常安装：strip_root=true 丢掉 ghidra_11.3.1/ 顶层目录 */
+    np_ti_zip_status_t st = np_ti_install_package(".s1test_root", &e, zip,
+            "support/analyzeHeadless.bat", true, 0, 0, &ins, err, sizeof(err));
+    CHECK(st == NP_TI_ZIP_OK);
+    CHECK(ins.installed);
+    CHECK(file_readable(ins.bin_path));
+    CHECK(strstr(ins.env_patch, "ghidra") != NULL);
+
+    /* 重复安装：幂等，仍成功（旧目录清理后重解） */
+    st = np_ti_install_package(".s1test_root", &e, zip,
+            "support/analyzeHeadless.bat", true, 0, 0, &ins, err, sizeof(err));
+    CHECK(st == NP_TI_ZIP_OK && ins.installed);
+
+    /* bin_rel 不存在 → BIN_MISSING */
+    st = np_ti_install_package(".s1test_root", &e, zip,
+            "support/nonexistent.bat", true, 0, 0, &ins, err, sizeof(err));
+    CHECK(st == NP_TI_ZIP_ERR_BIN_MISSING);
+    CHECK(err[0] != '\0');
+
+    /* 路径穿越 bin_rel → ARG 拒绝（T4 双保险） */
+    st = np_ti_install_package(".s1test_root", &e, zip,
+            "../../evil.bat", true, 0, 0, &ins, err, sizeof(err));
+    CHECK(st == NP_TI_ZIP_ERR_ARG);
+
+    /* 安装包不存在 → IO */
+    st = np_ti_install_package(".s1test_root", &e, "tests/golden/nope.zip",
+            "support/analyzeHeadless.bat", true, 0, 0, &ins, err, sizeof(err));
+    CHECK(st == NP_TI_ZIP_ERR_IO);
+    return 0;
+}
+
+/* 一键流程用：把 fixture zip 内容写到 dest（哈希与 entry 匹配时 success） */
+static const unsigned char *g_zip_bytes = NULL;
+static size_t g_zip_len = 0;
+static bool fixture_download(const char *url, const char *dest, void *user) {
+    (void)url; (void)user;
+    FILE *f = fopen(dest, "wb");
+    if (!f) return false;
+    size_t n = fwrite(g_zip_bytes, 1, g_zip_len, f);
+    fclose(f);
+    return n == g_zip_len;
+}
+
+static int test_fetch_and_install(void) {
+    printf("== T3→T4: 一键下载校验安装 ==\n");
+    const char *zip = "tests/golden/toolinstall_fixture.zip";
+    FILE *f = fopen(zip, "rb");
+    CHECK(f != NULL);
+    if (!f) return 0;
+    unsigned char buf[8192];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    g_zip_bytes = buf; g_zip_len = n;
+
+    np_tool_entry_t e = make_entry();
+    char expect[65];
+    mem_hex(buf, n, expect);
+    snprintf(e.sha256, sizeof(e.sha256), "%s", expect);
+
+    np_ti_install_result_t ins;
+    char err[240];
+    np_ti_zip_status_t st = np_ti_fetch_and_install(&e, "support/analyzeHeadless.bat",
+            true, ".s1test_root", fixture_download, NULL, &ins, err, sizeof(err));
+    CHECK(st == NP_TI_ZIP_OK);
+    CHECK(ins.installed && file_readable(ins.bin_path));
+
+    /* 下载失败 → UNPACK（err 写明 T3 状态） */
+    g_zip_bytes = (const unsigned char *)""; g_zip_len = 0;
+    st = np_ti_fetch_and_install(&e, "support/analyzeHeadless.bat",
+            true, ".s1test_root", fake_download, NULL, &ins, err, sizeof(err));
+    /* fake_download 用旧 payload → 哈希不符 → 两次后隔离 → UNPACK */
+    CHECK(st == NP_TI_ZIP_ERR_UNPACK);
+    CHECK(strstr(err, "T3") != NULL);
     return 0;
 }
 
@@ -217,7 +339,10 @@ int main(void) {
     test_plan();
     test_verify();
     test_download_flow();
+    test_default_downloader();
     test_plan_install();
+    test_install_package();
+    test_fetch_and_install();
     test_health();
     test_pick();
     if (failures == 0) printf("ALL TOOLINSTALL TESTS PASSED\n");

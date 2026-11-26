@@ -25,6 +25,8 @@
 #include "np_latex_templates.h"
 #include "np_zip.h"
 #include "np_net.h"
+#include "np_toolinstall.h"      /* T3/T4: 工具链下载与隔离安装 */
+#include "np_toolinstall_zip.h"  /* T4: 已校验 zip → 隔离 tool_dir */
 #include "np_tinytex.h"
 #include "np_templates_online.h"
 #include "np_bt.h"
@@ -40,6 +42,11 @@
 #include "np_review_panel.h"   /* M2/B3: 统一 Patch Review 面板 */
 #include "np_plancard_ui.h"    /* M4/B2: 计划卡面板（X2 工具路由 + F3 schema 树） */
 #include "np_composer_ui.h"    /* M3/B1: AI 工作台（意图表单 → Job 卡 → B3） */
+#include "np_ooxml_ui.h"       /* F2: OOXML(OPC) 结构树面板 */
+#include "np_byteintel.h"      /* H3/H4: 字节解释 + 结构化字节搜索 */
+#include "np_bytediff.h"       /* H7: 字节 Diff（对照文件 → B3 审查） */
+#include "np_searchprofile.h"  /* X9: 可配置知识搜索接口（SearchProfile） */
+#include "np_mcp.h"            /* X6: MCP 工具服务器（动态发现/健康检查/不可信输出） */
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -534,6 +541,7 @@ typedef struct notepad {
     bool show_review;               /* B3 补丁审查面板（与 AI 面板互斥显示） */
     bool show_plan;                 /* B2 计划卡面板（X2 路由预告 + F3 schema 树） */
     bool show_workbench;            /* B1 AI 工作台（Composer 意图表单） */
+    bool show_ooxml;                /* F2 OOXML 结构树面板（与 AI/计划卡/审查互斥） */
     bool review_allow_write;        /* H8 写入开关持久位（每文件独立由面板管理） */
     bool zen_prev_ai;
     int  last_active;               /* to make the directory pane follow tab switches */
@@ -542,6 +550,7 @@ typedef struct notepad {
     float review_ratio;             /* workspace share when the review panel is docked */
     float plan_ratio;               /* workspace share when the plan card is docked */
     float workbench_ratio;          /* workspace share when the workbench is docked */
+    float ooxml_ratio;              /* workspace share when the OOXML panel is docked */
     int  side_tab, out_tab;         /* 目录/文档/最近 · 查找结果/消息 */
     char side_dir[NP_PATH_CAP];
     bool side_reload;               /* rebuild the sidebar tree next frame */
@@ -553,9 +562,11 @@ typedef struct notepad {
     uint64_t hits_rev, hits_key;
     bool dlg_hexgoto;
     char hexgoto_buf[24];
-    bool dlg_hexfind;                   /* binary search: hex bytes or ASCII */
+    bool dlg_hexfind;                   /* binary search: hex bytes or ASCII or structured */
     char hexfind_buf[256];
     bool hexfind_ascii;                 /* treat the query as text, not hex */
+    bool hexfind_struct;                /* H4: structured query (u32le=1000 / png:IHDR / fill:... / str:...) */
+    bool show_byteinspect;              /* H3: inline byte-interpretation panel in the hex pane */
     size_t hexfind_at;                  /* last hit offset; SIZE_MAX = none */
     size_t hexfind_len;                 /* bytes of the last hit */
     size_t hexfind_hits[400];           /* all hits of the last query: scrollbar ticks */
@@ -702,6 +713,23 @@ typedef struct notepad {
     char llm_test_model[NP_LLM_PROV_MODEL_CAP];
     char llm_test_result[192];          /* success summary: latency + reply */
     char llm_test_err[256];
+
+    /* X9: SearchProfile — 可配置知识搜索接口（只召回，不写） ----------- */
+    np_sp_store_t *sp_store;            /* 配置注册表（懒加载） */
+    bool dlg_searchprof;                /* 配置对话框 */
+    int  sp_edit;                       /* -1 无表单 / -2 新增 / >=0 编辑索引 */
+    np_sp_profile_t sp_form;            /* 编辑缓冲 */
+    char sp_test_query[128];            /* 本地召回测试词 */
+    char sp_test_result[512];           /* 测试输出（脱敏后） */
+    bool sp_test_done;
+
+    /* X6: MCP 工具服务器 — 动态发现/健康检查（工具输出不可信） ----------- */
+    np_mcp_store_t *mcp_store;          /* 配置注册表（懒加载） */
+    bool dlg_mcp;                       /* 扩展管理器对话框 */
+    int  mcp_edit;                      /* -1 无表单 / -2 新增 / >=0 编辑索引 */
+    np_mcp_server_t mcp_form;           /* 编辑缓冲 */
+    char mcp_test_result[512];          /* 发现/健康检查输出（脱敏后） */
+    bool mcp_test_done;
 
     /* EditPlus-style find in files ------------------------------------ */
     /* Case and whole-word toggles are the shared a->match_case /
@@ -870,7 +898,8 @@ static bool np_any_dialog(const notepad *a) {
            a->dlg_update || a->dlg_latex_tpl || a->dlg_tpl_online || a->dlg_tinytex ||
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
            a->dlg_math_preview || a->dlg_maclaw || a->dlg_reload ||
-           a->dlg_llm_prov || a->dlg_ai_actions || a->dlg_smart_paste;
+           a->dlg_llm_prov || a->dlg_ai_actions || a->dlg_smart_paste ||
+           a->dlg_searchprof || a->dlg_mcp;
 }
 
 /* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
@@ -2698,6 +2727,50 @@ static bool np_hex_parse_bytes(const char *s, bool ascii, unsigned char *out, in
 static void np_hex_find_run(notepad *a, bool next) {
     np_doc *d = np_cur(a);
     if (!d || !d->is_hex) return;
+
+    /* H4 结构化查询：解析查询 → 本地扫描命中 → 复用 hexfind 命中刻度与跳转。 */
+    if (a->hexfind_struct) {
+        np_bi_query_t q;
+        char perr[128];
+        if (!np_bi_query_parse(a->hexfind_buf, &q, perr, sizeof perr)) {
+            np_toast(a, "查询格式不对", perr, CUI_TONE_WARNING);
+            return;
+        }
+        const unsigned char *buf = (const unsigned char *)d->text;
+        size_t n = (size_t)d->len;
+        /* 全量扫描到局部数组（上限 512 与滚动条刻度一致）；total 用于提示。 */
+        np_bi_hit_t hbuf[NP_BI_MAX_HITS];
+        int total = 0;
+        int found = np_bi_search(buf, n, &q, hbuf, NP_BI_MAX_HITS, &total);
+        if (found <= 0) {
+            a->hexfind_at = (size_t)-1; a->hexfind_len = 0; a->hexfind_hit_count = 0;
+            np_toast(a, "未找到", "没有符合结构化条件的字节", CUI_TONE_INFO);
+            return;
+        }
+        /* 写回滚动条 tick（k 上限 400） */
+        int k = 0;
+        for (int i = 0; i < found && k < (int)(sizeof a->hexfind_hits / sizeof a->hexfind_hits[0]); i++)
+            a->hexfind_hits[k++] = hbuf[i].offset;
+        a->hexfind_hit_count = k;
+        a->hexfind_doc_uid = d->uid;
+        /* 选择命中的字节（next 从上次偏移之后取，否则取第一个） */
+        int pick = 0;
+        if (next && a->hexfind_at != (size_t)-1) {
+            for (int i = 0; i < found; i++)
+                if (hbuf[i].offset > a->hexfind_at) { pick = i; break; }
+        }
+        a->hexfind_at = hbuf[pick].offset;
+        a->hexfind_len = hbuf[pick].length;
+        if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, a->hexfind_at);
+        char msg[128];
+        snprintf(msg, sizeof msg, "%s · 0x%X 命中 %zu 字节 · 共 %d 处%s",
+                 q.desc, (unsigned)a->hexfind_at, a->hexfind_len, total,
+                 total > found ? "（刻度已截断）" : "");
+        np_toast(a, next ? "下一个命中" : "已找到", msg, CUI_TONE_SUCCESS);
+        a->dlg_hexfind = false;
+        return;
+    }
+
     unsigned char pat[256];
     int pn = 0;
     if (!np_hex_parse_bytes(a->hexfind_buf, a->hexfind_ascii, pat,
@@ -3162,6 +3235,9 @@ static void np_smart_paste_dialog(cui_ctx *ui, notepad *a) {
     }
 }
 
+static void np_searchprof_dialog(notepad *a, cui_ctx *ui); /* X9: 定义在 np_config_path 之后 */
+static void np_mcp_dialog(notepad *a, cui_ctx *ui);        /* X6: 定义在 np_config_path 之后 */
+
 static void np_dialogs(notepad *a, cui_ctx *ui) {
     np_settings_dialog(ui, a);
     np_ai_actions_dialog(ui, a);
@@ -3369,14 +3445,26 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
 
     cui_dialog(ui, "查找字节", &a->dlg_hexfind,
                .description = "在十六进制视图中查找字节序列（下一个命中会滚动到视野内并选中）",
-               .width = 400) {
+               .width = 440) {
         int flags = cui_input(ui, "hexfind-q", a->hexfind_buf, sizeof a->hexfind_buf,
-                              .label = "查找内容", .placeholder = "例如 1F 2E CC 或 0x1F2ECC",
+                              .label = "查找内容",
+                              .placeholder = a->hexfind_struct
+                                  ? "例如 u32le=1000 / png:IHDR / fill:0x00:16 / str:hello"
+                                  : "例如 1F 2E CC 或 0x1F2ECC",
                               .width = CUI_FILL, .autofocus = true);
         if (flags & CUI_SUBMITTED) np_hex_find_run(a, false);
-        cui_checkbox(ui, "按 ASCII 文本查找", &a->hexfind_ascii);
-        cui_text(ui, "十六进制模式忽略空格与逗号；勾选后把输入当作普通文本逐字节匹配。",
-                 .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        cui_checkbox(ui, "结构化查询（整数/签名/填充区/文本）", &a->hexfind_struct);
+        if (!a->hexfind_struct)
+            cui_checkbox(ui, "按 ASCII 文本查找", &a->hexfind_ascii);
+        if (a->hexfind_struct) {
+            cui_text(ui, "u32le=1000 · u16be>256 · i32le=-5 · elf/png/jpg/zip ·",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_text(ui, "png:IHDR · fill:0x00:16 · str:hello（本地预筛，命中复用滚动条刻度）。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        } else {
+            cui_text(ui, "十六进制模式忽略空格与逗号；勾选后把输入当作普通文本逐字节匹配。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+        }
         cui_dialog_footer(ui) {
             if (cui_button(ui, "取消")) a->dlg_hexfind = false;
             if (cui_button(ui, "下一个", .variant = CUI_BUTTON_GHOST,
@@ -4238,6 +4326,9 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
             if (cui_button(ui, "关闭")) a->dlg_update = false;
         }
     }
+
+    np_searchprof_dialog(a, ui);   /* X9: 知识搜索源配置（只召回，不写） */
+    np_mcp_dialog(a, ui);          /* X6: MCP 工具服务器管理（发现/健康/不可信输出） */
 }
 
 /* ------------------------------------------------------------------ */
@@ -6747,6 +6838,450 @@ static void np_config_path(char *out, size_t cap) {
 #endif
 }
 
+/* ---- X9 SearchProfile: 配置存储 + 对话框 -------------------------------- */
+/* 独立存 searchprofiles.ini（auth_ref 只含引用名，明文密钥永不落盘）。 */
+static void np_sp_cfg_path(char *out, size_t cap) {
+    char dir[NP_PATH_CAP];
+    np_config_dir(dir, sizeof dir);
+#ifdef _WIN32
+    snprintf(out, cap, "%s\\searchprofiles.ini", dir);
+#else
+    snprintf(out, cap, "%s/searchprofiles.ini", dir);
+#endif
+}
+static np_sp_store_t *np_sp_store_get(notepad *a) {
+    if (!a->sp_store) {
+        a->sp_store = np_sp_store_create();
+        char path[NP_PATH_CAP];
+        np_sp_cfg_path(path, sizeof path);
+        np_sp_store_load(a->sp_store, path);
+    }
+    return a->sp_store;
+}
+static void np_sp_store_persist(notepad *a) {
+    if (!a->sp_store) return;
+    char path[NP_PATH_CAP];
+    np_sp_cfg_path(path, sizeof path);
+    if (!np_sp_store_save(a->sp_store, path))
+        np_toast(a, "保存搜索源失败", "检查 auth_ref 是否含明文密钥，或目录不可写", CUI_TONE_WARNING);
+}
+/* 本地召回回调：从当前打开文档路径中做大小写不敏感子串匹配。 */
+static size_t np_sp_local_cb(const char *query, char out[][260], size_t cap, void *user) {
+    notepad *a = (notepad *)user;
+    size_t n = 0;
+    char q[128]; snprintf(q, sizeof q, "%s", query ? query : "");
+    for (int i = 0; i < a->count && n < cap; ++i) {
+        const char *p = a->docs[i]->path;
+        if (!p[0]) continue;
+        const char *hit = NULL;
+        if (!q[0]) hit = p;
+        else {
+            /* strstr 大小写不敏感 */
+            size_t pl = strlen(p), ql = strlen(q);
+            for (size_t j = 0; j + ql <= pl; ++j) {
+                size_t k = 0;
+                for (; k < ql; ++k)
+                    if (tolower((unsigned char)p[j+k]) != tolower((unsigned char)q[k])) break;
+                if (k == ql) { hit = p; break; }
+            }
+        }
+        if (hit) snprintf(out[n++], 260, "%s", p);
+    }
+    return n;
+}
+/* HTTP 传输适配：把 np_sp_fetch_fn 接到 np_net_get_json（调用方在 UI 线程
+ * 同步触发，短超时；真实自动召回应放后台线程）。 */
+static char *np_sp_ui_fetch(const char *url, const char *method, const char *secret,
+                            int timeout_sec, void *user, int *status_out) {
+    (void)method; (void)user;
+    np_net_opts o; memset(&o, 0, sizeof o);
+    o.timeout_sec = timeout_sec > 0 ? timeout_sec : 8;
+    return np_net_get_json(url, secret, &o, status_out);
+}
+/* 鉴权引用解析：仅识别 env:NAME 从环境变量取明文（不落盘、不进日志）；
+ * keychain:/vault: 等引用本机无系统钥匙串绑定时返回 NULL（匿名请求）。 */
+static const char *np_sp_ui_resolve(const char *auth_ref, void *user) {
+    (void)user;
+    if (auth_ref && strncmp(auth_ref, "env:", 4) == 0 && auth_ref[4])
+        return getenv(auth_ref + 4);
+    return NULL;
+}
+static void np_searchprof_dialog(notepad *a, cui_ctx *ui) {
+    if (!a->dlg_searchprof) return;
+    np_sp_store_t *st = np_sp_store_get(a);
+    cui_dialog(ui, "知识搜索源（SearchProfile）", &a->dlg_searchprof,
+               .description = "配置外部/本地知识检索：端点、鉴权引用、域名白名单、字段映射与降级链。"
+                              "鉴权只存引用名（keychain:/env:），明文密钥永不写入配置；域名白名单为空即拒绝全部请求。只召回，不写入文档。",
+               .width = 780) {
+        /* === 已配置列表 === */
+        cui_text(ui, "已配置的搜索源", .size = 13, .font = CUI_FONT_MEDIUM);
+        size_t cnt = np_sp_count(st);
+        if (cnt == 0)
+            cui_empty_state(ui, "还没有搜索源", .compact = true, .icon = CUI_ICON_SEARCH,
+                            .description = "点击「新增」配置一个 HTTP JSON 或本地索引检索源。");
+        for (size_t i = 0; i < cnt; ++i) {
+            const np_sp_profile_t *p = np_sp_at(st, i);
+            if (!p) continue;
+            char line[600];
+            snprintf(line, sizeof line, "%s  ·  %s  ·  %s  ·  %s",
+                     p->name, np_sp_backend_name((np_sp_backend_t)p->backend),
+                     p->enabled ? "启用" : "停用",
+                     p->endpoint[0] ? p->endpoint : "（本地索引）");
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                cui_text(ui, line, .size = 12, .width = CUI_FILL);
+                if (cui_button(ui, p->enabled ? "停用" : "启用", .size = CUI_SIZE_SM)) {
+                    np_sp_set_enabled(st, p->name, !p->enabled);
+                    np_sp_store_persist(a);
+                }
+                if (cui_button(ui, "编辑", .size = CUI_SIZE_SM)) {
+                    a->sp_form = *p;
+                    a->sp_edit = (int)i;
+                    a->sp_test_done = false;
+                }
+                if (cui_button(ui, "删除", .size = CUI_SIZE_SM)) {
+                    np_sp_remove(st, p->name);
+                    np_sp_store_persist(a);
+                    if (a->sp_edit == (int)i) a->sp_edit = -1;
+                    break;
+                }
+            }
+        }
+        if (cui_button(ui, "＋ 新增搜索源", .size = CUI_SIZE_SM)) {
+            np_sp_profile_t np; memset(&np, 0, sizeof np);
+            np.backend = NP_SP_HTTP_JSON; np.enabled = true;
+            snprintf(np.method, sizeof np.method, "GET");
+            snprintf(np.query_param, sizeof np.query_param, "q");
+            snprintf(np.field_title, sizeof np.field_title, "title");
+            snprintf(np.field_url, sizeof np.field_url, "url");
+            snprintf(np.field_snippet, sizeof np.field_snippet, "snippet");
+            np.max_results = 10; np.timeout_sec = 15;
+            a->sp_form = np; a->sp_edit = -2;
+            a->sp_test_done = false;
+        }
+
+        cui_separator(ui);
+
+        /* === 编辑表单 === */
+        if (a->sp_edit >= -2) {
+            np_sp_profile_t *f = &a->sp_form;
+            cui_text(ui, a->sp_edit == -2 ? "新增搜索源" : "编辑搜索源",
+                     .size = 13, .font = CUI_FONT_MEDIUM);
+            cui_input(ui, "sp-name", f->name, sizeof f->name, .label = "名称", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, f->backend == NP_SP_HTTP_JSON ? "后端：HTTP JSON（点击切换）"
+                                                                 : "后端：本地索引（点击切换）",
+                               .size = CUI_SIZE_SM))
+                    f->backend = f->backend == NP_SP_HTTP_JSON ? NP_SP_LOCAL_FTS : NP_SP_HTTP_JSON;
+                cui_checkbox(ui, "启用", &f->enabled);
+            }
+            if (f->backend == NP_SP_HTTP_JSON) {
+                cui_input(ui, "sp-endpoint", f->endpoint, sizeof f->endpoint,
+                          .label = "端点 URL", .placeholder = "https://api.example.com/search",
+                          .width = CUI_FILL);
+                cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                    cui_input(ui, "sp-method", f->method, sizeof f->method,
+                              .label = "方法", .placeholder = "GET", .width = 120);
+                    cui_input(ui, "sp-qp", f->query_param, sizeof f->query_param,
+                              .label = "查询参数名", .placeholder = "q", .width = 200);
+                }
+                cui_input(ui, "sp-auth", f->auth_ref, sizeof f->auth_ref,
+                          .label = "鉴权引用（仅引用名，禁明文 Key）",
+                          .placeholder = "env:MY_API_KEY 或 keychain:..., 留空=匿名", .width = CUI_FILL);
+                const char *sec_reason = NULL;
+                if (np_sp_looks_like_secret(f->auth_ref, &sec_reason))
+                    cui_text(ui, sec_reason, .size = 12, .color = CUI_COLOR_WARNING);
+            }
+            cui_input(ui, "sp-rpath", f->result_path, sizeof f->result_path,
+                      .label = "结果数组路径（点分）", .placeholder = "data.items 或留空=根数组", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                cui_input(ui, "sp-ftitle", f->field_title, sizeof f->field_title,
+                          .label = "标题字段", .placeholder = "title", .width = 200);
+                cui_input(ui, "sp-furl", f->field_url, sizeof f->field_url,
+                          .label = "链接字段", .placeholder = "url", .width = 200);
+                cui_input(ui, "sp-fsnip", f->field_snippet, sizeof f->field_snippet,
+                          .label = "摘要字段", .placeholder = "snippet", .width = 200);
+            }
+            cui_input(ui, "sp-allow", f->domain_allow, sizeof f->domain_allow,
+                      .label = "域名白名单（逗号分隔；空=拒绝全部）",
+                      .placeholder = "api.example.com,*.wiki.example.org", .width = CUI_FILL);
+            cui_input(ui, "sp-block", f->domain_block, sizeof f->domain_block,
+                      .label = "域名黑名单（优先于白名单）", .placeholder = "evil.example.com", .width = CUI_FILL);
+            cui_input(ui, "sp-fallback", f->fallback, sizeof f->fallback,
+                      .label = "失败降级到（搜索源名称，留空=无）", .width = CUI_FILL);
+            /* 数字字段用 +/- 调整，避免跨帧输入缓冲 */
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                char lb[64];
+                snprintf(lb, sizeof lb, "最多结果 %d", f->max_results);
+                cui_text(ui, lb, .size = 12);
+                if (cui_button(ui, "−", .size = CUI_SIZE_SM)) f->max_results = NP_MAX(1, f->max_results - 1);
+                if (cui_button(ui, "＋", .size = CUI_SIZE_SM)) f->max_results = NP_MIN(NP_SP_MAX_RESULTS, f->max_results + 1);
+                snprintf(lb, sizeof lb, "超时 %ds", f->timeout_sec);
+                cui_text(ui, lb, .size = 12);
+                if (cui_button(ui, "−", .size = CUI_SIZE_SM)) f->timeout_sec = NP_MAX(1, f->timeout_sec - 1);
+                if (cui_button(ui, "＋", .size = CUI_SIZE_SM)) f->timeout_sec = NP_MIN(120, f->timeout_sec + 1);
+                snprintf(lb, sizeof lb, "优先级 %d", f->priority);
+                cui_text(ui, lb, .size = 12);
+                if (cui_button(ui, "−", .size = CUI_SIZE_SM)) f->priority--;
+                if (cui_button(ui, "＋", .size = CUI_SIZE_SM)) f->priority++;
+            }
+            /* 校验提示 */
+            {
+                char why[160];
+                np_sp_status_t vs = np_sp_validate(f, why, sizeof why);
+                if (vs == NP_SP_OK)
+                    cui_text(ui, "配置有效", .size = 12, .color = CUI_COLOR_SUCCESS);
+                else
+                    cui_text(ui, why, .size = 12, .color = CUI_COLOR_WARNING);
+            }
+            /* 测试召回（本地同步、HTTP 短超时同步） */
+            cui_input(ui, "sp-testq", a->sp_test_query, sizeof a->sp_test_query,
+                      .label = "测试查询词", .placeholder = "输入关键词测试召回", .width = CUI_FILL);
+            if (cui_button(ui, "测试召回", .size = CUI_SIZE_SM)) {
+                char why[160];
+                np_sp_status_t vs = np_sp_validate(f, why, sizeof why);
+                if (vs != NP_SP_OK) {
+                    snprintf(a->sp_test_result, sizeof a->sp_test_result, "配置无效：%s", why);
+                } else if (f->backend == NP_SP_LOCAL_FTS) {
+                    np_sp_hit_t hits[8]; int total = 0;
+                    np_sp_status_t rs = np_sp_recall_local(f, a->sp_test_query, np_sp_local_cb, a, hits, 8, &total);
+                    if (rs == NP_SP_OK)
+                        snprintf(a->sp_test_result, sizeof a->sp_test_result,
+                                 "本地召回 %d 条：%s", total, hits[0].title);
+                    else
+                        snprintf(a->sp_test_result, sizeof a->sp_test_result, "无命中或失败：%s", np_sp_status_name(rs));
+                } else {
+                    if (!np_sp_domain_allowed(f, f->endpoint)) {
+                        snprintf(a->sp_test_result, sizeof a->sp_test_result,
+                                 "域名门禁拒绝：请检查白名单/黑名单（白名单空=拒绝全部）");
+                    } else {
+                        np_sp_hit_t hits[8]; int total = 0;
+                        np_sp_status_t rs = np_sp_recall_http(f, a->sp_test_query, np_sp_ui_fetch,
+                                            np_sp_ui_resolve, a, hits, 8, &total);
+                        if (rs == NP_SP_OK)
+                            snprintf(a->sp_test_result, sizeof a->sp_test_result,
+                                     "HTTP 召回 %d 条（已脱敏）：%s", total, hits[0].title);
+                        else
+                            snprintf(a->sp_test_result, sizeof a->sp_test_result, "HTTP 失败：%s", np_sp_status_name(rs));
+                    }
+                }
+                a->sp_test_done = true;
+            }
+            if (a->sp_test_done)
+                cui_text(ui, a->sp_test_result, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, "保存", .variant = CUI_BUTTON_PRIMARY)) {
+                    char why[160];
+                    np_sp_status_t as = np_sp_add(st, f);
+                    if (as == NP_SP_OK) {
+                        np_sp_store_persist(a);
+                        a->sp_edit = -1;
+                        a->sp_test_done = false;
+                    } else {
+                        np_sp_validate(f, why, sizeof why);
+                        np_toast(a, "保存失败", why, CUI_TONE_WARNING);
+                    }
+                }
+                if (cui_button(ui, "取消")) { a->sp_edit = -1; a->sp_test_done = false; }
+            }
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY))
+                a->dlg_searchprof = false;
+        }
+    }
+}
+
+/* ---- X6 MCP: 工具服务器管理（动态发现/健康检查/不可信输出） ------------ */
+/* 独立存 mcp_servers.ini（auth_ref 只含引用名，明文密钥永不落盘）。 */
+static void np_mcp_cfg_path(char *out, size_t cap) {
+    char dir[NP_PATH_CAP];
+    np_config_dir(dir, sizeof dir);
+#ifdef _WIN32
+    snprintf(out, cap, "%s\\mcp_servers.ini", dir);
+#else
+    snprintf(out, cap, "%s/mcp_servers.ini", dir);
+#endif
+}
+static np_mcp_store_t *np_mcp_store_get(notepad *a) {
+    if (!a->mcp_store) {
+        a->mcp_store = np_mcp_store_create();
+        char path[NP_PATH_CAP];
+        np_mcp_cfg_path(path, sizeof path);
+        np_mcp_store_load(a->mcp_store, path);
+    }
+    return a->mcp_store;
+}
+static void np_mcp_store_persist(notepad *a) {
+    if (!a->mcp_store) return;
+    char path[NP_PATH_CAP];
+    np_mcp_cfg_path(path, sizeof path);
+    if (!np_mcp_store_save(a->mcp_store, path))
+        np_toast(a, "保存 MCP 配置失败", "检查 auth_ref 是否含明文密钥，或目录不可写", CUI_TONE_WARNING);
+}
+/* MCP 传输适配：stdio/HTTP 服务器均无内置进程/网络直连权限，UI 层只提供
+ * 注入点。真实 stdio 子进程与 HTTP 调用需在后台线程按 profile 实现；本适配
+ * 默认失败（fail-closed），避免 UI 线程阻塞与未验工具被误调用。 */
+static bool np_mcp_ui_transport(const np_mcp_server_t *srv, const char *req,
+                                char *out_resp, size_t out_cap, void *user) {
+    (void)srv; (void)req; (void)user;
+    if (out_resp && out_cap) out_resp[0] = 0;
+    return false;   /* 未连接真实 MCP 服务器：健康检查/发现会安全失败并禁用 */
+}
+/* 鉴权引用解析：仅 env:NAME 从环境变量取（不落盘/不进日志）；其余 NULL。 */
+static const char *np_mcp_ui_resolve(const char *auth_ref, void *user) {
+    (void)user;
+    if (auth_ref && strncmp(auth_ref, "env:", 4) == 0 && auth_ref[4])
+        return getenv(auth_ref + 4);
+    return NULL;
+}
+static void np_mcp_dialog(notepad *a, cui_ctx *ui) {
+    if (!a->dlg_mcp) return;
+    np_mcp_store_t *st = np_mcp_store_get(a);
+    cui_dialog(ui, "MCP 工具服务器（扩展管理）", &a->dlg_mcp,
+               .description = "配置本地 stdio 或远程 HTTP 工具服务器：启动时发现工具、周期健康检查；"
+                              "工具输出按不可信文本脱敏处理，写工具默认禁调用。鉴权只存引用名（keychain:/env:/vault:），"
+                              "明文密钥永不写入配置；HTTP 域名白名单为空即拒绝。",
+               .width = 800) {
+        cui_text(ui, "已配置的 MCP 服务器", .size = 13, .font = CUI_FONT_MEDIUM);
+        size_t cnt = np_mcp_count(st);
+        if (cnt == 0)
+            cui_empty_state(ui, "还没有 MCP 服务器", .compact = true, .icon = CUI_ICON_SEARCH,
+                            .description = "点击「新增」配置一个 stdio 命令或 HTTP 端点。");
+        for (size_t i = 0; i < cnt; ++i) {
+            const np_mcp_server_t *s = np_mcp_at(st, i);
+            if (!s) continue;
+            char line[600];
+            snprintf(line, sizeof line, "%s  ·  %s  ·  %s  ·  %s  ·  工具 %zu  ·  %s",
+                     s->name, np_mcp_transport_name(s->transport),
+                     s->enabled ? "启用" : "停用",
+                     s->health ? "健康✓" : (s->fail_streak ? "降级" : "未检查"),
+                     np_mcp_tool_count(st, s->name),
+                     s->allow_write ? "允许写" : "只读");
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                cui_text(ui, line, .size = 12, .width = CUI_FILL);
+                if (cui_button(ui, s->enabled ? "停用" : "启用", .size = CUI_SIZE_SM)) {
+                    np_mcp_set_enabled(st, s->name, !s->enabled);
+                    np_mcp_store_persist(a);
+                }
+                if (cui_button(ui, "编辑", .size = CUI_SIZE_SM)) {
+                    a->mcp_form = *s;
+                    a->mcp_edit = (int)i;
+                    a->mcp_test_done = false;
+                }
+                if (cui_button(ui, "删除", .size = CUI_SIZE_SM)) {
+                    np_mcp_remove(st, s->name);
+                    np_mcp_store_persist(a);
+                    if (a->mcp_edit == (int)i) a->mcp_edit = -1;
+                    break;
+                }
+            }
+        }
+        if (cui_button(ui, "＋ 新增 MCP 服务器", .size = CUI_SIZE_SM)) {
+            np_mcp_server_t ns; memset(&ns, 0, sizeof ns);
+            ns.transport = NP_MCP_STDIO; ns.enabled = true; ns.timeout_sec = 15;
+            a->mcp_form = ns; a->mcp_edit = -2; a->mcp_test_done = false;
+        }
+
+        cui_separator(ui);
+
+        if (a->mcp_edit >= -2) {
+            np_mcp_server_t *f = &a->mcp_form;
+            cui_text(ui, a->mcp_edit == -2 ? "新增 MCP 服务器" : "编辑 MCP 服务器",
+                     .size = 13, .font = CUI_FONT_MEDIUM);
+            cui_input(ui, "mcp-name", f->name, sizeof f->name, .label = "名称", .width = CUI_FILL);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, f->transport == NP_MCP_STDIO ? "传输：stdio（点击切换）"
+                                                                : "传输：HTTP（点击切换)",
+                               .size = CUI_SIZE_SM))
+                    f->transport = f->transport == NP_MCP_STDIO ? NP_MCP_HTTP : NP_MCP_STDIO;
+                cui_checkbox(ui, "启用", &f->enabled);
+                cui_checkbox(ui, "允许写工具（默认禁）", &f->allow_write);
+            }
+            if (f->transport == NP_MCP_STDIO) {
+                cui_input(ui, "mcp-cmd", f->command, sizeof f->command,
+                          .label = "启动命令（禁 shell 元字符）", .placeholder = "python mcp_server.py --stdio",
+                          .width = CUI_FILL);
+            } else {
+                cui_input(ui, "mcp-endpoint", f->endpoint, sizeof f->endpoint,
+                          .label = "HTTP 端点 URL", .placeholder = "https://kb.example.com/mcp", .width = CUI_FILL);
+                cui_input(ui, "mcp-allow", f->domain_allow, sizeof f->domain_allow,
+                          .label = "域名白名单（逗号分隔；空=拒绝全部）",
+                          .placeholder = "kb.example.com,*.internal.example.org", .width = CUI_FILL);
+                cui_input(ui, "mcp-block", f->domain_block, sizeof f->domain_block,
+                          .label = "域名黑名单（优先于白名单）", .placeholder = "evil.example.com", .width = CUI_FILL);
+            }
+            cui_input(ui, "mcp-auth", f->auth_ref, sizeof f->auth_ref,
+                      .label = "鉴权引用（仅引用名，禁明文 Key）",
+                      .placeholder = "env:MCP_TOKEN 或 keychain:..., 留空=匿名", .width = CUI_FILL);
+            {
+                const char *sec_reason = NULL;
+                if (np_mcp_looks_like_secret(f->auth_ref, &sec_reason))
+                    cui_text(ui, sec_reason, .size = 12, .color = CUI_COLOR_WARNING);
+            }
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                char lb[64];
+                snprintf(lb, sizeof lb, "超时 %ds", f->timeout_sec);
+                cui_text(ui, lb, .size = 12);
+                if (cui_button(ui, "−", .size = CUI_SIZE_SM)) f->timeout_sec = NP_MAX(1, f->timeout_sec - 1);
+                if (cui_button(ui, "＋", .size = CUI_SIZE_SM)) f->timeout_sec = NP_MIN(120, f->timeout_sec + 1);
+            }
+            {
+                char why[160];
+                np_mcp_status_t vs = np_mcp_validate(f, why, sizeof why);
+                if (vs == NP_MCP_OK)
+                    cui_text(ui, "配置有效", .size = 12, .color = CUI_COLOR_SUCCESS);
+                else
+                    cui_text(ui, why, .size = 12, .color = CUI_COLOR_WARNING);
+            }
+            if (cui_button(ui, "测试发现 + 健康检查", .size = CUI_SIZE_SM)) {
+                char why[160];
+                np_mcp_status_t vs = np_mcp_validate(f, why, sizeof why);
+                if (vs != NP_MCP_OK) {
+                    snprintf(a->mcp_test_result, sizeof a->mcp_test_result, "配置无效：%s", why);
+                } else if (f->transport == NP_MCP_HTTP && !np_mcp_domain_allowed(f, f->endpoint)) {
+                    snprintf(a->mcp_test_result, sizeof a->mcp_test_result,
+                             "域名门禁拒绝：检查白名单/黑名单（白名单空=拒绝全部）");
+                } else {
+                    /* 临时 store 里放一份，避免污染未保存的编辑缓冲状态。 */
+                    np_mcp_store_t *tmp = np_mcp_store_create();
+                    np_mcp_add(tmp, f);
+                    np_mcp_status_t ds = NP_MCP_ERR_ARG;
+                    int tools = np_mcp_discover(tmp, f->name, np_mcp_ui_transport,
+                                                np_mcp_ui_resolve, a, &ds);
+                    bool healthy = np_mcp_health_check(tmp, f->name, np_mcp_ui_transport,
+                                                       np_mcp_ui_resolve, a);
+                    snprintf(a->mcp_test_result, sizeof a->mcp_test_result,
+                             "发现 %d 个工具（%s）；健康 %s。未连接真实服务器时安全失败。",
+                             tools, np_mcp_status_name(ds), healthy ? "✓" : "✗（失败会禁用）");
+                    np_mcp_store_destroy(tmp);
+                }
+                a->mcp_test_done = true;
+            }
+            if (a->mcp_test_done)
+                cui_text(ui, a->mcp_test_result, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, "保存", .variant = CUI_BUTTON_PRIMARY)) {
+                    char why[160];
+                    np_mcp_status_t as = np_mcp_add(st, f);
+                    if (as == NP_MCP_OK) {
+                        np_mcp_store_persist(a);
+                        a->mcp_edit = -1;
+                        a->mcp_test_done = false;
+                    } else {
+                        np_mcp_validate(f, why, sizeof why);
+                        np_toast(a, "保存失败", why, CUI_TONE_WARNING);
+                    }
+                }
+                if (cui_button(ui, "取消")) { a->mcp_edit = -1; a->mcp_test_done = false; }
+            }
+        }
+        cui_dialog_footer(ui) {
+            if (cui_button(ui, "关闭", .variant = CUI_BUTTON_PRIMARY))
+                a->dlg_mcp = false;
+        }
+    }
+}
+
 /* Snapshot files live next to config.ini. Keeping them as plain UTF-8 makes
  * recovery possible even when the original file was never saved. */
 static void np_draft_path(char *out, size_t cap, int idx) {
@@ -8391,6 +8926,90 @@ static void np_bt_tree_paint(cui_ctx *ui, cui_rect r, void *user) {
     }
 }
 
+/* H7: 选对照文件 → 与当前 hex 文档做字节 Diff → 送入 B3 审查面板。
+ * before = 当前文档（审查基线），after = 对照文件（目标版本）。 */
+static void np_hex_diff_dialog(notepad *a, np_doc *d) {
+    if (!d) return;
+    char p[NP_PATH_CAP];
+    if (!cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+            .kind = CUI_FILE_OPEN, .title = "选择对照版本（字节 Diff 目标）",
+            .filter_name = "所有文件", .filter = "*" },
+            p, sizeof p))
+        return;
+    FILE *f = fopen(p, "rb");
+    if (!f) {
+        np_logf(a, "字节 Diff：无法打开 %s", np_base(p));
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0 || sz > (long)64 * 1024 * 1024) {   /* 64 MB 上限防御 */
+        fclose(f);
+        np_logf(a, "字节 Diff：文件大小超出 64 MB 上限");
+        return;
+    }
+    unsigned char *after = (unsigned char *)malloc((size_t)sz ? (size_t)sz : 1);
+    if (!after) { fclose(f); return; }
+    size_t got = fread(after, 1, (size_t)sz, f);
+    fclose(f);
+    size_t n = np_review_ui_inject_byte(np_review_ui_get(),
+                                        (const unsigned char *)d->text, (size_t)d->len,
+                                        after, got, d->path);
+    free(after);
+    if (n) {
+        a->show_review = true;
+        a->show_byteinspect = false;
+        np_logf(a, "字节 Diff：%zu 处改动已送入 B3 审查 · 对照 %s", n, np_base(p));
+    } else {
+        np_logf(a, "字节 Diff：两版本无差异或无法生成 hunk");
+    }
+}
+
+/* H3 字节解释：把当前选区解释为多类型候选字段，渲染成可点芯片。
+ * 点芯片把选区收窄为该字段宽度并跳回 hex（"字段芯片可跳 hex"）；只读。 */
+static void np_byte_inspect_panel(cui_ctx *ui, notepad *a, np_doc *d) {
+    np_bi_result_t r;
+    size_t off = d->hexsel.start;
+    size_t len = d->hexsel.length ? d->hexsel.length : 8;
+    if (len > 16) len = 16;
+    np_bi_interpret((const unsigned char *)d->text, (size_t)d->len, off, len, &r);
+
+    char head[160];
+    snprintf(head, sizeof head, "选区 0x%X · %zu 字节 · %d 种类型候选%s",
+             (unsigned)off, d->hexsel.length ? d->hexsel.length : 0,
+             r.nfields, r.nfields >= NP_BI_MAX_FIELDS ? "（已截断）" : "");
+    cui_text(ui, head, .size = 11, .font = CUI_FONT_MEDIUM);
+
+    for (int i = 0; i < r.nfields; i++) {
+        const np_bi_field_t *f = &r.fields[i];
+        char chip[128];
+        const char *en = np_bi_type_endian(f->type);
+        if (en[0])
+            snprintf(chip, sizeof chip, "%s = %s · %s###bi%d",
+                     np_bi_type_name(f->type), f->value, en, i);
+        else
+            snprintf(chip, sizeof chip, "%s = %s###bi%d",
+                     np_bi_type_name(f->type), f->value, i);
+        if (cui_button(ui, chip, .size = CUI_SIZE_SM,
+                       .variant = f->plausible ? CUI_BUTTON_GHOST : CUI_BUTTON_GHOST,
+                       .tooltip = "点选：把 hex 选区收窄为该字段宽度")) {
+            d->hexsel.cursor = f->offset;
+            d->hexsel.start = f->offset;
+            d->hexsel.length = f->size;
+            if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, f->offset);
+        }
+    }
+    /* B5 引用：file:0xOFFSET（本地读回由 Citation 模块负责；此处只生成串） */
+    char cite[280];
+    const char *base = d->path;
+    const char *slash = strrchr(base, '/');
+    if (slash) base = slash + 1;
+    for (const char *p = base; *p; p++) if (*p == '\\') base = p + 1;
+    snprintf(cite, sizeof cite, "%s:0x%X", base, (unsigned)off);
+    cui_text(ui, cite, .size = 11, .color = CUI_COLOR_SUCCESS);
+}
+
 /* 010 Editor style pane: offsets, hex bytes and ASCII, fully editable —
  * typing hex digits overwrites the byte under the cursor. cui_hex_view owns
  * all of the interaction (selection, arrows, copy, virtual scrolling); we
@@ -8407,6 +9026,14 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             if (flags & CUI_SUBMITTED) np_hex_do_goto(a);
             if (cui_button(ui, "跳转", .size = CUI_SIZE_SM)) np_hex_do_goto(a);
             cui_spacer(ui);
+            if (cui_button(ui, a->show_byteinspect ? "隐藏字节解释" : "字节解释",
+                           .size = CUI_SIZE_SM, .icon = CUI_ICON_CODE,
+                           .tooltip = "本地把选区字节解释为多类型候选（只读，字段芯片可跳 hex）"))
+                a->show_byteinspect = !a->show_byteinspect;
+            if (cui_button(ui, "字节 Diff…", .size = CUI_SIZE_SM,
+                           .icon = CUI_ICON_GIT_BRANCH,
+                           .tooltip = "选择对照版本，与当前字节做偏移对齐 Diff 并送入 B3 逐块审查"))
+                np_hex_diff_dialog(a, d);
             if (cui_button(ui, "AI 解释选区", .size = CUI_SIZE_SM,
                            .icon = CUI_ICON_SPARKLES,
                            .tooltip = "把当前字节选区的 hexdump 发给 AI 解释（只读，不写入）"))
@@ -8433,6 +9060,13 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
         } else {
             cui_text(ui, "点击/拖选字节 · 方向键移动 · 键入十六进制覆盖 · Ctrl C 复制 · Ctrl Home/End 首尾",
                      .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        }
+
+        /* H3 字节解释面板（点按钮切换；只读，字段芯片可跳 hex） */
+        if (a->show_byteinspect) {
+            cui_spacer(ui);
+            np_byte_inspect_panel(ui, a, d);
+            cui_spacer(ui);
         }
 
         /* Build highlight ranges from the template fields (frame-stable),
@@ -10155,6 +10789,17 @@ static void np_plan_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
         a->show_plan = false;
 }
 
+/* ---- F2 OOXML 结构树面板接线：主程序只做绑定，逻辑在面板内 ---- */
+static void np_ooxml_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
+    np_ox_ui_t *ou = np_ox_ui_get();
+    if (d && d->len > 0)
+        np_ox_ui_bind(ou, d->path, (const unsigned char *)d->text, (size_t)d->len);
+    else
+        np_ox_ui_bind(ou, "", NULL, 0);
+    if (np_ox_ui_draw(ou, ui) == NP_OXUI_CLOSED)
+        a->show_ooxml = false;
+}
+
 static void np_frame(cui_ctx *ui, void *user) {
     notepad *a = (notepad *)user;
     a->ui = ui;
@@ -10689,6 +11334,10 @@ static void np_frame(cui_ctx *ui, void *user) {
                     a->show_workbench = !a->show_workbench;
                 if (cui_menu_item(ui, "maclaw 官方服务登录…", .icon = CUI_ICON_SPARKLES))
                     a->dlg_maclaw = true;
+                if (cui_menu_item(ui, "知识搜索源（SearchProfile）…", .icon = CUI_ICON_SEARCH))
+                    a->dlg_searchprof = true;
+                if (cui_menu_item(ui, "MCP 工具服务器…", .icon = CUI_ICON_SERVER))
+                    a->dlg_mcp = true;
                 cui_menu_separator(ui);
                 if (cui_menu_item(ui, "保存时创建 .bak 备份", .checked = a->make_backup))
                     a->make_backup = !a->make_backup;
@@ -10716,6 +11365,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                 if (cui_menu_item(ui, "计划卡面板", .icon = CUI_ICON_SPARKLES,
                                   .checked = a->show_plan))
                     a->show_plan = !a->show_plan;
+                if (cui_menu_item(ui, "OOXML 结构树", .icon = CUI_ICON_FILE,
+                                  .checked = a->show_ooxml))
+                    a->show_ooxml = !a->show_ooxml;
                 if (cui_menu_item(ui, "目录跟随当前文件", .icon = CUI_ICON_BOOKMARK,
                                   .checked = a->follow_active))
                     a->follow_active = !a->follow_active;
@@ -11136,6 +11788,23 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_split_next(ui);
                 np_plan_panel_dock(ui, a, d);
             }
+        } else if (a->show_ooxml) {
+            /* F2 OOXML 结构树面板 dock（与 AI/计划卡/审查互斥） */
+            cui_split(ui, "np_ooxml_split", &a->ooxml_ratio,
+                      .min_first = 400, .min_second = 260) {
+                if (a->show_sidebar) {
+                    cui_split(ui, "np_main_split", &a->side_ratio,
+                              .min_first = 175, .min_second = 400) {
+                        np_sidebar(ui, a);
+                        cui_split_next(ui);
+                        d = np_workspace(ui, a, busy);
+                    }
+                } else {
+                    d = np_workspace(ui, a, busy);
+                }
+                cui_split_next(ui);
+                np_ooxml_panel_dock(ui, a, d);
+            }
         } else if (a->show_review) {
             /* B3 补丁审查面板 dock 在最右（与 AI 面板互斥：show_ai 优先） */
             cui_split(ui, "np_review_split", &a->review_ratio,
@@ -11374,7 +12043,15 @@ static void np_android_bootstrap(notepad *a) {
 }
 #endif
 
+/* T3 默认下载器：薄适配 np_net_download（主程序已链 np_net）。
+ * 与 np_toolinstall.c 解耦——后者被多个单测链接，不引网络依赖。 */
+static bool np_ti_real_download(const char *url, const char *dest, void *user) {
+    (void)user;
+    return np_net_download(url, dest, NULL);
+}
+
 int main(int argc, char **argv) {
+    np_ti_set_default_downloader(np_ti_real_download);
     for (int i = 0; i < NP_DOC_MAX; i++) g.startup_cur[i] = -1;
     g.font_size = NP_FONT_DEF;
     snprintf(g.font_ident, sizeof g.font_ident, "default");
@@ -11401,6 +12078,7 @@ int main(int argc, char **argv) {
     g.review_ratio = 0.72f;
     g.plan_ratio = 0.72f;
     g.workbench_ratio = 0.72f;
+    g.ooxml_ratio = 0.72f;
     g.inline_delay = 1;
     g.out_ratio = 0.76f;
     g.side_tab = 0;
@@ -11416,6 +12094,8 @@ int main(int argc, char **argv) {
     snprintf(g.maclaw_centers, sizeof g.maclaw_centers, "%s",
              "https://hubs.mypapers.top,https://hubs.maclaw.top,https://hubs2.maclaw.top");
     g.llm_prov_edit = -1;
+    g.sp_edit = -1;              /* X9: -1 = 无编辑表单 */
+    g.mcp_edit = -1;             /* X6: -1 = 无编辑表单 */
 #ifdef _WIN32
     g.default_crlf = true;
 #endif

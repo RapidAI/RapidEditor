@@ -73,12 +73,23 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                src/np_filesafety.c src/np_capability.c src/np_toolchain.c
                src/np_context.c src/np_citation.c src/np_index.c
                # S1 工作流：探测路由 + 工具链自动供给 + Skill/MCP 管理 + 原生文本工具
-               src/np_probe.c src/np_toolinstall.c src/np_skillmgr.c src/np_texttools.c
+               src/np_probe.c src/np_toolinstall.c src/np_toolinstall_zip.c
+               src/np_skillmgr.c src/np_texttools.c
                src/np_sqlite.c src/np_review.c src/np_review_panel.c
                # M4 B2计划卡 + F3 schema 树汇合（模型无 CUI，UI 独立文件）
                src/np_plancard.c src/np_plancard_ui.c
                # M3 B1 Composer → Job → PatchSet（模型无 CUI，UI 独立文件）
-               src/np_composer.c src/np_composer_ui.c)
+               src/np_composer.c src/np_composer_ui.c
+               # F2 OOXML(OPC) 容器解析与结构树（模型无 CUI，UI 独立文件）
+               src/np_ooxml.c src/np_ooxml_ui.c
+               # H3/H4 字节解释 + 结构化字节搜索（模型无 CUI）
+               src/np_byteintel.c
+               # H7 字节 Diff Review（模型无 CUI）
+               src/np_bytediff.c
+               # X9 SearchProfile 可配置知识搜索接口（模型无 CUI）
+               src/np_searchprofile.c
+               # X6 MCP 工具服务器：动态发现/健康检查/不可信输出清洗（模型无 CUI，传输注入）
+               src/np_mcp.c)
 
 # Detect WebKitGTK early on Linux so we pick the right source and link libs.
 set(RE_HAVE_WEBKITGTK OFF)

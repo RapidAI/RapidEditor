@@ -279,24 +279,42 @@ np_bp_result_t np_review_commit_byte(np_review_t *rv, np_bytepatch_t *bp,
         if (why && why_cap) snprintf(why, why_cap, "gate: %s", rv->gate_reason);
         return NP_BP_ERR_ARG;
     }
-    bool any = false;
-    for (size_t i = 0; i < rv->count; ++i)
-        if (rv->hunks[i].state == NP_REVIEW_ACCEPTED) any = true;
-    if (!any) {
-        if (why && why_cap) snprintf(why, why_cap, "nothing accepted");
-        return NP_BP_ERR_ARG;
-    }
-    if (!np_bytepatch_begin_group(bp)) return NP_BP_ERR_ALLOC;
-
+    /* H7: accepted hunks may be variable-length (insert/delete). Apply them
+     * in DESCENDING offset order so an earlier splice cannot shift the offsets
+     * of hunks still pending (forward order corrupts multi-hunk diffs). */
+    size_t nacc = 0;
     for (size_t i = 0; i < rv->count; ++i) {
         if (rv->hunks[i].state != NP_REVIEW_ACCEPTED) continue;
         if (rv->hunks[i].guard_blocked) {
             if (why && why_cap)
                 snprintf(why, why_cap, "hunk %zu blocked: %s",
                          i, rv->hunks[i].guard_reason);
-            np_bytepatch_undo(bp);
             return NP_BP_ERR_ARG;
         }
+        nacc++;
+    }
+    if (!nacc) {
+        if (why && why_cap) snprintf(why, why_cap, "nothing accepted");
+        return NP_BP_ERR_ARG;
+    }
+    size_t *order = (size_t *)malloc(nacc * sizeof(*order));
+    if (!order) return NP_BP_ERR_ALLOC;
+    size_t m = 0;
+    for (size_t i = 0; i < rv->count; ++i)
+        if (rv->hunks[i].state == NP_REVIEW_ACCEPTED) order[m++] = i;
+    /* stable insertion sort, descending by offset */
+    for (size_t a = 1; a < m; ++a) {
+        size_t cur = order[a], b = a;
+        while (b > 0 && rv->data[order[b - 1]].off < rv->data[cur].off) {
+            order[b] = order[b - 1]; b--;
+        }
+        order[b] = cur;
+    }
+    if (!np_bytepatch_begin_group(bp)) { free(order); return NP_BP_ERR_ALLOC; }
+
+    np_bp_result_t ret = NP_BP_OK;
+    for (size_t k = 0; k < m; ++k) {
+        const size_t i = order[k];
         const size_t off = rv->data[i].off, len = rv->data[i].len;
         const unsigned char *bytes = rv->data[i].bytes;
         const size_t blen = rv->data[i].bytes_len;
@@ -308,9 +326,11 @@ np_bp_result_t np_review_commit_byte(np_review_t *rv, np_bytepatch_t *bp,
             if (why && why_cap)
                 snprintf(why, why_cap, "hunk %zu failed: %s", i, np_bp_result_name(r));
             np_bytepatch_undo(bp);
-            return r;
+            ret = r;
+            break;
         }
     }
-    np_bytepatch_end_group(bp);
-    return NP_BP_OK;
+    free(order);
+    if (ret == NP_BP_OK) np_bytepatch_end_group(bp);
+    return ret;
 }

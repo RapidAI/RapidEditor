@@ -3,6 +3,7 @@
 #include "np_patch.h"
 #include "np_integrity.h"
 #include "np_bytepatch.h"
+#include "np_bytediff.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,11 @@ struct np_review_ui {
      * 否则 Composer reset 会销毁 ps，滞留的注入指针变悬垂 → UAF） */
     np_patch_set_t *inject;
     char            inject_path[260];  /* 源文档：导入只在同文档会话 */
+
+    /* H7 字节 Diff 页脚信息 */
+    bool     diff_active;
+    size_t   diff_len_before, diff_len_after;
+    uint32_t diff_crc_before, diff_crc_after;
 
     /* 交互状态 */
     char hex_input[256];        /* 新内容 hex 文本 "DE AD BE EF" */
@@ -224,7 +230,10 @@ static void bind_locked(np_review_ui_t *r, const char *path,
                  np_fs_reason(r->path, data, len));
         return;
     }
-    /* 新文档/内容变化/换轨 → 重置 */
+    /* 新文档/内容变化/换轨 → 重置。
+     * H7: inject 触发的强制重建不清 diff 页脚（此时 r->inject 仍在）；
+     *     真正切换文档/编辑后才清。 */
+    if (!r->inject) r->diff_active = false;
     snprintf(r->path, sizeof(r->path), "%s", path ? path : "");
     r->data_len = len;
     r->data_crc = crc;
@@ -307,6 +316,70 @@ void np_review_ui_inject_text(np_review_ui_t *r, const np_patch_set_t *ps,
     /* 强制下一次 bind 重建会话并导入（会话可能已存在且指纹未变） */
     r->data_crc = 0;
     r->data_len = 0;
+}
+
+/* H7: 计算 before/after 字节 Diff → 构造字节 patch_set → 注入审查会话。 */
+size_t np_review_ui_inject_byte(np_review_ui_t *r,
+                                const unsigned char *before, size_t blen,
+                                const unsigned char *after, size_t alen,
+                                const char *src_path) {
+    if (!r || !before || !blen || !after) return 0;
+    np_bd_result_t diff;
+    if (!np_bytediff_compute(before, blen, after, alen, &diff)) return 0;
+
+    r->diff_active     = true;
+    r->diff_len_before = blen;
+    r->diff_len_after  = alen;
+    r->diff_crc_before = diff.crc_before;
+    r->diff_crc_after  = diff.crc_after;
+
+    drop_inject(r);
+    np_patch_set_t *ps = np_patch_set_create(0);
+    size_t added = 0;
+    if (ps) {
+        for (size_t i = 0; i < diff.nhunks; ++i) {
+            const np_bd_hunk_t *h = &diff.hunks[i];
+            const unsigned char *bytes = NULL;
+            size_t bytes_len = 0;
+            np_patch_op_t op;
+            if (h->kind == NP_BD_REPLACE) {
+                op = NP_OP_REPLACE;
+                bytes = after + h->after_off; bytes_len = h->after_len;
+            } else if (h->kind == NP_BD_INSERT) {
+                op = NP_OP_INSERT;
+                bytes = after + h->after_off; bytes_len = h->after_len;
+            } else {
+                op = NP_OP_DELETE;
+            }
+            if (np_patch_add_byte(ps, op, h->before_off, h->before_len,
+                                  bytes, bytes_len) == NP_PATCH_OK)
+                added++;
+        }
+    }
+    np_bytediff_free(&diff);
+    if (!ps || !added) { np_patch_set_destroy(ps); return 0; }
+
+    r->inject = ps;
+    snprintf(r->inject_path, sizeof(r->inject_path), "%s",
+             src_path ? src_path : "");
+    /* 强制下一次 bind 重建会话并导入 */
+    r->data_crc = 0;
+    r->data_len = 0;
+    snprintf(r->msg, sizeof(r->msg),
+             "字节 Diff：%zu 处改动（%zu→%zu 字节）", added, blen, alen);
+    r->msg_tone = NP_FS_WRITE_ALLOWED;
+    return added;
+}
+
+bool np_review_ui_diff_footer(const np_review_ui_t *rv,
+                              size_t *len_before, size_t *len_after,
+                              uint32_t *crc_before, uint32_t *crc_after) {
+    if (!rv || !rv->diff_active) return false;
+    if (len_before)  *len_before  = rv->diff_len_before;
+    if (len_after)   *len_after   = rv->diff_len_after;
+    if (crc_before)  *crc_before  = rv->diff_crc_before;
+    if (crc_after)   *crc_after   = rv->diff_crc_after;
+    return true;
 }
 
 void np_review_ui_set_selection(np_review_ui_t *r, size_t off, size_t sel_len) {
@@ -507,6 +580,18 @@ np_rvui_action_t np_review_ui_draw(np_review_ui_t *r, cui_ctx *ui) {
                          np_review_byte_delta(r->review));
             }
             cui_text(ui, foot, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+            /* H7 字节 Diff 页脚：长度前后 + CRC32 前后（H2 完整性证据） */
+            if (!is_text) {
+                size_t lb = 0, la = 0;
+                uint32_t cb = 0, ca = 0;
+                if (np_review_ui_diff_footer(r, &lb, &la, &cb, &ca)) {
+                    char dfoot[176];
+                    snprintf(dfoot, sizeof(dfoot),
+                             "字节 Diff：长度 %zu→%zu · CRC32 %08X→%08X",
+                             lb, la, cb, ca);
+                    cui_text(ui, dfoot, .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+                }
+            }
         }
         cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
             /* 开关变化后的 gate 复算在下一帧 bind 时进行（单帧滞后） */

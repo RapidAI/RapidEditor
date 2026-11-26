@@ -68,12 +68,17 @@ np_ti_dl_status_t np_ti_verify_package(const char *file,
                                        char *quarantined_path, size_t cap);
 
 /* T3 全流程（网络可用时）：白名单 URL 检查 → 下载 → 校验 → 隔离/放行。
- * downloader 注入以便单测（传 NULL 用 np_net_download 真下载）。
- * downloader 返回 false 表示网络失败。 */
+ * downloader 注入以便单测；返回 false 表示网络失败。
+ * 传 NULL 时用 np_ti_set_default_downloader 注册的默认下载器（主程序在
+ * 启动时注册 np_net_download 的薄适配）；未注册则视为网络失败（单测路径）。 */
 np_ti_dl_status_t np_ti_download_and_verify(
         np_ti_download_t *plan, const char *install_root,
         bool (*downloader)(const char *url, const char *dest, void *user),
         void *user, char *final_path, size_t cap);
+
+/* 注册 T3 默认下载器（主程序用：薄适配 np_net_download）。传 NULL 清空。 */
+void np_ti_set_default_downloader(
+        bool (*downloader)(const char *url, const char *dest, void *user));
 
 /* ------------------------------------------------------------------ */
 /* T4 隔离安装                                                          */

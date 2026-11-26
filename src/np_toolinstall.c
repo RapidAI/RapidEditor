@@ -14,6 +14,17 @@
 #endif
 
 /* ------------------------------------------------------------------ */
+/* T3 默认下载器（主程序注册，单测不注册 → 保持无网络依赖）             */
+/* ------------------------------------------------------------------ */
+
+static bool (*g_default_downloader)(const char *, const char *, void *) = NULL;
+
+void np_ti_set_default_downloader(
+        bool (*downloader)(const char *url, const char *dest, void *user)) {
+    g_default_downloader = downloader;
+}
+
+/* ------------------------------------------------------------------ */
 /* T4 安装根目录                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -199,9 +210,9 @@ np_ti_dl_status_t np_ti_download_and_verify(
 
     char qpath[300];
     for (int attempt = 1; attempt <= 2; ++attempt) {
-        bool ok = downloader
-            ? downloader(plan->url, plan->dest_path, user)
-            : false; /* 无注入且未链接 np_net 时视为网络失败 */
+        bool (*dl)(const char *, const char *, void *) =
+            downloader ? downloader : g_default_downloader;
+        bool ok = dl ? dl(plan->url, plan->dest_path, user) : false;
         if (!ok) return NP_TI_DL_ERR_NETWORK;
         np_ti_dl_status_t st = np_ti_verify_package(
             plan->dest_path, plan->expected_sha256, install_root,
