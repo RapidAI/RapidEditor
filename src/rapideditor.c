@@ -37,6 +37,7 @@
 #include "np_qr.h"
 #include "np_maclaw.h"
 #include "np_openai.h"
+#include "np_review_panel.h"   /* M2/B3: 统一 Patch Review 面板 */
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
@@ -528,10 +529,13 @@ typedef struct notepad {
     /* EditPlus-style workspace ---------------------------------------- */
     bool show_sidebar, show_output, follow_active;
     bool show_ai;                   /* AI assistant docked as a side panel */
+    bool show_review;               /* B3 补丁审查面板（与 AI 面板互斥显示） */
+    bool review_allow_write;        /* H8 写入开关持久位（每文件独立由面板管理） */
     bool zen_prev_ai;
     int  last_active;               /* to make the directory pane follow tab switches */
     float side_ratio, out_ratio;    /* first pane's share of each split */
     float ai_ratio;                 /* workspace share when the AI panel is docked */
+    float review_ratio;             /* workspace share when the review panel is docked */
     int  side_tab, out_tab;         /* 目录/文档/最近 · 查找结果/消息 */
     char side_dir[NP_PATH_CAP];
     bool side_reload;               /* rebuild the sidebar tree next frame */
@@ -9943,6 +9947,48 @@ static void np_cmd_run(notepad *a, int i) {
     }
 }
 
+/* ---- B3 补丁审查面板接线（M2）：主程序只做绑定与写回，逻辑在面板内 ---- */
+static void np_review_write_back(notepad *a, np_doc *d,
+                                 const unsigned char *data, size_t n) {
+    if (!d || !d->is_hex || !data) return;
+    if (!np_ensure_cap(d, n + 2)) return;
+    memcpy(d->text, data, n);
+    d->text[n] = 0;
+    d->len = (int)n;
+    d->file_size = n;
+    d->dirty = true;
+    d->rev++;
+    d->content_rev++;
+    np_bump_editor(a, d);
+    np_update_title(a);
+}
+
+static void np_review_panel_dock(cui_ctx *ui, notepad *a, np_doc *d) {
+    np_review_ui_t *rui = np_review_ui_get();
+    if (d && d->is_hex && d->len > 0) {
+        np_review_ui_bind(rui, d->path, (const unsigned char *)d->text,
+                          (size_t)d->len, a->review_allow_write);
+        np_review_ui_set_selection(rui, d->hexsel.start, d->hexsel.length);
+    } else {
+        np_review_ui_bind(rui, "", NULL, 0, a->review_allow_write);
+    }
+    np_rvui_action_t act = np_review_ui_draw(rui, ui);
+    if (act == NP_RVUI_CLOSED) {
+        a->show_review = false;
+        return;
+    }
+    if ((act == NP_RVUI_APPLY || act == NP_RVUI_UNDO) && d && d->is_hex) {
+        size_t n = 0;
+        const unsigned char *nd = np_review_ui_data(rui, &n);
+        if (nd) {
+            np_logf(a, "%s  %s  ·  %zu 字节",
+                    act == NP_RVUI_APPLY ? "补丁已应用" : "补丁已撤销",
+                    np_base(d->path), n);
+            np_review_write_back(a, d, nd, n);
+        }
+    }
+}
+
 static void np_frame(cui_ctx *ui, void *user) {
     notepad *a = (notepad *)user;
     a->ui = ui;
@@ -10495,6 +10541,9 @@ static void np_frame(cui_ctx *ui, void *user) {
                                       .shortcut = "Ctrl Alt P", .checked = a->show_preview))
                         a->show_preview = !a->show_preview;
                 }
+                if (cui_menu_item(ui, "补丁审查面板", .icon = CUI_ICON_EYE,
+                                  .checked = a->show_review))
+                    a->show_review = !a->show_review;
                 if (cui_menu_item(ui, "目录跟随当前文件", .icon = CUI_ICON_BOOKMARK,
                                   .checked = a->follow_active))
                     a->follow_active = !a->follow_active;
@@ -10881,6 +10930,23 @@ static void np_frame(cui_ctx *ui, void *user) {
                 cui_split_next(ui);
                 np_ai_panel(ui, a, d);
             }
+        } else if (a->show_review) {
+            /* B3 补丁审查面板 dock 在最右（与 AI 面板互斥：show_ai 优先） */
+            cui_split(ui, "np_review_split", &a->review_ratio,
+                      .min_first = 400, .min_second = 260) {
+                if (a->show_sidebar) {
+                    cui_split(ui, "np_main_split", &a->side_ratio,
+                              .min_first = 175, .min_second = 400) {
+                        np_sidebar(ui, a);
+                        cui_split_next(ui);
+                        d = np_workspace(ui, a, busy);
+                    }
+                } else {
+                    d = np_workspace(ui, a, busy);
+                }
+                cui_split_next(ui);
+                np_review_panel_dock(ui, a, d);
+            }
         } else if (a->show_sidebar) {
             cui_split(ui, "np_main_split", &a->side_ratio,
                       .min_first = 175, .min_second = 400) {
@@ -11126,6 +11192,7 @@ int main(int argc, char **argv) {
     np_http_init(&g.web_server);
     g.side_ratio = 0.22f;
     g.ai_ratio = 0.72f;
+    g.review_ratio = 0.72f;
     g.inline_delay = 1;
     g.out_ratio = 0.76f;
     g.side_tab = 0;

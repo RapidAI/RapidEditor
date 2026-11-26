@@ -83,7 +83,9 @@ $tests = @(
     @{ name = "test_s0_index";     src = "scripts\test_s0_index.c";     link = @("src\np_index.c","src\np_integrity.c") },
     @{ name = "test_s1_probe";     src = "scripts\test_s1_probe.c";     link = @("src\np_probe.c") },
     @{ name = "test_s1_toolinstall"; src = "scripts\test_s1_toolinstall.c"; link = @("src\np_toolinstall.c","src\np_toolchain.c","src\np_integrity.c") },
-    @{ name = "test_s1_skillmgr";  src = "scripts\test_s1_skillmgr.c";  link = @("src\np_skillmgr.c","src\np_texttools.c","src\np_capability.c","src\np_patch.c","src\np_job.c","src\np_integrity.c") }
+    @{ name = "test_s1_skillmgr";  src = "scripts\test_s1_skillmgr.c";  link = @("src\np_skillmgr.c","src\np_texttools.c","src\np_capability.c","src\np_patch.c","src\np_job.c","src\np_integrity.c") },
+    @{ name = "test_m1_sqlite";    src = "scripts\test_m1_sqlite.c";    link = @("src\np_sqlite.c","src\np_probe.c"); runIn = "repo" },
+    @{ name = "test_m2_review";    src = "scripts\test_m2_review.c";    link = @("src\np_review.c","src\np_patch.c","src\np_bytepatch.c","src\np_filesafety.c","src\np_integrity.c","src\np_job.c") }
 )
 
 $fail = 0
