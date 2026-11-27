@@ -1,0 +1,32 @@
+// PCAP capture: global header and packet records (microsecond timestamps)
+LittleEndian();
+if (FSize() >= 24) {
+    uint32 magic;                   // 0xA1B2C3D4 (LE) or 0xD4C3B2A1 (BE file)
+    if (magic == 0xA1B2C3D4) {
+        FSeek(0);
+        struct PcapGlobal {
+            uint32 magic;
+            ushort major;
+            ushort minor;
+            int32 thiszone;
+            uint32 sigfigs;
+            uint32 snaplen;
+            uint32 network;
+        };
+        PcapGlobal gh;
+        uint32 packets = 0;
+        while (!FEof() && packets < 64 && FTell() + 16 <= FSize()) {
+            if (FTell() >= FSize()) break;
+            struct PacketRec {
+                uint32 ts_sec;
+                uint32 ts_usec;
+                uint32 incl_len;
+                uint32 orig_len;
+            };
+            PacketRec rec;
+            if (rec.incl_len > FSize() - FTell()) break;
+            ubyte data[rec.incl_len];
+            packets = packets + 1;
+        }
+    }
+}

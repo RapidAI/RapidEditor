@@ -6,6 +6,23 @@
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); fails++; } else printf("ok: %s\n", msg); } while (0)
 
+static char g_seen[256];
+static int g_calls;
+static bool collect_delta(const char *d, size_t n, void *u) {
+    (void)u;
+    size_t room = sizeof g_seen - strlen(g_seen) - 1;
+    if (n > room) n = room;
+    memcpy(g_seen + strlen(g_seen), d, n);
+    g_seen[strlen(g_seen) + n] = 0;
+    g_calls++;
+    return true;
+}
+static bool cancel_delta(const char *d, size_t n, void *u) {
+    (void)d; (void)n; (void)u;
+    g_calls++;
+    return false;         /* cancel immediately on the first delta */
+}
+
 int main(void) {
     char out[512];
     CHECK(np_ai_subst("claude -p {file} > {out}", "{file}", "\"C:\\a b\\ctx.txt\"", out, sizeof out), "subst1 ok");
@@ -64,6 +81,55 @@ int main(void) {
         FILE *chk = fopen(outp, "rb");
         CHECK(chk == NULL, "stale result removed, late output not written");
         if (chk) fclose(chk);
+        remove(ctx); remove(outp);
+    }
+#endif
+
+#ifdef _WIN32
+    /* Streaming: a command that appends to the result file in stages. The
+     * poll loop must deliver each stage to on_delta before the process exits. */
+    {
+        const char *ctx = "test-stream-ctx.tmp";
+        const char *outp = "test-stream-out.tmp";
+        np_ai_write_context(ctx, "x");
+        /* ping inserts delays; each echo appends one token. */
+        const char *tpl = "echo A > {out} & ping -n 2 127.0.0.1 > nul & echo B >> {out} & "
+                          "ping -n 2 127.0.0.1 > nul & echo C >> {out}";
+        g_seen[0] = 0; g_calls = 0;
+        char err[256];
+        volatile bool cancel = false;
+        np_ai_exec_stream(tpl, ctx, outp, NULL, 6000, &cancel,
+                          collect_delta, NULL, err, sizeof err);
+        char res[128];
+        long rn = np_ai_read_result(outp, res, sizeof res);
+        CHECK(rn > 0 && strstr(res, "A") && strstr(res, "B") && strstr(res, "C"),
+              "stream command produced full output");
+        CHECK(strstr(g_seen, "A") && strstr(g_seen, "C"),
+              "stream delivered both early and late deltas");
+        CHECK(g_calls >= 2, "stream invoked delta callback more than once");
+        remove(ctx); remove(outp);
+    }
+    /* Cancel via delta callback: stop early, keep partial output. */
+    {
+        const char *ctx = "test-stream2-ctx.tmp";
+        const char *outp = "test-stream2-out.tmp";
+        np_ai_write_context(ctx, "x");
+#ifdef _WIN32
+        const char *tpl = "echo FIRST > {out} & ping -n 10 127.0.0.1 > nul & echo SECOND >> {out}";
+#else
+        const char *tpl = "echo FIRST > {out}; sleep 2; echo SECOND >> {out}";
+#endif
+        g_calls = 0;
+        char err[256];
+        volatile bool cancel = false;
+        bool ok = np_ai_exec_stream(tpl, ctx, outp, NULL, 6000, &cancel,
+                                    cancel_delta, NULL, err, sizeof err);
+        CHECK(!ok, "stream cancel reported failure");
+        CHECK(cancel, "stream cancel flag set");
+        CHECK(strstr(err, "停止") != NULL, "stream cancel error message");
+        char res[128];
+        long rn = np_ai_read_result(outp, res, sizeof res);
+        CHECK(rn > 0 && strstr(res, "FIRST"), "stream cancel keeps partial output");
         remove(ctx); remove(outp);
     }
 #endif

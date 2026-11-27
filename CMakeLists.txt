@@ -5,13 +5,13 @@ cmake_minimum_required(VERSION 3.16)
 # "required internal CMake variable not set: CMAKE_OBJCXX_COMPILE_OBJECT".
 if(APPLE)
     project(RapidEditor
-        VERSION 1.3.11
+        VERSION 1.3.12
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX OBJCXX)
 else()
     project(RapidEditor
-        VERSION 1.3.11
+        VERSION 1.3.12
         DESCRIPTION "A fast multi-tab notepad and source-code editor built on CUI"
         HOMEPAGE_URL "https://github.com/RapidAI/RapidEditor"
         LANGUAGES C CXX)
@@ -69,11 +69,11 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                src/np_ai.c src/np_qr.c src/np_maclaw.c src/np_openai.c
                src/np_latex_html.c
                # S0 AI-native底座：三轨任务/补丁/上下文 + 二进制守卫 + AI能力层 + 工具链 + 索引
-               src/np_job.c src/np_patch.c src/np_bytepatch.c src/np_integrity.c
+               src/np_job.c src/np_patch.c src/np_bytepatch.c src/np_hexundo.c src/np_integrity.c
                src/np_filesafety.c src/np_capability.c src/np_toolchain.c
                src/np_context.c src/np_citation.c src/np_index.c
                # S1 工作流：探测路由 + 工具链自动供给 + Skill/MCP 管理 + 原生文本工具
-               src/np_probe.c src/np_toolinstall.c src/np_toolinstall_zip.c
+               src/np_probe.c src/np_sandbox.c src/np_toolinstall.c src/np_toolinstall_zip.c
                src/np_skillmgr.c src/np_texttools.c
                src/np_sqlite.c src/np_review.c src/np_review_panel.c
                # M4 B2计划卡 + F3 schema 树汇合（模型无 CUI，UI 独立文件）
@@ -81,13 +81,24 @@ set(RE_SOURCES src/rapideditor.c src/np_preview.c src/np_font_bundle.c
                # M3 B1 Composer → Job → PatchSet（模型无 CUI，UI 独立文件）
                src/np_composer.c src/np_composer_ui.c
                # F2 OOXML(OPC) 容器解析与结构树（模型无 CUI，UI 独立文件）
-               src/np_ooxml.c src/np_ooxml_ui.c
+               src/np_ooxml.c src/np_ooxml_ui.c src/np_ooxml_write.c
                # H3/H4 字节解释 + 结构化字节搜索（模型无 CUI）
-               src/np_byteintel.c
+               src/np_byteintel.c src/np_disasm.c src/np_deq.c src/np_fmtdiff.c
+               src/np_featcard.c
+               src/np_sqlquery.c
+               src/np_cfg.c
+               src/np_revasst.c
+               src/np_patchimpact.c
+               src/np_binsummary.c
+               src/np_bintools.c
+               src/np_extlife.c
+               src/np_gapdetect.c
+               # DC1 本地反编译后端桥接（内置启发式 + 注入外部后端，只读）
+               src/np_decomp.c
                # H7 字节 Diff Review（模型无 CUI）
                src/np_bytediff.c
                # X9 SearchProfile 可配置知识搜索接口（模型无 CUI）
-               src/np_searchprofile.c
+               src/np_searchprofile.c src/np_searchhit.c
                # X6 MCP 工具服务器：动态发现/健康检查/不可信输出清洗（模型无 CUI，传输注入）
                src/np_mcp.c
                # X10 混合知识索引与 Context Pack（自研 BM25 + 注入式向量）

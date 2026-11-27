@@ -45,14 +45,25 @@
 #include "np_ooxml_ui.h"       /* F2: OOXML(OPC) 结构树面板 */
 #include "np_byteintel.h"      /* H3/H4: 字节解释 + 结构化字节搜索 */
 #include "np_bytediff.h"       /* H7: 字节 Diff（对照文件 → B3 审查） */
+#include "np_patchimpact.h"    /* R6: 补丁影响分析（字节→指令/函数/块 + H2 校验） */
+#include "np_binsummary.h"     /* R4: 符号/字符串/导入表摘要（只读解析） */
 #include "np_searchprofile.h"  /* X9: 可配置知识搜索接口（SearchProfile） */
 #include "np_mcp.h"            /* X6: MCP 工具服务器（动态发现/健康检查/不可信输出） */
 #include "np_kbidx.h"          /* X10: 混合知识索引与 Context Pack */
+#include "np_hexundo.h"        /* H1: hex 手动编辑多级撤销会话 */
+#include "np_disasm.h"         /* R2: 多架构反汇编视图（注入式解码） */
+#include "np_searchhit.h"      /* X11: 搜索结果引用、读回与防注入 */
+#include "np_sandbox.h"        /* T10: 分析沙箱策略与企业离线门禁 */
+#include "np_featcard.h"       /* F4: AI 特征抽取与特征卡（只读，证据回跳） */
+#include "np_sqlquery.h"       /* F6: 结构化查询与采样分析（只读预览，需确认） */
+#include "np_cfg.h"            /* R3: 函数边界与控制流图（启发式 L1） */
+#include "np_revasst.h"        /* R5: AI 逆向助手（只读，命名待确认） */
+#include "np_decomp.h"         /* DC1: 反编译后端桥接（候选·待确认，只读） */
 
 /* App version for the update check. Keep in sync with versionName in
  * android/app/build.gradle (single source of truth for the Android build
  * is there; this macro drives the GitHub tag comparison). */
-#define NP_APP_VERSION "1.3.11"
+#define NP_APP_VERSION "1.3.12"
 
 #include <ctype.h>
 #include <errno.h>
@@ -383,6 +394,7 @@ typedef struct np_doc {
     bool crlf;
     bool is_hex;                        /* binary file: shown in the hex editor */
     cui_hex_selection hexsel;           /* hex view selection (per document) */
+    np_hexundo_t *hex_undo;             /* H1: 手动 hex 编辑撤销栈（懒创建，仅 hex 文档） */
     /* Binary template (010 Editor style) applied to this hex document */
     char      bt_name[96];              /* active template name, empty = none */
     char      bt_source[BT_SRC_CAP];    /* active template script (loaded/embedded) */
@@ -574,6 +586,40 @@ typedef struct notepad {
     int hexfind_hit_count;
     unsigned hexfind_doc_uid;           /* the hits belong to this document */
 
+    /* R2: 多架构反汇编视图（Hex 旁标签） -------------------------------- */
+    bool show_disasm;                   /* 显示反汇编面板 */
+    np_disasm_view_t *disasm;           /* 反汇编视图（懒创建） */
+    np_parch_t disasm_arch;             /* 上次探测的架构（决定 ARM 模式切换显示） */
+    unsigned disasm_doc_uid;            /* 当前指令属于哪个文档 */
+    char disasm_status[256];            /* 架构/来源/错误状态展示 */
+    int disasm_pick;                    /* 选中的指令行 */
+    /* R3: 函数边界与 CFG（基于当前反汇编指令的启发式分析） ------------- */
+    bool show_cfg;                      /* 反汇编面板内切到 CFG 视图 */
+    np_cfg_graph_t cfg;                 /* 函数/CFG 图模型 */
+    char cfg_status[200];
+    unsigned cfg_doc_uid;               /* 图属于哪个文档 */
+    char cfg_mermaid[NP_CFG_MAX_MERMAID]; /* Mermaid 文本（复制用） */
+    /* R5: AI 逆向助手分析结果（选函数 → 只读分析） --------------------- */
+    np_ra_result_t rev_result;          /* 当前函数的逆向分析结果 */
+    char rev_ctx[NP_RA_MAX_CTX];        /* 分析上下文（可复制到 AI 工作台） */
+    bool rev_done;
+    int  rev_func;                      /* 分析的函数下标 */
+    /* DC1: 反编译候选（内置启发式 · 逐行 offset 映射 · 候选待确认） ----- */
+    np_dc_result_t dc_result;           /* 当前函数反编译候选（全局实例，避免栈溢出） */
+    char dc_md[32768];                  /* 渲染后的 Markdown（复制用） */
+    char dc_status[200];
+    bool dc_done;
+    int  dc_func;                       /* 反编译的函数下标 */
+    /* R6: 补丁影响分析报告（当前字节 vs 对照版本） ---------------------- */
+    bool dlg_pi;
+    char pi_report[NP_PI_MAX_SUMMARY];
+    char pi_status[200];
+    /* R4: 二进制摘要（符号/字符串/导入） ------------------------------- */
+    bool dlg_binsum;
+    char bs_path[NP_PATH_CAP];
+    char bs_report[NP_BS_MAX_OUT];
+    char bs_status[200];
+
     /* Binary template (010 Editor style) ------------------------------- */
     bool dlg_bt;                        /* choose a binary template */
     int  bt_pick;                       /* selected builtin in the dialog */
@@ -723,6 +769,9 @@ typedef struct notepad {
     char sp_test_query[128];            /* 本地召回测试词 */
     char sp_test_result[512];           /* 测试输出（脱敏后） */
     bool sp_test_done;
+    /* X11: 搜索正文防注入预览（不可信输入，清洗后展示） */
+    char x11_preview[2048];
+    bool x11_preview_done;
 
     /* X6: MCP 工具服务器 — 动态发现/健康检查（工具输出不可信） ----------- */
     np_mcp_store_t *mcp_store;          /* 配置注册表（懒加载） */
@@ -731,6 +780,22 @@ typedef struct notepad {
     /* X10: 混合知识索引与 Context Pack ------------------------------- */
     np_kb_store_t *kb_store;            /* 懒加载，存 kbindex.kb */
     bool dlg_kb;                        /* 知识索引对话框 */
+    /* F4: AI 特征卡（从当前 F2/F3 只读解析结果抽取，证据可回跳） ------- */
+    bool dlg_featcard;
+    char fc_path[NP_PATH_CAP];          /* 目标文档/数据库路径 */
+    char fc_md[NP_FC_MAX_CARD];         /* 渲染后的特征卡（Markdown） */
+    char fc_err[200];
+    bool fc_done;
+    /* F6: 结构化查询与采样分析（只读预览，需确认后执行） --------------- */
+    bool dlg_sqlquery;
+    char sq_path[NP_PATH_CAP];          /* 目标 .db 路径 */
+    char sq_input[NP_SQ_MAX_SQL];       /* SQL 或自然语言输入 */
+    char sq_preview[NP_SQ_MAX_OUT];     /* 查询计划预览（供确认） */
+    char sq_result[NP_SQ_MAX_OUT];      /* Markdown 结果 + 质量报告 */
+    char sq_err[200];
+    bool sq_confirmed;                  /* 用户确认开关 */
+    bool sq_has_plan;                   /* 是否已解析出计划 */
+    np_sq_plan_t sq_plan;
     np_kb_doc_t kb_form;                /* 新增/编辑表单 */
     int kb_edit;                        /* -1 无；-2 新增；>=0 索引 */
     char kb_query[NP_KB_QUERY_CAP];     /* 检索词 */
@@ -764,6 +829,10 @@ typedef struct notepad {
     np_ti_health_t ti_health;
     bool ti_health_done;
     char ti_pick_show[2048];            /* T7 降级链展示 */
+
+    /* T10: 分析沙箱策略（企业离线门禁，config_dir/sandbox.ini 持久化） */
+    np_sb_policy_t sb_policy;           /* 策略（启动时加载） */
+    np_sb_audit_t *sb_audit;            /* 审计环形缓冲（懒创建） */
     int  mcp_edit;                      /* -1 无表单 / -2 新增 / >=0 编辑索引 */
     np_mcp_server_t mcp_form;           /* 编辑缓冲 */
     char mcp_test_result[512];          /* 发现/健康检查输出（脱敏后） */
@@ -937,7 +1006,8 @@ static bool np_any_dialog(const notepad *a) {
            a->dlg_bt || a->dlg_latex_table || a->dlg_latex_tidy || a->dlg_latex_fonts ||
            a->dlg_math_preview || a->dlg_maclaw || a->dlg_reload ||
            a->dlg_llm_prov || a->dlg_ai_actions || a->dlg_smart_paste ||
-           a->dlg_searchprof || a->dlg_mcp || a->dlg_kb || a->dlg_ti;
+           a->dlg_searchprof || a->dlg_mcp || a->dlg_kb || a->dlg_ti ||
+           a->dlg_featcard || a->dlg_sqlquery || a->dlg_pi || a->dlg_binsum;
 }
 
 /* Compare a release tag ("v1.3.0" / "1.3.0") against NP_APP_VERSION.
@@ -1101,6 +1171,7 @@ static np_doc *np_doc_from_latex_template(notepad *a, int index) {
 
 static void np_doc_free(np_doc *d) {
     if (!d) return;
+    np_hexundo_destroy(d->hex_undo);
     np_bt_result_free(&d->bt_result);
     free(d->text); free(d->tmp); free(d);
 }
@@ -1510,6 +1581,7 @@ static bool np_load_binary(notepad *a, np_doc *d, const char *path) {
     d->rev++;
     d->content_rev++;
     memset(&d->hexsel, 0, sizeof d->hexsel);
+    np_hexundo_reset(d->hex_undo, d->text, (size_t)d->len);  /* 新文件：清空撤销历史 */
     np_bump_editor(a, d);
     np_add_recent(a, path);
     np_update_title(a);
@@ -3277,6 +3349,10 @@ static void np_searchprof_dialog(notepad *a, cui_ctx *ui); /* X9: 定义在 np_c
 static void np_mcp_dialog(notepad *a, cui_ctx *ui);        /* X6: 定义在 np_config_path 之后 */
 static void np_kb_dialog(notepad *a, cui_ctx *ui);         /* X10: 定义在 np_mcp_dialog 之后 */
 static void np_ti_dialog(notepad *a, cui_ctx *ui);         /* T3/T4: 定义在 np_kb_dialog 之后 */
+static void np_featcard_dialog(notepad *a, cui_ctx *ui);   /* F4: 定义在 np_ti_dialog 之后 */
+static void np_sqlquery_dialog(notepad *a, cui_ctx *ui);   /* F6: 定义在 np_featcard_dialog 之后 */
+static void np_pi_dialog(notepad *a, cui_ctx *ui);         /* R6: 定义在 np_hex_diff_dialog 之后 */
+static void np_binsum_dialog(notepad *a, cui_ctx *ui);     /* R4: 定义在 np_pi_dialog 之后 */
 
 static void np_dialogs(notepad *a, cui_ctx *ui) {
     np_settings_dialog(ui, a);
@@ -4370,6 +4446,10 @@ static void np_dialogs(notepad *a, cui_ctx *ui) {
     np_searchprof_dialog(a, ui);   /* X9: 知识搜索源配置（只召回，不写） */
     np_mcp_dialog(a, ui);          /* X6: MCP 工具服务器管理（发现/健康/不可信输出） */
     np_kb_dialog(a, ui);           /* X10: 知识索引与 Context Pack */
+    np_featcard_dialog(a, ui);     /* F4: 特征卡（只读抽取，证据可回跳） */
+    np_sqlquery_dialog(a, ui);     /* F6: 结构化查询（只读预览，需确认） */
+    np_pi_dialog(a, ui);           /* R6: 补丁影响分析报告 */
+    np_binsum_dialog(a, ui);       /* R4: 二进制摘要（符号/字符串/导入） */
     np_ti_dialog(a, ui);           /* T3/T4: 分析工具安装 */
 }
 
@@ -4893,14 +4973,18 @@ static void np_ai_worker(void *arg) {
     bool wrote = np_ai_write_context(a->ai_ctx_path, prompt);
     free(prompt);
     if (!wrote) { a->ai_done = 3; snprintf(a->ai_error, sizeof a->ai_error, "无法写入临时提示文件"); goto done; }
-    if (!np_ai_exec_cancel(a->ai_cmd, a->ai_ctx_path, a->ai_out_path, NULL,
-                           &a->ai_cancel, a->ai_error, sizeof a->ai_error)) {
-        np_ai_finish(a, false);
-        goto done;
-    }
+    /* 本地 CLI：流式读取重定向输出文件，delta 回调实时发布 ai_stream_len，
+     * 与另外两条后端路径的 UI 行为一致；失败仍读回已产生的部分内容供审查。 */
+    bool ok = np_ai_exec_stream(a->ai_cmd, a->ai_ctx_path, a->ai_out_path, NULL,
+                                NP_AI_TIMEOUT_MS, &a->ai_cancel,
+                                np_ai_delta_cb, a,
+                                a->ai_error, sizeof a->ai_error);
     long n = np_ai_read_result(a->ai_out_path, a->ai_result, sizeof a->ai_result);
-    if (n < 0) {
-        snprintf(a->ai_error, sizeof a->ai_error, "无法读取 AI 输出");
+    if (!ok || n < 0) {
+        if (a->ai_cancel && n >= 0 && a->ai_result[0])
+            snprintf(a->ai_error, sizeof a->ai_error, "已停止（保留部分输出供审查）");
+        else if (!a->ai_error[0])
+            snprintf(a->ai_error, sizeof a->ai_error, "AI 调用失败");
         np_ai_finish(a, false);
         goto done;
     }
@@ -4931,9 +5015,21 @@ static void np_ai_maclaw_worker(void *arg) {
         goto done;
     }
     np_ai_build_prompt(a, prompt, prompt_cap);
-    bool ok = np_maclaw_llm_chat(a->maclaw_hub, a->maclaw_token, prompt,
-                                 a->ai_result, sizeof a->ai_result,
-                                 a->ai_error, sizeof a->ai_error);
+    /* 官方 Hub 走 SSE 流式：delta 回调实时发布 ai_stream_len，UI 可在生成中
+     * 显示部分内容并随时停止。失败（非取消）时回退到一次性 chat 保证可用。 */
+    bool ok = np_maclaw_llm_chat_stream(a->maclaw_hub, a->maclaw_token, prompt,
+                                        a->ai_result, sizeof a->ai_result,
+                                        a->ai_error, sizeof a->ai_error,
+                                        &a->ai_cancel, np_ai_delta_cb, a);
+    /* 只在流式一字未收到时回退一次性 chat；已有部分内容则保留供审查，
+     * 避免网络中断把已生成的文本清掉（与 OpenAI worker 的降级策略一致）。 */
+    if (!ok && !a->ai_cancel && !a->ai_result[0]) {
+        a->ai_error[0] = 0;
+        a->ai_stream_len = 0;
+        ok = np_maclaw_llm_chat(a->maclaw_hub, a->maclaw_token, prompt,
+                                a->ai_result, sizeof a->ai_result,
+                                a->ai_error, sizeof a->ai_error);
+    }
     free(prompt);
     if (a->ai_cancel && ok) {
         snprintf(a->ai_error, sizeof a->ai_error, "已停止");
@@ -6940,6 +7036,20 @@ static char *np_sp_ui_fetch(const char *url, const char *method, const char *sec
     o.timeout_sec = timeout_sec > 0 ? timeout_sec : 8;
     return np_net_get_json(url, secret, &o, status_out);
 }
+/* X11 正文抓取适配器：np_net_fetch 返回堆串，复制到注入式回调的输出缓冲。
+ * 正文一律按不可信处理（清洗在 np_sh_fetch_slices 内完成）。 */
+static long np_sh_ui_fetch(const char *url, unsigned char *out, size_t cap, void *user) {
+    (void)user;
+    np_net_opts o; memset(&o, 0, sizeof o);
+    o.timeout_sec = 8;
+    char *body = np_net_fetch(url, &o);
+    if (!body) return -1;
+    size_t n = strlen(body);
+    if (n > cap) n = cap;
+    memcpy(out, body, n);
+    free(body);
+    return (long)n;
+}
 /* 鉴权引用解析：仅识别 env:NAME 从环境变量取明文（不落盘、不进日志）；
  * keychain:/vault: 等引用本机无系统钥匙串绑定时返回 NULL（匿名请求）。 */
 static const char *np_sp_ui_resolve(const char *auth_ref, void *user) {
@@ -7110,6 +7220,31 @@ static void np_searchprof_dialog(notepad *a, cui_ctx *ui) {
             }
             if (a->sp_test_done)
                 cui_text(ui, a->sp_test_result, .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+            /* X11: 抓取该 profile 的端点正文，按不可信处理清洗后预览。 */
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, "防注入预览…", .size = CUI_SIZE_SM,
+                               .tooltip = "抓取正文并按不可信输入清洗（提示注入标记/PII 脱敏/编码检测），仅预览不进上下文")) {
+                    a->x11_preview_done = false;
+                    np_sh_slice_t slices[2];
+                    char err[200];
+                    int ns = np_sh_fetch_slices(np_sh_ui_fetch, NULL,
+                                                f->endpoint, 0, 4000,
+                                                slices, 2, err, sizeof err);
+                    if (ns > 0) {
+                        snprintf(a->x11_preview, sizeof a->x11_preview,
+                                 "编码 %s · %d 段 · 首段 hash=%08x\n%s",
+                                 np_sh_encoding_name(slices[0].encoding), ns,
+                                 slices[0].hash, slices[0].text);
+                    } else {
+                        snprintf(a->x11_preview, sizeof a->x11_preview,
+                                 "抓取/清洗失败：%s", err[0] ? err : "未知");
+                    }
+                    a->x11_preview_done = true;
+                }
+            }
+            if (a->x11_preview_done)
+                cui_text(ui, a->x11_preview, .size = 11, .nowrap = false,
+                         .color = CUI_COLOR_TEXT_MUTED);
             cui_row(ui, .width = CUI_FILL, .gap = 6) {
                 if (cui_button(ui, "保存", .variant = CUI_BUTTON_PRIMARY)) {
                     char why[160];
@@ -7539,6 +7674,17 @@ static void np_ti_install_worker(void *arg) {
         a->ti_state = 2;
         return;
     }
+    /* T10 企业策略门禁：离线模式下公网 URL 直接拒绝（fail-closed），
+     * 任何被拒都写审计；放行才进入下载/校验/安装链。 */
+    np_sb_verdict_t sv = np_sb_check_url(&a->sb_policy, e->source_url);
+    if (a->sb_audit) np_sb_audit_add(a->sb_audit, "fetch", e->source_url, sv);
+    if (sv != NP_SB_ALLOW) {
+        a->ti_status = NP_TI_ZIP_ERR_ARG;
+        snprintf(a->ti_err, sizeof a->ti_err, "企业沙箱策略拒绝下载：%s（%s）",
+                 np_sb_verdict_name(sv), e->source_url);
+        a->ti_state = 2;
+        return;
+    }
     a->ti_status = np_ti_fetch_and_install(e, a->ti_bin_rel, a->ti_strip_root,
                                            NULL, NULL, NULL,
                                            &a->ti_result, a->ti_err, sizeof a->ti_err);
@@ -7566,6 +7712,169 @@ static void np_ti_refresh_pick(notepad *a) {
     else
         snprintf(at, left, "decompile → 无可用层\n");
 }
+/* F4: 特征卡——对 OOXML 文档或 SQLite 库做只读特征抽取，
+ * 每条特征带证据回跳串与置信度；L2 候选明确标注需人工确认。 */
+static void np_featcard_dialog(notepad *a, cui_ctx *ui)
+{
+    if (!a->dlg_featcard) return;
+    cui_dialog(ui, "AI 特征卡（只读抽取 · 证据可回跳）", &a->dlg_featcard,
+               .description = "从 OOXML 文档 / SQLite 库抽取结构、语义、质量与安全特征。"
+                              "每条特征带 file#结构路径 证据与置信度；L2 主题/列语义/外键为"
+                              "启发式候选，需人工确认。只读，绝不修改源文件。",
+               .width = 820) {
+        cui_input(ui, "fc-path", a->fc_path, sizeof a->fc_path,
+                  .label = "文档 / 数据库路径",
+                  .placeholder = "tests/golden/golden.docx 或 golden_full.db",
+                  .width = CUI_FILL);
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            if (cui_button(ui, "生成特征卡", .variant = CUI_BUTTON_PRIMARY)) {
+                np_fc_card_t card;
+                np_fc_status_t st = NP_FC_ERR_ARG;
+                const char *p = a->fc_path;
+                size_t pl = strlen(p);
+                a->fc_done = true;
+                a->fc_md[0] = '\0';
+                a->fc_err[0] = '\0';
+                if (pl == 0) {
+                    (void)snprintf(a->fc_err, sizeof a->fc_err, "请先填写文件路径");
+                } else if (pl > 3 && (strstr(p, ".db") || strstr(p, ".sqlite"))) {
+                    st = np_fc_extract_sqlite(p, p, &card);
+                } else {
+                    st = np_fc_extract_ooxml(p, p, &card);
+                }
+                if (st != NP_FC_OK && a->fc_err[0] == '\0')
+                    (void)snprintf(a->fc_err, sizeof a->fc_err,
+                                   "解析失败或格式不支持（支持 .docx/.xlsx/.pptx/.db）");
+                if (st == NP_FC_OK &&
+                    np_fc_render(&card, a->fc_md, sizeof a->fc_md) < 0) {
+                    (void)snprintf(a->fc_err, sizeof a->fc_err,
+                                   "特征卡过大，渲染失败");
+                }
+            }
+            if (cui_button(ui, "清空")) {
+                a->fc_md[0] = '\0';
+                a->fc_err[0] = '\0';
+                a->fc_done = false;
+            }
+        }
+        if (a->fc_err[0])
+            cui_text(ui, a->fc_err, .size = 12, .color = CUI_COLOR_DANGER);
+        if (a->fc_done && a->fc_md[0])
+            cui_text(ui, a->fc_md, .size = 11, .nowrap = false,
+                     .color = CUI_COLOR_TEXT_MUTED);
+    }
+}
+
+/* F6: 结构化查询与采样分析——只读 SELECT 预览 + 需确认后执行 +
+ * 采样行/空值率/数值范围。SQL 与自然语言均走白名单门禁，写操作一律拒绝。 */
+static void np_sqlquery_dialog(notepad *a, cui_ctx *ui)
+{
+    if (!a->dlg_sqlquery) return;
+    cui_dialog(ui, "结构化查询与采样分析（只读 · 需确认）", &a->dlg_sqlquery,
+               .description = "输入受限 SELECT 或自然语言，先生成只读查询计划供确认，"
+                              "确认后才执行采样分析。安全红线：INSERT/UPDATE/DELETE/DROP/"
+                              "PRAGMA 等写操作一律拒绝；未声明的表/列拒绝；大文件按"
+                              "行数上限截断并标注 sampled。",
+               .width = 860) {
+        size_t n;
+        cui_input(ui, "sq-path", a->sq_path, sizeof a->sq_path,
+                  .label = "SQLite 数据库路径",
+                  .placeholder = "tests/golden/golden_full.db", .width = CUI_FILL);
+        cui_input(ui, "sq-input", a->sq_input, sizeof a->sq_input,
+                  .label = "查询（SQL 或自然语言）",
+                  .placeholder = "SELECT name, age FROM users WHERE age > 25",
+                  .width = CUI_FILL);
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            if (cui_button(ui, "生成只读查询计划", .size = CUI_SIZE_SM)) {
+                unsigned char *buf = NULL;
+                size_t len = 0;
+                np_db_schema_t sch;
+                np_sq_status_t st = NP_SQ_ERR_ARG;
+                FILE *f = fopen(a->sq_path, "rb");
+                a->sq_err[0] = '\0';
+                a->sq_preview[0] = '\0';
+                a->sq_result[0] = '\0';
+                a->sq_has_plan = false;
+                a->sq_confirmed = false;
+                memset(&a->sq_plan, 0, sizeof a->sq_plan);
+                if (!f) {
+                    (void)snprintf(a->sq_err, sizeof a->sq_err, "无法打开数据库文件");
+                } else {
+                    buf = (unsigned char *)malloc(64u * 1024u * 1024u);
+                    if (buf) {
+                        len = fread(buf, 1, 64u * 1024u * 1024u, f);
+                        fclose(f);
+                        if (np_db_parse(buf, len, &sch) == NP_DB_OK) {
+                            /* 以 SELECT/sqlite 关键字开头按 SQL 解析，否则自然语言 */
+                            n = strlen(a->sq_input);
+                            if (n >= 6 && strncmp(a->sq_input, "select", 6) == 0)
+                                st = np_sq_parse_sql(a->sq_input, &sch, &a->sq_plan);
+                            else
+                                st = np_sq_parse_nl(a->sq_input, &sch, &a->sq_plan);
+                        } else {
+                            st = NP_SQ_ERR_NOTSQLITE;
+                        }
+                        free(buf);
+                    } else {
+                        fclose(f);
+                        (void)snprintf(a->sq_err, sizeof a->sq_err, "内存不足");
+                    }
+                }
+                if (st == NP_SQ_OK) {
+                    a->sq_has_plan = true;
+                    if (np_sq_preview(&a->sq_plan, a->sq_preview,
+                                      sizeof a->sq_preview) < 0)
+                        (void)snprintf(a->sq_err, sizeof a->sq_err, "计划预览失败");
+                } else if (a->sq_err[0] == '\0') {
+                    (void)snprintf(a->sq_err, sizeof a->sq_err,
+                                   "查询被拒绝：%s（仅支持白名单 SELECT）",
+                                   np_sq_status_name(st));
+                }
+            }
+        }
+        if (a->sq_err[0])
+            cui_text(ui, a->sq_err, .size = 12, .color = CUI_COLOR_DANGER);
+        if (a->sq_has_plan && a->sq_preview[0])
+            cui_text(ui, a->sq_preview, .size = 11, .nowrap = false);
+        if (a->sq_has_plan) {
+            cui_checkbox(ui, "我已确认：执行上述只读查询", &a->sq_confirmed);
+            if (cui_button(ui, "执行查询", .variant = CUI_BUTTON_PRIMARY,
+                           .disabled = !a->sq_confirmed)) {
+                np_sq_result_t res;
+                np_sq_plan_t plan = a->sq_plan;
+                np_sq_status_t st;
+                plan.confirmed = true;
+                st = np_sq_run(a->sq_path, &plan, NP_SQ_MAX_ROWS, &res);
+                if (st == NP_SQ_OK) {
+                    char md[NP_SQ_MAX_OUT], quality[1024];
+                    int m = np_sq_render(&plan, &res, a->sq_path,
+                                         md, sizeof md);
+                    int q = np_sq_quality(&res, quality, sizeof quality);
+                    size_t u = 0;
+                    a->sq_result[0] = '\0';
+                    if (m > 0) {
+                        u += (size_t)snprintf(a->sq_result + u,
+                             sizeof a->sq_result - u, "%s", md);
+                    }
+                    if (q > 0 && u < sizeof a->sq_result) {
+                        (void)snprintf(a->sq_result + u,
+                             sizeof a->sq_result - u, "\n%s", quality);
+                    }
+                    a->sq_err[0] = '\0';
+                } else {
+                    (void)snprintf(a->sq_err, sizeof a->sq_err,
+                                   "执行失败：%s", np_sq_status_name(st));
+                }
+            }
+        }
+        if (a->sq_err[0])
+            cui_text(ui, a->sq_err, .size = 12, .color = CUI_COLOR_DANGER);
+        if (a->sq_result[0])
+            cui_text(ui, a->sq_result, .size = 11, .nowrap = false,
+                     .color = CUI_COLOR_TEXT_MUTED);
+    }
+}
+
 static void np_ti_dialog(notepad *a, cui_ctx *ui) {
     if (!a->dlg_ti) return;
     if (!a->ti_wl) {
@@ -9376,6 +9685,163 @@ static void np_hex_diff_dialog(notepad *a, np_doc *d) {
     }
 }
 
+/* R6: 计算补丁影响分析并弹报告对话框。before=当前文档，after=选中的对照文件。
+ * 复用当前反汇编指令（若与当前文档匹配）与 R3 CFG（若已分析）做字节→指令映射。 */
+static void np_patch_impact_run(notepad *a, np_doc *d)
+{
+    char p[NP_PATH_CAP];
+    FILE *f;
+    long sz;
+    unsigned char *after;
+    size_t got;
+    np_bd_result_t diff;
+    np_pi_result_t pi;
+    np_pi_status_t st;
+    np_disasm_insn_t *ins = NULL;
+    const np_cfg_graph_t *cfg = NULL;
+    size_t ni = 0, k;
+    if (!d) return;
+    if (!cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+            .kind = CUI_FILE_OPEN, .title = "选择对照版本（补丁影响分析）",
+            .filter_name = "所有文件", .filter = "*" }, p, sizeof p))
+        return;
+    f = fopen(p, "rb");
+    if (!f) { snprintf(a->pi_status, sizeof a->pi_status, "无法打开 %s", np_base(p));
+              a->dlg_pi = true; return; }
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz < 0 || sz > (long)64 * 1024 * 1024) {
+        fclose(f); snprintf(a->pi_status, sizeof a->pi_status, "文件超出 64 MB 上限");
+        a->dlg_pi = true; return;
+    }
+    after = (unsigned char *)malloc((size_t)sz ? (size_t)sz : 1);
+    if (!after) { fclose(f); return; }
+    got = fread(after, 1, (size_t)sz, f);
+    fclose(f);
+    memset(&diff, 0, sizeof(diff));
+    a->pi_report[0] = '\0';
+    if (!np_bytediff_compute(d->text, (size_t)d->len, after, got, &diff)) {
+        free(after);
+        snprintf(a->pi_status, sizeof a->pi_status, "字节 Diff 计算失败");
+        a->dlg_pi = true; return;
+    }
+    /* 复用当前已解码指令 / CFG（仅当属于当前文档） */
+    if (a->disasm && a->disasm_doc_uid == d->uid) {
+        ni = np_disasm_count(a->disasm);
+        if (ni && ni < 100000) {
+            ins = (np_disasm_insn_t *)calloc(ni, sizeof(*ins));
+            if (ins) {
+                for (k = 0; k < ni; k++) {
+                    const np_disasm_insn_t *one = np_disasm_at(a->disasm, k);
+                    if (one) ins[k] = *one;
+                }
+            } else {
+                ni = 0;
+            }
+        } else {
+            ni = 0;
+        }
+        if (a->cfg_doc_uid == d->uid && a->cfg.nfuncs > 0) cfg = &a->cfg;
+    }
+    st = np_pi_analyze(d->text, (size_t)d->len, after, got, &diff,
+                       ins, ni, NULL, 0, cfg, NULL,
+                       d->path, p, &pi);
+    free(ins);
+    (void)cfg;
+    if (st == NP_PI_OK) {
+        if (np_pi_render(&pi, a->pi_report, sizeof(a->pi_report)) < 0)
+            snprintf(a->pi_status, sizeof a->pi_status, "报告渲染失败");
+        else
+            snprintf(a->pi_status, sizeof a->pi_status,
+                     "分析完成：%lu 处改动，H2 校验%s",
+                     (unsigned long)pi.nhunks,
+                     pi.digest.verified ? "通过" : "未通过");
+    } else if (st == NP_PI_ERR_NODIFF) {
+        snprintf(a->pi_status, sizeof a->pi_status, "两版本无差异");
+    } else {
+        snprintf(a->pi_status, sizeof a->pi_status, "影响分析失败：%s",
+                 np_pi_status_name(st));
+    }
+    np_bytediff_free(&diff);
+    free(after);
+    a->dlg_pi = true;
+}
+
+/* R6: 补丁影响分析报告对话框（显示 np_patch_impact_run 的结果） */
+static void np_pi_dialog(notepad *a, cui_ctx *ui)
+{
+    if (!a->dlg_pi) return;
+    cui_dialog(ui, "补丁影响分析（只读 · H2 校验串联）", &a->dlg_pi,
+               .description = "字节改动 → 受影响指令/函数/块（静态启发式 L1）。"
+                              "H2 CRC32/SHA256 校验两端字节完整性；位移后的指令需"
+                              "重新反汇编才精确。只读，不改任何字节。",
+               .width = 860) {
+        cui_text(ui, a->pi_status, .size = 12,
+                 .color = strstr(a->pi_status, "失败") ? CUI_COLOR_DANGER
+                                                       : CUI_COLOR_TEXT_MUTED);
+        if (a->pi_report[0])
+            cui_text(ui, a->pi_report, .size = 11, .nowrap = false,
+                     .color = CUI_COLOR_TEXT_MUTED);
+        else
+            cui_text(ui, "当前版本无指令级影响数据。可在「反汇编」视图确认架构后，"
+                         "结合字节 Diff 定位受影响区域。", .size = 12,
+                     .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+    }
+}
+
+/* R4: 二进制摘要对话框——只读解析 ELF/PE 的符号/字符串/导入表。
+ * 每条结论带 offset 引用；不加载/执行二进制。 */
+static void np_binsum_dialog(notepad *a, cui_ctx *ui)
+{
+    if (!a->dlg_binsum) return;
+    cui_dialog(ui, "二进制摘要（符号 / 字符串 / 导入表 · 只读）",
+               &a->dlg_binsum,
+               .description = "解析 ELF/PE 的符号表、静态导入函数与可打印字符串，"
+                              "生成一页报告，每条结论带 file:0xOFFSET 引用供回跳。"
+                              "只读解析，不加载/执行二进制；畸形文件有硬上限防御。",
+               .width = 860) {
+        cui_input(ui, "bs-path", a->bs_path, sizeof a->bs_path,
+                  .label = "ELF / PE 文件路径",
+                  .placeholder = "选择程序二进制（.exe / .so / ELF）",
+                  .width = CUI_FILL);
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            if (cui_button(ui, "选择文件…", .size = CUI_SIZE_SM)) {
+                char p[NP_PATH_CAP];
+                if (cui_app_file_dialog(NULL, &(cui_file_dialog_opts){
+                        .kind = CUI_FILE_OPEN, .title = "选择程序二进制",
+                        .filter_name = "程序文件", .filter = "*.exe;*.dll;*.so;*.bin;*" },
+                        p, sizeof p))
+                    (void)snprintf(a->bs_path, sizeof a->bs_path, "%s", p);
+            }
+            if (cui_button(ui, "解析摘要", .variant = CUI_BUTTON_PRIMARY,
+                           .size = CUI_SIZE_SM)) {
+                /* np_bs_result_t 约 200KB，必须静态分配避免 UI 栈帧溢出 */
+                static np_bs_result_t r;
+                np_bs_status_t st = np_bs_parse_file(a->bs_path, &r);
+                a->bs_report[0] = '\0';
+                if (st == NP_BS_OK) {
+                    if (np_bs_render(&r, a->bs_report, sizeof a->bs_report) < 0)
+                        (void)snprintf(a->bs_status, sizeof a->bs_status,
+                                       "报告过大，渲染失败");
+                    else
+                        (void)snprintf(a->bs_status, sizeof a->bs_status,
+                                       "解析完成：%d 符号 / %d 导入 / %d 字符串",
+                                       r.nsymbols, r.nimports, r.nstrings);
+                } else {
+                    (void)snprintf(a->bs_status, sizeof a->bs_status,
+                                   "解析失败：%s", np_bs_status_name(st));
+                }
+            }
+        }
+        if (a->bs_status[0])
+            cui_text(ui, a->bs_status, .size = 12,
+                     .color = strstr(a->bs_status, "失败") ? CUI_COLOR_DANGER
+                                                           : CUI_COLOR_TEXT_MUTED);
+        if (a->bs_report[0])
+            cui_text(ui, a->bs_report, .size = 11, .nowrap = false,
+                     .color = CUI_COLOR_TEXT_MUTED);
+    }
+}
+
 /* H3 字节解释：把当前选区解释为多类型候选字段，渲染成可点芯片。
  * 点芯片把选区收窄为该字段宽度并跳回 hex（"字段芯片可跳 hex"）；只读。 */
 static void np_byte_inspect_panel(cui_ctx *ui, notepad *a, np_doc *d) {
@@ -9420,21 +9886,509 @@ static void np_byte_inspect_panel(cui_ctx *ui, notepad *a, np_doc *d) {
     cui_text(ui, cite, .size = 11, .color = CUI_COLOR_SUCCESS);
 }
 
+/* ---- R2: 反汇编视图（注入式解码，objdump 兜底） -----------------------
+ * 解码能力不硬链接 Capstone：这里提供唯一的 objdump 适配器（本机 T1 探测到
+ * 的 llvm-objdump / objdump 可执行文件），把字节写临时文件→objdump -D→逐行
+ * 解析。核心 np_disasm 只管视图/导航/门禁/降级来源，可用测试注入假解码器。
+ * 架构未确认或本机无 objdump 时明确提示，绝不猜指令。 */
+typedef struct {
+    char bin[512];                 /* objdump executable */
+    char tmp_in[NP_PATH_CAP];      /* temp binary file */
+} np_r2_objdump_ctx;
+
+static const char *np_r2_arch_flag(np_parch_t a) {
+    switch (a) {
+        case NP_PARCH_X86:       return "i386";
+        case NP_PARCH_X64:       return "i386:x86-64";
+        case NP_PARCH_ARM:       return "arm";
+        case NP_PARCH_AARCH64:   return "aarch64";
+        case NP_PARCH_MIPS:      return "mips";
+        case NP_PARCH_LOONGARCH: return "loongarch64";
+        case NP_PARCH_RISCV:     return "riscv";
+        case NP_PARCH_POWERPC:   return "powerpc";
+        default:                 return NULL;
+    }
+}
+
+/* Decode callback: run objdump on a temp file, parse -D output lines. */
+static int np_r2_objdump_decode(const unsigned char *data, size_t off, size_t len,
+                                np_parch_t arch, np_disasm_syntax_t syntax,
+                                np_disasm_armmode_t mode, uint64_t base,
+                                np_disasm_insn_t *out, size_t cap, void *user) {
+    (void)syntax; (void)mode;
+    np_r2_objdump_ctx *ctx = (np_r2_objdump_ctx *)user;
+    if (!ctx || !ctx->bin[0] || cap == 0) return -1;
+    const char *flag = np_r2_arch_flag(arch);
+    if (!flag) return -1;
+    /* Write the byte window to a temp raw binary (objdump -b binary). */
+    FILE *f = fopen(ctx->tmp_in, "wb");
+    if (!f) return -1;
+    bool wrote = fwrite(data + off, 1, len, f) == len;
+    fclose(f);
+    if (!wrote) return -1;
+    /* Decode with VMA 0 so objdump addresses equal offsets within the temp
+     * window; then translate back to document offsets. Virtual addresses are
+     * stamped by the core as base + offset. */
+    char cmd[1400];
+#ifdef _WIN32
+    snprintf(cmd, sizeof cmd, "\"%s\" -D -b binary -m %s \"%s\" 2>&1",
+             ctx->bin, flag, ctx->tmp_in);
+    FILE *p = _popen(cmd, "r");
+#else
+    snprintf(cmd, sizeof cmd, "\"%s\" -D -b binary -m %s \"%s\" 2>/dev/null",
+             ctx->bin, flag, ctx->tmp_in);
+    FILE *p = popen(cmd, "r");
+#endif
+    if (!p) { remove(ctx->tmp_in); return -1; }
+    char line[512];
+    size_t n = 0;
+    while (fgets(line, sizeof line, p) && n < cap) {
+        np_disasm_insn_t ins;
+        if (!np_disasm_parse_objdump_line(line, &ins)) continue;
+        uint64_t rel = ins.addr;        /* offset within the window */
+        if (rel >= len) continue;       /* outside requested window */
+        ins.offset = off + (size_t)rel;
+        ins.addr = base + ins.offset;   /* virtual address for display */
+        out[n++] = ins;
+    }
+#ifdef _WIN32
+    _pclose(p);
+#else
+    pclose(p);
+#endif
+    remove(ctx->tmp_in);
+    return n ? (int)n : -1;
+}
+
+static void np_r2_ensure(notepad *a) {
+    if (!a->disasm) a->disasm = np_disasm_view_create();
+}
+
+/* Refresh the disassembly for the current hex document. Called on demand
+ * (button) rather than every frame — objdump is a process spawn. */
+static void np_r2_refresh(notepad *a, np_doc *d) {
+    np_r2_ensure(a);
+    if (!a->disasm || !d) return;
+    np_disasm_view_clear(a->disasm);
+    a->disasm_doc_uid = d->uid;
+    a->disasm_pick = 0;
+
+    np_probe_result_t pr;
+    memset(&pr, 0, sizeof pr);
+    np_probe((const unsigned char *)d->text, (size_t)d->len, d->path, &pr);
+    a->disasm_arch = pr.prog.arch;
+
+    /* T7: find an objdump on PATH or the installed tool dir. */
+    np_r2_objdump_ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    const char *tmpdir = (a->side_dir[0]) ? a->side_dir : ".";
+#ifdef _WIN32
+    snprintf(ctx.tmp_in, sizeof ctx.tmp_in, "%s\\rapideditor-disasm-tmp.bin", tmpdir);
+#else
+    snprintf(ctx.tmp_in, sizeof ctx.tmp_in, "%s/rapideditor-disasm-tmp.bin", tmpdir);
+#endif
+    const char *cands[] = { "llvm-objdump", "objdump" };
+    for (size_t i = 0; i < 2; ++i) {
+        if (np_ai_has_tool(cands[i])) { snprintf(ctx.bin, sizeof ctx.bin, "%s", cands[i]); break; }
+    }
+    np_disasm_decoder_t dec = { np_r2_objdump_decode, &ctx, NP_DSRC_OBJDUMP };
+    np_disasm_view_set_decoders(a->disasm, &dec, ctx.bin[0] ? 1 : 0);
+
+    char err[256] = {0};
+    size_t off = 0, len = (size_t)d->len;
+    bool ok = np_disasm_decode(a->disasm, (const unsigned char *)d->text, (size_t)d->len,
+                               off, len, &pr, err, sizeof err);
+    if (ok) {
+        snprintf(a->disasm_status, sizeof a->disasm_status,
+                 "架构 %s · 来源 %s · %zu 条指令 · 基址 0x%llx",
+                 np_parch_name(pr.prog.arch), np_disasm_source_name(np_disasm_source(a->disasm)),
+                 np_disasm_count(a->disasm), (unsigned long long)pr.prog.image_base);
+    } else {
+        snprintf(a->disasm_status, sizeof a->disasm_status, "%s",
+                 err[0] ? err : "反汇编不可用");
+    }
+}
+
+/* R3: 从当前 R2 已解码指令构建函数边界与 CFG（启发式，非精确反编译）。
+ * 无指令或未确认架构时不猜测；x86/x64 用内置分类器，其它架构拒绝并提示注入。 */
+static void np_r3_analyze(notepad *a, np_doc *d)
+{
+    size_t n, i;
+    np_disasm_insn_t *ins;
+    np_cfg_status_t st;
+    memset(&a->cfg, 0, sizeof(a->cfg));
+    a->cfg_doc_uid = d->uid;
+    a->cfg_mermaid[0] = '\0';
+    a->rev_done = false;                 /* 文档/图变化，旧分析结果失效 */
+    a->dc_done = false;                  /* CFG 变化，旧反编译候选失效 */
+    n = np_disasm_count(a->disasm);
+    if (!n) {
+        snprintf(a->cfg_status, sizeof a->cfg_status,
+                 "无已解码指令：请先在「指令列表」中反汇编。");
+        return;
+    }
+    if (a->disasm_arch != NP_PARCH_X86 && a->disasm_arch != NP_PARCH_X64) {
+        snprintf(a->cfg_status, sizeof a->cfg_status,
+                 "架构 %s 暂无内置分类器：R3 当前仅支持 x86/x64（不猜测其它 ISA）。",
+                 np_parch_name(a->disasm_arch));
+        return;
+    }
+    ins = (np_disasm_insn_t *)calloc(n, sizeof(*ins));
+    if (!ins) { snprintf(a->cfg_status, sizeof a->cfg_status, "内存不足"); return; }
+    for (i = 0; i < n; i++) {
+        const np_disasm_insn_t *p = np_disasm_at(a->disasm, i);
+        if (p) ins[i] = *p;
+    }
+    st = np_cfg_build(ins, n, a->disasm_arch, NULL, NULL, &a->cfg);
+    free(ins);
+    if (st != NP_CFG_OK) {
+        snprintf(a->cfg_status, sizeof a->cfg_status, "CFG 构建失败：%s",
+                 np_cfg_status_name(st));
+        return;
+    }
+    {
+        char sum[2048];
+        int m = np_cfg_render_summary(&a->cfg, sum, sizeof sum);
+        snprintf(a->cfg_status, sizeof a->cfg_status, "%s",
+                 m > 0 ? sum : "构建完成，但摘要渲染失败");
+        if (np_cfg_render_mermaid(&a->cfg, a->cfg_mermaid,
+                                  sizeof a->cfg_mermaid) < 0)
+            a->cfg_mermaid[0] = '\0';
+    }
+}
+
+/* DC1: 从当前 R3 CFG + R2 指令为指定函数生成反编译候选（内置启发式）。
+ * 只读、不写回二进制；所有输出标注「候选·待确认」，不声称等价。 */
+static void np_dc_generate_func(notepad *a, np_doc *d, int func_index)
+{
+    size_t n, k;
+    np_disasm_insn_t *arr;
+    np_dc_status_t st;
+
+    a->dc_done = false;
+    a->dc_func = func_index;
+    a->dc_md[0] = '\0';
+    if (!d || func_index < 0 || func_index >= a->cfg.nfuncs) {
+        snprintf(a->dc_status, sizeof a->dc_status,
+                 "无对应函数：请先在「函数 / CFG」中分析");
+        return;
+    }
+    n = np_disasm_count(a->disasm);
+    arr = (n && n < 100000) ? (np_disasm_insn_t *)calloc(n, sizeof(*arr)) : NULL;
+    if (!arr) {
+        snprintf(a->dc_status, sizeof a->dc_status, "内存不足");
+        return;
+    }
+    for (k = 0; k < n; k++) {
+        const np_disasm_insn_t *p = np_disasm_at(a->disasm, k);
+        if (p) arr[k] = *p;
+    }
+    st = np_dc_generate_builtin(arr, n, &a->cfg, func_index, d->path,
+                                &a->dc_result);
+    free(arr);
+    if (st != NP_DC_OK) {
+        snprintf(a->dc_status, sizeof a->dc_status, "反编译失败：%s",
+                 np_dc_status_name(st));
+        return;
+    }
+    if (np_dc_render(&a->dc_result, a->dc_md, sizeof a->dc_md) < 0)
+        a->dc_md[0] = '\0';
+    snprintf(a->dc_status, sizeof a->dc_status,
+             "候选·待确认 · 内置启发式 · %d 行 · 逐行 offset 映射 · 置信度 %d/100",
+             a->dc_result.nlines, a->dc_result.conf);
+    a->dc_done = true;
+}
+
+/* R3 CFG 子视图：函数表 + 基本块/边摘要 + Mermaid 图 + offset 回跳。 */
+static void np_cfg_panel(cui_ctx *ui, notepad *a, np_doc *d)
+{
+    int i;
+    if (a->cfg_doc_uid != d->uid && np_disasm_count(a->disasm))
+        np_r3_analyze(a, d);
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
+        cui_text(ui, a->cfg_status[0] ? a->cfg_status : "尚未分析函数与 CFG",
+                 .size = 12,
+                 .color = (a->cfg.nfuncs > 0) ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING,
+                 .nowrap = false);
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            if (cui_button(ui, "重新分析", .size = CUI_SIZE_SM)) np_r3_analyze(a, d);
+            if (a->cfg_mermaid[0] &&
+                cui_button(ui, "复制 Mermaid", .size = CUI_SIZE_SM)) {
+                if (a->ui) cui_set_clipboard_text(a->ui, a->cfg_mermaid);
+                np_toast(a, "已复制 Mermaid", "可粘贴到支持 Mermaid 的文档", CUI_TONE_INFO);
+            }
+        }
+        /* 函数表：点击行跳回反汇编+Hex；点「逆向分析」做只读语义分析（R5） */
+        for (i = 0; i < a->cfg.nfuncs && i < 64; i++) {
+            const np_cfg_func_t *f = &a->cfg.funcs[i];
+            char line[256];
+            snprintf(line, sizeof line, "%s  0x%llx–0x%llx  %zu 指令 / %d 块  置信度 %d",
+                     f->name, (unsigned long long)f->start_addr,
+                     (unsigned long long)f->end_addr,
+                     f->end_insn - f->start_insn + 1, f->nblocks, f->conf);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, line, .size = CUI_SIZE_SM, .full_width = true)) {
+                    int si = np_disasm_insn_for_offset(a->disasm,
+                                                       np_disasm_offset_for_insn(a->disasm,
+                                                                                 f->start_insn));
+                    if (si >= 0) a->disasm_pick = (int)si;
+                    d->hexsel.cursor = np_disasm_offset_for_insn(a->disasm, f->start_insn);
+                    d->hexsel.start = d->hexsel.cursor;
+                    d->hexsel.length = 1;
+                    if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, d->hexsel.cursor);
+                    np_toast(a, "已跳到函数起点", f->name, CUI_TONE_INFO);
+                }
+                if (cui_button(ui, "逆向分析", .size = CUI_SIZE_SM)) {
+                    size_t ni = np_disasm_count(a->disasm), k;
+                    np_disasm_insn_t *arr = (ni && ni < 100000)
+                        ? (np_disasm_insn_t *)calloc(ni, sizeof(*arr)) : NULL;
+                    if (!arr) {
+                        np_toast(a, "逆向分析失败", "内存不足", CUI_TONE_WARNING);
+                    } else {
+                        for (k = 0; k < ni; k++) {
+                            const np_disasm_insn_t *p = np_disasm_at(a->disasm, k);
+                            if (p) arr[k] = *p;
+                        }
+                        /* 本地启发式分析（不阻塞 UI）；AI 解释可复制上下文后
+                         * 到 AI 工作台获取。命名一律「待确认」，不写原文。 */
+                        if (np_ra_analyze(d->path, &a->cfg, i, arr, ni,
+                                          NULL, NULL, &a->rev_result) == NP_RA_OK) {
+                            a->rev_done = true;
+                            a->rev_func = i;
+                            np_ra_build_context(d->path, &a->cfg, i, arr, ni,
+                                                a->rev_ctx, sizeof a->rev_ctx);
+                            np_toast(a, "逆向分析完成", "命名均为待确认建议",
+                                     CUI_TONE_INFO);
+                        } else {
+                            np_toast(a, "逆向分析失败", "参数错误", CUI_TONE_WARNING);
+                        }
+                        free(arr);
+                    }
+                }
+                if (cui_button(ui, "反编译", .size = CUI_SIZE_SM)) {
+                    np_dc_generate_func(a, d, i);
+                    np_toast(a, a->dc_done ? "反编译候选已生成" : "反编译失败",
+                             a->dc_status,
+                             a->dc_done ? CUI_TONE_INFO : CUI_TONE_WARNING);
+                }
+            }
+        }
+        /* DC1 反编译候选（内置启发式 · 只读 · 未写回二进制） */
+        if (a->dc_done) {
+            cui_separator(ui);
+            cui_text(ui, "反编译候选（内置启发式 · 未写回二进制）", .size = 13,
+                     .font = CUI_FONT_MEDIUM);
+            cui_text(ui, a->dc_status, .size = 11,
+                     .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+            if (a->dc_md[0])
+                cui_text(ui, a->dc_md, .size = 10, .nowrap = false,
+                         .color = CUI_COLOR_TEXT_MUTED);
+            cui_row(ui, .width = CUI_FILL, .gap = 6) {
+                if (cui_button(ui, "复制伪代码", .size = CUI_SIZE_SM)) {
+                    if (a->ui) cui_set_clipboard_text(a->ui, a->dc_md);
+                    np_toast(a, "已复制伪代码",
+                             "候选·待确认，未经 DC5 等价验证", CUI_TONE_INFO);
+                }
+                if (cui_button(ui, "复制 code", .size = CUI_SIZE_SM)) {
+                    if (a->ui) cui_set_clipboard_text(a->ui, a->dc_result.code);
+                    np_toast(a, "已复制完整伪代码", "含 provenance 头", CUI_TONE_INFO);
+                }
+            }
+            /* 前 8 行 offset 回跳：伪代码 ↔ Hex 双向核验 */
+            {
+                int j, lim = a->dc_result.nlines < 8 ? a->dc_result.nlines : 8;
+                for (j = 0; j < lim; j++) {
+                    const np_dc_line_t *ln = &a->dc_result.lines[j];
+                    char lbl[48];
+                    snprintf(lbl, sizeof lbl, "L%d 0x%llx", ln->line_no,
+                             (unsigned long long)ln->addr);
+                    if (cui_button(ui, lbl, .size = CUI_SIZE_SM)) {
+                        size_t off = np_dc_offset_for_line(&a->dc_result,
+                                                            ln->line_no);
+                        if (off != (size_t)-1) {
+                            d->hexsel.cursor = off;
+                            d->hexsel.start = off;
+                            d->hexsel.length = 1;
+                            if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, off);
+                            np_toast(a, "已跳到伪代码对应 offset", lbl, CUI_TONE_INFO);
+                        }
+                    }
+                }
+            }
+        }
+        /* R5 分析报告（选中函数的只读分析） */
+        if (a->rev_done) {
+            char md[NP_RA_MAX_OUT];
+            cui_separator(ui);
+            cui_text(ui, "逆向分析报告（只读 · 命名待确认）", .size = 13,
+                     .font = CUI_FONT_MEDIUM);
+            if (np_ra_render(&a->rev_result, md, sizeof(md)) > 0)
+                cui_text(ui, md, .size = 11, .nowrap = false,
+                         .color = CUI_COLOR_TEXT_MUTED);
+            if (cui_button(ui, "复制分析上下文（供 AI 工作台）", .size = CUI_SIZE_SM)) {
+                if (a->ui) cui_set_clipboard_text(a->ui, a->rev_ctx);
+                np_toast(a, "已复制上下文", "粘贴到 AI 工作台可获 AI 解释",
+                         CUI_TONE_INFO);
+            }
+        }
+        if (a->cfg_mermaid[0]) {
+            cui_text(ui, "Mermaid 控制流图：", .size = 12, .font = CUI_FONT_MEDIUM);
+            cui_text(ui, a->cfg_mermaid, .size = 10, .nowrap = false,
+                     .color = CUI_COLOR_TEXT_MUTED);
+        }
+    }
+}
+
+/* R2 disassembly panel: instruction list with offset/virtual-address, source
+ * provenance, and click-to-jump back into the hex view (offset↔insn). */
+static void np_disasm_panel(cui_ctx *ui, notepad *a, np_doc *d) {
+    np_r2_ensure(a);
+    if (!a->disasm || a->disasm_doc_uid != d->uid) np_r2_refresh(a, d);
+
+    cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
+        cui_text(ui, a->disasm_status[0] ? a->disasm_status : "尚未探测架构",
+                 .size = 12,
+                 .color = np_disasm_count(a->disasm) ? CUI_COLOR_SUCCESS : CUI_COLOR_WARNING);
+        /* R3: 指令列表 / 函数CFG 子视图切换 */
+        {
+            static const char *sub[] = { "指令列表", "函数 / CFG" };
+            int sv = a->show_cfg ? 1 : 0;
+            if (cui_tabs(ui, "r2-subview", sub, 2, &sv)) {
+                a->show_cfg = (sv == 1);
+                if (a->show_cfg && a->cfg_doc_uid != d->uid) np_r3_analyze(a, d);
+            }
+        }
+        if (a->show_cfg) {
+            np_cfg_panel(ui, a, d);
+        } else
+        cui_row(ui, .width = CUI_FILL, .gap = 6) {
+            static const char *syn[] = { "Intel", "AT&T" };
+            int si = (int)np_disasm_view_syntax(a->disasm);
+            if (cui_tabs(ui, "r2-syntax", syn, 2, &si)) {
+                np_disasm_view_set_syntax(a->disasm, (np_disasm_syntax_t)si);
+                np_r2_refresh(a, d);
+            }
+            if (a->disasm_arch == NP_PARCH_ARM) {
+                static const char *am[] = { "ARM", "Thumb" };
+                int mi = (int)np_disasm_view_armmode(a->disasm);
+                if (cui_tabs(ui, "r2-armmode", am, 2, &mi)) {
+                    np_disasm_view_set_armmode(a->disasm, (np_disasm_armmode_t)mi);
+                    np_r2_refresh(a, d);
+                }
+            }
+            cui_spacer(ui);
+            if (cui_button(ui, "重新反汇编", .size = CUI_SIZE_SM)) np_r2_refresh(a, d);
+        }
+        size_t n = np_disasm_count(a->disasm);
+        if (!n) {
+            cui_text(ui, "无指令可显示：请确认架构（置信度≥70）、安装 llvm-objdump/objdump，"
+                         "或缩小选区。不会用错误架构猜测指令。",
+                     .size = 12, .color = CUI_COLOR_TEXT_MUTED, .nowrap = false);
+        } else {
+            /* One virtualized label per instruction, capped to keep frames cheap. */
+            int show = (int)(n < 512 ? n : 512);
+            for (int i = 0; i < show; ++i) {
+                const np_disasm_insn_t *ins = np_disasm_at(a->disasm, (size_t)i);
+                if (!ins) break;
+                char line[320];
+                snprintf(line, sizeof line, "%08llx  %-20s  %s%s",
+                         (unsigned long long)ins->addr, ins->text,
+                         np_disasm_source_name(ins->source),
+                         i == a->disasm_pick ? "  ◀" : "");
+                if (cui_button(ui, line, .size = CUI_SIZE_SM,
+                               .variant = i == a->disasm_pick ? CUI_BUTTON_PRIMARY : CUI_BUTTON_GHOST,
+                               .full_width = true)) {
+                    a->disasm_pick = i;
+                    d->hexsel.cursor = ins->offset;
+                    d->hexsel.start = ins->offset;
+                    d->hexsel.length = ins->size;
+                    if (a->ui) cui_hex_view_goto(a->ui, d->editor_id, ins->offset);
+                    np_toast(a, "已跳转到指令", line, CUI_TONE_INFO);
+                }
+            }
+            if (n > 512)
+                cui_text(ui, "仅显示前 512 条；请缩小范围以查看其余指令。",
+                         .size = 11, .color = CUI_COLOR_TEXT_MUTED);
+        }
+    }
+}
+
+/* H1: 手动 hex 编辑多级撤销。cui_hex_view 每帧就地改写 d->text，我们把每帧
+ * 的结果喂给影子撤销栈；同一时间窗内的连续键入合并为一个 undo 步。撤销/重做
+ * 后把影子字节拷回 d->text 并 bump revision，让模板/统计/H3 解析全部失效重算。 */
+static void np_hexundo_ensure(np_doc *d) {
+    if (!d->hex_undo)
+        d->hex_undo = np_hexundo_create(d ? d->text : NULL, d ? (size_t)d->len : 0);
+}
+
+/* 撤销/重做一步，把结果同步回文档。返回是否真的改变了文档。 */
+static bool np_hexundo_step(np_doc *d, bool redo) {
+    np_hexundo_ensure(d);
+    if (!d->hex_undo) return false;
+    bool ok = redo ? np_hexundo_redo(d->hex_undo) : np_hexundo_undo(d->hex_undo);
+    if (!ok) return false;
+    size_t n = 0;
+    const unsigned char *p = np_hexundo_data(d->hex_undo, &n);
+    /* 容量不足：撤销已发生，反向走一步把 shadow 恢复到与 d->text 一致，
+     * 避免 shadow 与文档失步导致后续所有撤销错位。 */
+    if (!np_ensure_cap(d, n + 1)) {
+        if (redo) np_hexundo_undo(d->hex_undo);
+        else      np_hexundo_redo(d->hex_undo);
+        np_hexundo_flush(d->hex_undo);
+        return false;
+    }
+    if (n) memcpy(d->text, p, n);
+    d->text[n] = 0;
+    d->len = (int)n;
+    d->dirty = true;
+    d->rev++;
+    d->content_rev++;
+    return true;
+}
+
 /* 010 Editor style pane: offsets, hex bytes and ASCII, fully editable —
  * typing hex digits overwrites the byte under the cursor. cui_hex_view owns
  * all of the interaction (selection, arrows, copy, virtual scrolling); we
  * only feed it our buffer, track edits and wire the goto field. */
 static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
     np_bt_reparse(a, d);               /* re-parse after byte edits, cached by rev */
+    np_hexundo_ensure(d);
+    if (d->hex_undo) np_hexundo_tick(d->hex_undo, cui_delta_time(ui));
+    bool hex_edited = false;           /* 本帧是否发生键入（用于空闲时结束 undo 组） */
 
     cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 8, .gap = 6) {
         np_doc_breadcrumb(ui, a, d);
+        /* R2: Hex / 反汇编 视图切换（标签与 Hex 编辑器并排）。 */
+        {
+            static const char *views[] = { "Hex", "反汇编" };
+            int vi = a->show_disasm ? 1 : 0;
+            if (cui_tabs(ui, "hex-view-switch", views, 2, &vi))
+                a->show_disasm = (vi == 1);
+        }
+        if (a->show_disasm) {
+            if (d->hex_undo) np_hexundo_flush(d->hex_undo);   /* 切走前收尾编辑会话 */
+            np_disasm_panel(ui, a, d);
+            np_keep_editors(a, ui);
+            return;                    /* 反汇编视图独占主体（工具栏/hex 视图跳过） */
+        }
         cui_row(ui, .width = CUI_FILL, .gap = 6) {
             int flags = cui_input(ui, "hex-goto", a->hexgoto_buf, sizeof a->hexgoto_buf,
                                   .placeholder = "偏移（十六进制，如 1A2B）",
                                   .width = 200);
             if (flags & CUI_SUBMITTED) np_hex_do_goto(a);
             if (cui_button(ui, "跳转", .size = CUI_SIZE_SM)) np_hex_do_goto(a);
+            /* H1: 手动编辑撤销。Ctrl+Z / Ctrl+Shift+Z 亦可（见全局快捷键）。 */
+            np_hexundo_ensure(d);
+            if (cui_button(ui, "撤销", .size = CUI_SIZE_SM, .icon = CUI_ICON_UNDO_2,
+                           .disabled = !d->hex_undo || !np_hexundo_can_undo(d->hex_undo),
+                           .tooltip = "撤销手动 hex 编辑（Ctrl+Z）")) {
+                if (np_hexundo_step(d, false)) np_update_title(a);
+            }
+            if (cui_button(ui, "重做", .size = CUI_SIZE_SM, .icon = CUI_ICON_REDO_2,
+                           .disabled = !d->hex_undo || !np_hexundo_can_redo(d->hex_undo),
+                           .tooltip = "重做手动 hex 编辑（Ctrl+Shift+Z）")) {
+                if (np_hexundo_step(d, true)) np_update_title(a);
+            }
             cui_spacer(ui);
             if (cui_button(ui, a->show_byteinspect ? "隐藏字节解释" : "字节解释",
                            .size = CUI_SIZE_SM, .icon = CUI_ICON_CODE,
@@ -9444,6 +10398,10 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                            .icon = CUI_ICON_GIT_BRANCH,
                            .tooltip = "选择对照版本，与当前字节做偏移对齐 Diff 并送入 B3 逐块审查"))
                 np_hex_diff_dialog(a, d);
+            if (cui_button(ui, "影响分析…", .size = CUI_SIZE_SM,
+                           .icon = CUI_ICON_GIT_BRANCH,
+                           .tooltip = "补丁影响分析：字节改动→受影响指令/函数/块，串联 H2 完整性校验（只读）"))
+                np_patch_impact_run(a, d);
             if (cui_button(ui, "AI 解释选区", .size = CUI_SIZE_SM,
                            .icon = CUI_ICON_SPARKLES,
                            .tooltip = "把当前字节选区的 hexdump 发给 AI 解释（只读，不写入）"))
@@ -9506,6 +10464,9 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
                 if (r.edited) {
                     d->dirty = true;
                     d->content_rev++;
+                    if (d->hex_undo)
+                        np_hexundo_observe(d->hex_undo, d->text, (size_t)d->len);
+                    hex_edited = true;
                     np_update_title(a);
                 }
                 /* right: field tree */
@@ -9550,9 +10511,15 @@ static void np_hex_pane(cui_ctx *ui, notepad *a, np_doc *d) {
             if (r.edited) {
                 d->dirty = true;
                 d->content_rev++;
+                if (d->hex_undo)
+                    np_hexundo_observe(d->hex_undo, d->text, (size_t)d->len);
+                hex_edited = true;
                 np_update_title(a);
             }
         }
+        /* 无键入帧：结束当前 undo 组，使下一次撤销回退整段连续编辑。
+         * 注意 undo/redo 按钮点击会改变字节但 r.edited=false，此时不 observe。 */
+        if (!hex_edited && d->hex_undo) np_hexundo_flush(d->hex_undo);
         np_keep_editors(a, ui);        /* keep the sibling tabs' text editors alive */
     }
 }
@@ -11350,6 +12317,17 @@ static void np_frame(cui_ctx *ui, void *user) {
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_Q)) np_request_quit(a);
         if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_H)) a->dlg_replace = true;
 
+        /* H1: hex 轨多级撤销。cui_hex_view 吞掉普通键入但不处理 Ctrl+Z/Y，
+         * 因此由全局层接管；文本轨的撤销仍归 CUI editor 自身。 */
+        if (d && d->is_hex && !cui_wants_keyboard(ui)) {
+            if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_Z)) {
+                if (np_hexundo_step(d, false)) np_update_title(a);
+            } else if (cui_shortcut(ui, CUI_MOD_PRIMARY | CUI_MOD_SHIFT, CUI_KEY_Z) ||
+                       cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_Y)) {
+                if (np_hexundo_step(d, true)) np_update_title(a);
+            }
+        }
+
         if (!cui_wants_keyboard(ui)) {
             if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_F)) np_open_find(a);
             if (cui_shortcut(ui, CUI_MOD_PRIMARY, CUI_KEY_G)) {
@@ -11750,6 +12728,12 @@ static void np_frame(cui_ctx *ui, void *user) {
                     a->dlg_mcp = true;
                 if (cui_menu_item(ui, "知识索引与 Context Pack…", .icon = CUI_ICON_SEARCH))
                     a->dlg_kb = true;
+                if (cui_menu_item(ui, "AI 特征卡（文档/数据库）…", .icon = CUI_ICON_SPARKLES))
+                    a->dlg_featcard = true;
+                if (cui_menu_item(ui, "结构化查询与采样分析…", .icon = CUI_ICON_SEARCH))
+                    a->dlg_sqlquery = true;
+                if (cui_menu_item(ui, "二进制摘要（符号/字符串/导入）…", .icon = CUI_ICON_CPU))
+                    a->dlg_binsum = true;
                 if (cui_menu_item(ui, "安装分析工具…", .icon = CUI_ICON_SERVER))
                     a->dlg_ti = true;
                 cui_menu_separator(ui);
@@ -12515,6 +13499,20 @@ int main(int argc, char **argv) {
     g.kb_budget = 1500;          /* X10: 默认 token 预算 */
     g.ti_state = 0;              /* T3/T4 UI: 安装 worker 状态 */
     g.ti_hc_state = 0;           /* T5 健康检查 worker 状态 */
+    /* T10: 加载企业沙箱策略（sandbox.ini），审计环形缓冲懒创建于安装入口。 */
+    np_sb_policy_defaults(&g.sb_policy);
+    g.sb_audit = np_sb_audit_create(128);
+    {
+        char sbpath[NP_PATH_CAP];
+        np_config_dir(sbpath, sizeof sbpath);
+        char fn[NP_PATH_CAP];
+#ifdef _WIN32
+        snprintf(fn, sizeof fn, "%s\\sandbox.ini", sbpath);
+#else
+        snprintf(fn, sizeof fn, "%s/sandbox.ini", sbpath);
+#endif
+        np_sb_load(&g.sb_policy, fn);   /* 无文件 = 默认策略 */
+    }
 #ifdef _WIN32
     g.default_crlf = true;
 #endif

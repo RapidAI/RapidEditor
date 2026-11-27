@@ -1,0 +1,53 @@
+// PE portable executable: DOS header, PE signature, COFF header, sections
+LittleEndian();
+if (FSize() >= 64) {
+    uint16 mz;                      // "MZ"
+    if (mz == 0x5A4D) {
+        FSeek(0);
+        struct DosHeader {
+            char magic[2];
+            ubyte stub[58];
+            uint32 pe_offset;
+        };
+        DosHeader dos;
+        if (dos.pe_offset > 0 && dos.pe_offset + 24 <= FSize()) {
+            FSeek(dos.pe_offset);
+            uint32 pe_sig;          // "PE\0\0"
+            if (pe_sig == 0x00004550) {
+                FSeek(dos.pe_offset);
+                struct CoffHeader {
+                    char sig[4];
+                    ushort machine;
+                    ushort sections;
+                    uint32 timestamp;
+                    uint32 sym_ptr;
+                    uint32 num_syms;
+                    ushort opt_size;
+                    ushort characteristics;
+                };
+                CoffHeader coff;
+                if (FTell() + coff.opt_size <= FSize()) {
+                    ubyte optional[coff.opt_size];
+                }
+                uint32 s = 0;
+                while (s < coff.sections && s < 32 && FTell() + 40 <= FSize()) {
+                    if (FTell() >= FSize()) break;
+                    struct SectionHeader {
+                        char name[8];
+                        uint32 virtual_size;
+                        uint32 virtual_addr;
+                        uint32 raw_size;
+                        uint32 raw_ptr;
+                        uint32 reloc_ptr;
+                        uint32 line_ptr;
+                        ushort num_relocs;
+                        ushort num_lines;
+                        uint32 characteristics;
+                    };
+                    SectionHeader section;
+                    s = s + 1;
+                }
+            }
+        }
+    }
+}

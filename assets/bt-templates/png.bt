@@ -9,6 +9,7 @@ struct Chunk {
 ubyte signature[8];
 uint32 chunks = 0;
 while (!FEof() && chunks < 64) {
+    if (FTell() >= FSize()) break;
     if (FTell() + 8 > FSize()) break;
     Chunk chunk;
     chunks = chunks + 1;

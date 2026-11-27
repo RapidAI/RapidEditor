@@ -1,0 +1,7 @@
+
+Disassembly of section .text:
+
+00400000 <main>:
+  400000:	8c820000 	lw	v0,0(s0)
+  400004:	03e00008 	jr	ra
+  400008:	00000000 	nop

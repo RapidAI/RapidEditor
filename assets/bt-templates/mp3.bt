@@ -1,0 +1,37 @@
+// MP3 audio: ID3v2 tag (header + synchsafe size + frames), then MPEG frame header
+BigEndian();
+if (FSize() >= 10) {
+    uint32 id3;                     // "ID3" + version/flags
+    if ((id3 & 0xFFFFFF00) == 0x49443300) {
+        FSeek(0);
+        char magic[3];
+        ubyte major;
+        ubyte revision;
+        ubyte flags;
+        uint32 size = 0;            // synchsafe: 7 bits per byte
+        uint32 k = 0;
+        while (k < 4 && FTell() < FSize()) {
+            if (FTell() >= FSize()) break;
+            ubyte part;
+            size = size * 128 + (part & 0x7F);
+            k = k + 1;
+        }
+        if (FTell() + size <= FSize()) {
+            ubyte tag[size];
+        } else if (FTell() < FSize()) {
+            ubyte tag_partial[FSize() - FTell()];
+        }
+    } else {
+        FSeek(0);
+        uint32 frame;               // MPEG audio frame sync: 11 set bits
+        if ((frame & 0xFFE00000) == 0xFFE00000) {
+            FSeek(0);
+            ubyte sync1;
+            ubyte sync2;
+            ubyte info;
+            ubyte channel;
+        } else {
+            FSeek(0);
+        }
+    }
+}

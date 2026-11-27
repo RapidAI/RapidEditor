@@ -1,0 +1,7 @@
+
+Disassembly of section .text:
+
+00010000 <main>:
+   10000:	e59f0000 	ldr	r0, [pc, #0]
+   10004:	e12fff1e 	bx	lr
+   10008:	e3a00001 	mov	r0, #1

@@ -8,6 +8,11 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Default child-process wait (ms); overridable at compile time for tests. */
+#ifndef NP_AI_TIMEOUT_MS
+#define NP_AI_TIMEOUT_MS 180000
+#endif
+
 /* Minimal helper for calling a locally-installed coding agent (Codex,
  * Claude Code, aider, ...) from a worker thread. The agent command is a
  * user-editable template with two placeholders:
@@ -40,6 +45,20 @@ bool np_ai_exec_timeout_cancel(const char *tpl, const char *ctx_path,
                                const char *out_path, const char *sys,
                                int timeout_ms, volatile bool *cancel,
                                char *err, size_t err_cap);
+
+/* Streaming variant of np_ai_exec_timeout_cancel: while the child runs, the
+ * result file is polled every ~120 ms and every newly written byte chunk is
+ * handed to `on_delta`. This works with any command template that redirects
+ * output to {out} (the existing convention) without changing the template.
+ * Returning false from `on_delta` cancels the child. Returns true when the
+ * command completed and produced output; partial output stays in `out_path`
+ * for review even on cancellation/timeout. `out_path` is always truncated
+ * before launch. `on_delta` may be NULL. */
+typedef bool (*np_ai_out_cb)(const char *delta, size_t len, void *user);
+bool np_ai_exec_stream(const char *tpl, const char *ctx_path, const char *out_path,
+                       const char *sys, int timeout_ms, volatile bool *cancel,
+                       np_ai_out_cb on_delta, void *user,
+                       char *err, size_t err_cap);
 
 /* Read the result file into `buf` (UTF-8). Returns bytes read, or -1. */
 long np_ai_read_result(const char *path, char *buf, size_t cap);

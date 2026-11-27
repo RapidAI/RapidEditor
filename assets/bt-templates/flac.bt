@@ -1,0 +1,23 @@
+// FLAC audio: "fLaC" marker followed by metadata blocks (STREAMINFO first)
+BigEndian();
+if (FSize() >= 4) {
+    uint32 magic;                   // "fLaC"
+    if (magic == 0x664C6143) {
+        FSeek(0);
+        char signature[4];
+        uint32 blocks = 0;
+        while (!FEof() && blocks < 32 && FTell() + 4 <= FSize()) {
+            if (FTell() >= FSize()) break;
+            ubyte head;             // bit7 = last block, low7 = type
+            uint32 len = 0;
+            uint32 b0 = ReadByte();
+            uint32 b1 = ReadByte();
+            uint32 b2 = ReadByte();
+            len = b0 * 65536 + b1 * 256 + b2;
+            if (FTell() + len > FSize()) break;
+            ubyte block[len];
+            blocks = blocks + 1;
+            if ((head & 0x80) != 0) break;
+        }
+    }
+}

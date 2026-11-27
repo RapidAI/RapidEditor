@@ -1,0 +1,28 @@
+// JPEG image: SOI marker, marker segments, SOS scan data, EOI
+BigEndian();
+if (FSize() >= 4) {
+    uint16 soi;                // 0xFFD8
+    if (soi == 0xFFD8) {
+        FSeek(0);
+        char soi_marker[2];    // FF D8
+        uint32 segs = 0;
+        while (!FEof() && segs < 64 && FTell() + 4 <= FSize()) {
+            if (FTell() >= FSize()) break;
+            ubyte prefix;      // 0xFF
+            ubyte marker;
+            if (prefix != 0xFF) break;
+            if (marker == 0xD9) break;              // EOI
+            ushort len;                             // includes the 2 length bytes
+            if (len < 2 || FTell() + len - 2 > FSize()) break;
+            if (marker == 0xDA) {                   // Start of Scan
+                ubyte scan_header[len - 2];
+                if (FTell() < FSize()) {
+                    ubyte entropy[FSize() - FTell()];
+                }
+                break;
+            }
+            ubyte payload[len - 2];
+            segs = segs + 1;
+        }
+    }
+}

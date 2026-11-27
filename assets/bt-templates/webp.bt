@@ -1,0 +1,23 @@
+// WebP image (RIFF container): fourCC chunks
+LittleEndian();
+if (FSize() >= 12) {
+    uint32 riff;                    // "RIFF"
+    if (riff == 0x46464952) {
+        FSeek(0);
+        char riff_id[4];
+        uint32 file_size;
+        uint32 form;                // "WEBP"
+        uint32 chunks = 0;
+        while (!FEof() && chunks < 64 && FTell() + 8 <= FSize()) {
+            if (FTell() >= FSize()) break;
+            char fourcc[4];
+            uint32 size;
+            if (FTell() + size > FSize()) break;
+            ubyte data[size];
+            if ((size & 1) != 0 && FTell() < FSize()) {
+                ubyte pad;
+            }
+            chunks = chunks + 1;
+        }
+    }
+}

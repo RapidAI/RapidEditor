@@ -10,6 +10,9 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
 #endif
 
 /* Local agents can be slow; cap the wait so a hung CLI never pins a worker
@@ -222,6 +225,209 @@ bool np_ai_exec_timeout_cancel(const char *tpl, const char *ctx_path,
     if (got == 0) {
         if (err && err_cap) snprintf(err, err_cap, "AI 输出为空");
         return false;
+    }
+    return true;
+}
+
+/* Streaming variant: poll the redirected output file while the child runs.
+ * Reuses the exact command construction / process lifetime rules of
+ * np_ai_exec_timeout_cancel, but feeds newly written bytes to on_delta. */
+bool np_ai_exec_stream(const char *tpl, const char *ctx_path, const char *out_path,
+                       const char *sys, int timeout_ms, volatile bool *cancel,
+                       np_ai_out_cb on_delta, void *user,
+                       char *err, size_t err_cap) {
+    (void)sys;
+    if (!tpl || !ctx_path || !out_path) return false;
+    if (err && err_cap) err[0] = 0;
+    if (cancel && *cancel) {
+        if (err && err_cap) snprintf(err, err_cap, "已停止");
+        return false;
+    }
+    char qfile[2048], qout[2048];
+    quote_path(ctx_path, qfile, sizeof qfile);
+    quote_path(out_path, qout, sizeof qout);
+    char s1[8192], cmd[12288];
+    if (!np_ai_subst(tpl, "{file}", qfile, s1, sizeof s1) ||
+        !np_ai_subst(s1, "{out}", qout, cmd, sizeof cmd)) {
+        if (err && err_cap) snprintf(err, err_cap, "命令模板过长");
+        return false;
+    }
+    np_ai_remove_file(out_path);
+
+    /* Offset into the result file already delivered to on_delta. */
+    size_t offset = 0;
+    char buf[8192];
+    bool cb_stop = false;
+    int rc = -1;
+#ifdef _WIN32
+    {
+        wchar_t wcmd[16384];
+        int wn = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd,
+                                     (int)(sizeof(wcmd) / sizeof(wcmd[0])));
+        if (wn <= 0) {
+            if (err && err_cap) snprintf(err, err_cap, "命令包含非法 UTF-8");
+            return false;
+        }
+        wchar_t wline[17000];
+        swprintf(wline, sizeof(wline) / sizeof(wline[0]), L"cmd.exe /d /c %ls", wcmd);
+        STARTUPINFOW si; PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof si); memset(&pi, 0, sizeof pi);
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        if (CreateProcessW(NULL, wline, NULL, NULL, FALSE,
+                           CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                           NULL, NULL, &si, &pi)) {
+            DWORD waited = 0;
+            bool stopped = false;
+            for (;;) {
+                /* Pump newly written output before each wait slice. */
+                FILE *f = np_ai_fopen(out_path, "rb");
+                if (f) {
+                    if (fseek(f, (long)offset, SEEK_SET) == 0) {
+                        size_t got = fread(buf, 1, sizeof buf, f);
+                        if (got) {
+                            offset += got;
+                            if (on_delta && !on_delta(buf, got, user)) {
+                                cb_stop = true;
+                                if (cancel) *cancel = true;
+                            }
+                        }
+                    }
+                    fclose(f);
+                }
+                if (cb_stop) {
+                    TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, 5000);
+                    if (err && err_cap) snprintf(err, err_cap, "已停止");
+                    stopped = true;
+                    break;
+                }
+                DWORD slice = 120;
+                if (timeout_ms > 0 && waited + slice >= (DWORD)timeout_ms)
+                    slice = (DWORD)timeout_ms - waited;
+                if (slice == 0) break;
+                DWORD wait = WaitForSingleObject(pi.hProcess, slice);
+                waited += slice;
+                if (wait == WAIT_OBJECT_0) break;
+                if (cancel && *cancel) {
+                    TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, 5000);
+                    if (err && err_cap) snprintf(err, err_cap, "已停止");
+                    stopped = true;
+                    break;
+                }
+                if (timeout_ms > 0 && waited >= (DWORD)timeout_ms) {
+                    TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, 5000);
+                    if (err && err_cap) snprintf(err, err_cap, "AI 命令超时（%d 秒）已终止", timeout_ms / 1000);
+                    stopped = true;
+                    break;
+                }
+            }
+            /* Final drain after the process exits. */
+            FILE *f = np_ai_fopen(out_path, "rb");
+            if (f) {
+                if (fseek(f, (long)offset, SEEK_SET) == 0) {
+                    size_t got = fread(buf, 1, sizeof buf, f);
+                    if (got && on_delta && !cb_stop) on_delta(buf, got, user);
+                }
+                fclose(f);
+            }
+            DWORD code = 0;
+            GetExitCodeProcess(pi.hProcess, &code);
+            rc = (int)code;
+            if (stopped) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return false; }
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        } else {
+            if (err && err_cap) snprintf(err, err_cap, "无法启动命令进程");
+        }
+    }
+#else
+    /* POSIX: fork a shell child and poll the redirected output file while it
+     * runs — symmetric with the Windows wait loop, so deltas arrive in real
+     * time and cancellation/timeout work here too. */
+    {
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Child: detach stdio so it never writes into the parent's UI. */
+            freopen("/dev/null", "r", stdin);
+            freopen("/dev/null", "w", stdout);
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        } else if (pid > 0) {
+            int waited_ms = 0;
+            bool stopped = false;
+            for (;;) {
+                /* Pump newly written bytes. */
+                FILE *f = np_ai_fopen(out_path, "rb");
+                if (f) {
+                    if (fseek(f, (long)offset, SEEK_SET) == 0) {
+                        size_t got = fread(buf, 1, sizeof buf, f);
+                        if (got) {
+                            offset += got;
+                            if (on_delta && !on_delta(buf, got, user)) {
+                                cb_stop = true;
+                                if (cancel) *cancel = true;
+                            }
+                        }
+                    }
+                    fclose(f);
+                }
+                if (cb_stop || (cancel && *cancel)) {
+                    kill(pid, SIGTERM);
+                    waitpid(pid, NULL, 0);
+                    stopped = true;
+                    break;
+                }
+                int st = 0;
+                pid_t r = waitpid(pid, &st, WNOHANG);
+                if (r == pid) break;      /* child finished */
+                if (timeout_ms > 0 && waited_ms >= timeout_ms) {
+                    kill(pid, SIGTERM);
+                    waitpid(pid, NULL, 0);
+                    if (err && err_cap) snprintf(err, err_cap, "AI 命令超时（%d 秒）已终止", timeout_ms / 1000);
+                    stopped = true;
+                    break;
+                }
+                usleep(120000);           /* 120 ms poll */
+                waited_ms += 120;
+            }
+            /* Final drain after exit. */
+            FILE *f = np_ai_fopen(out_path, "rb");
+            if (f) {
+                if (fseek(f, (long)offset, SEEK_SET) == 0) {
+                    size_t got = fread(buf, 1, sizeof buf, f);
+                    if (got && on_delta && !cb_stop) {
+                        if (!on_delta(buf, got, user)) { cb_stop = true; if (cancel) *cancel = true; }
+                    }
+                }
+                fclose(f);
+            }
+            if (stopped && err && err_cap && !err[0]) snprintf(err, err_cap, "已停止");
+            rc = stopped ? 1 : 0;
+        } else {
+            if (err && err_cap) snprintf(err, err_cap, "无法启动命令进程");
+        }
+    }
+#endif
+    (void)rc;
+    FILE *f = np_ai_fopen(out_path, "rb");
+    if (!f) {
+        if (err && err_cap && !err[0])
+            snprintf(err, err_cap, "AI 未产生输出（请检查命令模板与本机 CLI 是否可用）");
+        return false;
+    }
+    char probe[64];
+    size_t got = fread(probe, 1, sizeof probe, f);
+    fclose(f);
+    if (!got) {
+        if (err && err_cap) snprintf(err, err_cap, "AI 输出为空");
+        return false;
+    }
+    if (cb_stop) {
+        if (err && err_cap && !err[0]) snprintf(err, err_cap, "已停止");
+        return false;   /* partial output remains in out_path for review */
     }
     return true;
 }

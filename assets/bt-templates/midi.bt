@@ -1,0 +1,26 @@
+// MIDI file: MThd header and MTrk tracks
+BigEndian();
+if (FSize() >= 14) {
+    uint32 mthd;                    // "MThd"
+    if (mthd == 0x4D546864) {
+        FSeek(0);
+        struct MidiHeader {
+            char id[4];
+            uint32 length;
+            ushort format;
+            ushort tracks;
+            ushort division;
+        };
+        MidiHeader header;
+        uint32 t = 0;
+        while (!FEof() && t < 64 && FTell() + 8 <= FSize()) {
+            if (FTell() >= FSize()) break;
+            uint32 id;              // "MTrk"
+            if (id != 0x4D54726B) break;
+            uint32 length;
+            if (FTell() + length > FSize()) break;
+            ubyte events[length];
+            t = t + 1;
+        }
+    }
+}

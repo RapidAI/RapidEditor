@@ -1,0 +1,34 @@
+// SQLite database header (first 100 bytes)
+BigEndian();
+if (FSize() >= 100) {
+    uint32 magic;                   // "SQLi" = 0x53514C69
+    if (magic == 0x53514C69) {
+        FSeek(0);
+        struct SqliteHeader {
+            char magic[16];         // "SQLite format 3\0"
+            ushort page_size;
+            ubyte write_ver;
+            ubyte read_ver;
+            ubyte reserved;
+            ubyte max_payload;
+            ubyte min_payload;
+            ubyte leaf_payload;
+            uint32 change_counter;
+            uint32 db_size;
+            uint32 freelist_trunk;
+            uint32 freelist_count;
+            uint32 schema_cookie;
+            uint32 schema_format;
+            uint32 cache_size;
+            uint32 largest_root;
+            uint32 text_encoding;
+            uint32 user_version;
+            uint32 vacuum;
+            uint32 app_id;
+            ubyte reserved2[20];
+            uint32 version_valid;
+            uint32 sqlite_version;
+        };
+        SqliteHeader db;
+    }
+}

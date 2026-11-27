@@ -593,6 +593,14 @@ static void bt_exec_decl(bt_vm *v, bt_type *ty, const char *prefix) {
     bt_compose(full, sizeof full, prefix, var, 0, false);
 
     int parent = -1;
+    if (is_array && alen == 0) {
+        /* Zero-length array: emit an empty summary field, read nothing. */
+        char tname[80];
+        snprintf(tname, sizeof tname, "%s[0]", ty->name);
+        bt_field_add(v, full, tname, "0 个元素", v->off, 0, 3);
+        bt_sym_set(v, full, (int64_t)v->off);
+        return;
+    }
     if (is_array && alen > 1 && alen <= 64) {
         char tname[80];
         snprintf(tname, sizeof tname, "%s[%lld]", ty->name, (long long)alen);

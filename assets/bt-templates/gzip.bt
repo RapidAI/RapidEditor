@@ -1,0 +1,38 @@
+// GZIP stream (RFC 1952): header with optional fields, then compressed body
+LittleEndian();
+if (FSize() >= 10) {
+    uint16 magic;                   // 0x8B1F
+    if (magic == 0x8B1F) {
+        FSeek(0);
+        struct GzipHeader {
+            ubyte id1;
+            ubyte id2;
+            ubyte cm;
+            ubyte flg;
+            uint32 mtime;
+            ubyte xfl;
+            ubyte os;
+        };
+        GzipHeader hdr;
+        if ((hdr.flg & 4) != 0 && FTell() + 2 <= FSize()) {
+            ushort xlen;
+            if (FTell() + xlen <= FSize()) {
+                ubyte extra[xlen];
+            }
+        }
+        if ((hdr.flg & 8) != 0 && FTell() < FSize()) {
+            string name;
+        }
+        if ((hdr.flg & 16) != 0 && FTell() < FSize()) {
+            string comment;
+        }
+        if ((hdr.flg & 2) != 0 && FTell() + 2 <= FSize()) {
+            ushort hcrc;
+        }
+        if (FTell() + 8 <= FSize()) {
+            ubyte body[FSize() - FTell() - 8];
+            uint32 crc32;
+            uint32 isize;
+        }
+    }
+}

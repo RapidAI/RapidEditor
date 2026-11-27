@@ -1,0 +1,29 @@
+// WebAssembly binary: magic, version and LEB128-sized sections
+LittleEndian();
+if (FSize() >= 8) {
+    uint32 magic;                   // 0x6D736100 = "\0asm"
+    if (magic == 0x6D736100) {
+        FSeek(0);
+        ubyte magic_bytes[4];
+        uint32 version;
+        uint32 secs = 0;
+        while (!FEof() && secs < 32 && FTell() < FSize()) {
+            if (FTell() >= FSize()) break;
+            ubyte id;
+            uint32 size = 0;
+            uint32 shift = 0;
+            uint32 guard = 0;
+            while (guard < 5 && FTell() < FSize()) {
+                if (FTell() >= FSize()) break;
+                uint32 byte_val = ReadByte();
+                size = size + ((byte_val & 0x7F) << shift);
+                if ((byte_val & 0x80) == 0) break;
+                shift = shift + 7;
+                guard = guard + 1;
+            }
+            if (FTell() + size > FSize()) break;
+            ubyte payload[size];
+            secs = secs + 1;
+        }
+    }
+}

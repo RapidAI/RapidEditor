@@ -1,0 +1,7 @@
+
+Disassembly of section .text:
+
+0000000012000000 <main>:
+  12000000:	0200004c 	addi.d	$r0, $r0, 0
+  12000004:	0400004c 	addi.d	$r1, $r1, 0
+  12000008:	0000004c 	syscall	0x0

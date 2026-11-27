@@ -332,3 +332,27 @@ bool np_maclaw_llm_chat(const char *hub_url, const char *token,
     free(resp);
     return ok;
 }
+
+bool np_maclaw_llm_chat_stream(const char *hub_url, const char *token,
+                               const char *prompt, char *out, size_t out_cap,
+                               char *err, size_t err_cap,
+                               volatile bool *cancel,
+                               np_llm_delta_cb on_delta, void *user) {
+    if (err && err_cap) err[0] = 0;
+    if (!hub_url || !token || !prompt || !out || !out_cap) {
+        if (err && err_cap) snprintf(err, err_cap, "参数缺失");
+        return false;
+    }
+    char hub[600];
+    np_maclaw_normalize_hub(hub_url, hub, sizeof hub);
+    if (!hub[0]) {
+        if (err && err_cap) snprintf(err, err_cap, "Hub 地址无效");
+        return false;
+    }
+    /* The official proxy is OpenAI-compatible, mounted under /api/llm/v1.
+     * Reuse the shared SSE decoder with an explicit endpoint path. */
+    return np_openai_chat_stream_url(hub, "/api/llm/v1/chat/completions",
+                                     token, "auto", prompt,
+                                     out, out_cap, err, err_cap,
+                                     cancel, on_delta, user);
+}

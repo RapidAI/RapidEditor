@@ -1,6 +1,7 @@
 /* Unit tests for the maclaw protocol layer's JSON parsing & normalization. */
 #include "np_maclaw.h"
 #include "np_net.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,28 @@ char *np_net_post_json(const char *url, const char *bearer, const char *body,
     if (!copy) return NULL;
     memcpy(copy, g_response, n);
     return copy;
+}
+
+/* Streaming transport stub: feed scripted SSE to exercise the maclaw stream
+ * path (which delegates to the shared OpenAI SSE decoder). */
+static const char *g_sse;
+static int g_delta_calls;
+bool np_net_post_json_stream(const char *url, const char *bearer, const char *body,
+                             const np_net_opts *o, int *status_out,
+                             bool (*chunk_cb)(const char *, size_t, void *), void *user) {
+    (void)o;
+    snprintf(g_url, sizeof g_url, "%s", url ? url : "");
+    snprintf(g_bearer, sizeof g_bearer, "%s", bearer ? bearer : "");
+    snprintf(g_body, sizeof g_body, "%s", body ? body : "");
+    if (status_out) *status_out = g_status;
+    if (!g_sse) return false;
+    return chunk_cb(g_sse, strlen(g_sse), user);
+}
+
+static bool test_delta(const char *delta, size_t len, void *user) {
+    (void)delta; (void)len; (void)user;
+    g_delta_calls++;
+    return true;
 }
 
 char *np_net_get_json(const char *url, const char *bearer,
@@ -183,6 +206,38 @@ int main(void) {
                               answer, sizeof answer, err, sizeof err),
           "official LLM transport failure reported");
     CHECK(answer[0] == 0 && err[0] != 0, "official LLM failure clears output");
+
+    /* Streaming chat: official proxy mounted at /api/llm/v1, model "auto". */
+    g_status = 200;
+    g_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"流\"}}]}\n"
+            "data: {\"choices\":[{\"delta\":{\"content\":\"式\"}}]}\n"
+            "data: [DONE]\n";
+    g_delta_calls = 0;
+    char stream_out[256] = {0}, stream_err[256] = {0};
+    volatile bool cancel = false;
+    CHECK(np_maclaw_llm_chat_stream("https://hub.example.com", "tok-1", "hi",
+                                    stream_out, sizeof stream_out,
+                                    stream_err, sizeof stream_err,
+                                    &cancel, test_delta, NULL),
+          "maclaw stream succeeds");
+    CHECK(!strcmp(stream_out, "流式"), "maclaw stream concatenates deltas");
+    CHECK(g_delta_calls == 2, "maclaw stream invokes on_delta per delta");
+    CHECK(!strcmp(g_url, "https://hub.example.com/api/llm/v1/chat/completions"),
+          "maclaw stream uses official endpoint");
+    CHECK(strstr(g_body, "\"model\":\"auto\"") != NULL, "maclaw stream uses model auto");
+    CHECK(strstr(g_body, "\"stream\":true") != NULL, "maclaw stream requests SSE");
+
+    /* on_delta is optional: streaming still accumulates when it is NULL. */
+    g_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"AB\"}}]}\n"
+            "data: [DONE]\n";
+    stream_out[0] = 0;
+    CHECK(np_maclaw_llm_chat_stream("hub.example.com", "tok-1", "hi",
+                                    stream_out, sizeof stream_out,
+                                    stream_err, sizeof stream_err,
+                                    &cancel, NULL, NULL),
+          "maclaw stream works without delta callback");
+    CHECK(!strcmp(stream_out, "AB"), "maclaw stream text without callback");
+    g_sse = NULL;
 
     printf("%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;

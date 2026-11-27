@@ -20,6 +20,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "np_openai.h"   /* np_llm_delta_cb: shared streaming delta callback */
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +64,17 @@ const char *np_maclaw_poll(const np_maclaw_cfg *cfg, const np_maclaw_session *s,
 bool np_maclaw_llm_chat(const char *hub_url, const char *token,
                         const char *prompt, char *out, size_t out_cap,
                         char *err, size_t err_cap);
+
+/* Streaming variant: same official LLM proxy, but requests SSE and invokes
+ * on_delta for each content delta (NULL allowed). The UI can show partial
+ * output while the model generates. Returns true if any text was received;
+ * cancellation is reported through `cancel` and err. On failure callers may
+ * fall back to the non-streaming np_maclaw_llm_chat(). */
+bool np_maclaw_llm_chat_stream(const char *hub_url, const char *token,
+                               const char *prompt, char *out, size_t out_cap,
+                               char *err, size_t err_cap,
+                               volatile bool *cancel,
+                               np_llm_delta_cb on_delta, void *user);
 
 /* Normalize a user-entered URL (trim trailing slash, ensure scheme). Safe
  * for in-place calls (in == out). */

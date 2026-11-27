@@ -1,0 +1,32 @@
+// Ogg container: "OggS" pages with CRC, granule and lacing values
+LittleEndian();
+if (FSize() >= 27) {
+    uint32 cap;                     // "OggS"
+    if (cap == 0x5367674F) {
+        FSeek(0);
+        uint32 pages = 0;
+        while (!FEof() && pages < 32 && FTell() + 27 <= FSize()) {
+            if (FTell() >= FSize()) break;
+            char capture[4];
+            ubyte version;
+            ubyte header_type;
+            uint64 granule;
+            uint32 serial;
+            uint32 seq;
+            uint32 crc;
+            ubyte segments;
+            if (FTell() + segments > FSize()) break;
+            uint32 total = 0;
+            uint32 k = 0;
+            while (k < segments && FTell() < FSize()) {
+                if (FTell() >= FSize()) break;
+                uint32 part = ReadByte();
+                total = total + part;
+                k = k + 1;
+            }
+            if (FTell() + total > FSize()) break;
+            ubyte payload[total];
+            pages = pages + 1;
+        }
+    }
+}

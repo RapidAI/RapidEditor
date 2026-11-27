@@ -1,0 +1,34 @@
+// TIFF image: byte order mark, IFD0 entries, next IFD
+LittleEndian();
+if (FSize() >= 8) {
+    uint16 bom;                     // 0x4949 = "II", 0x4D4D = "MM"
+    if (bom == 0x4949) {
+        LittleEndian();
+    } else {
+        if (bom == 0x4D4D) {
+            BigEndian();
+        }
+    }
+    if (bom == 0x4949 || bom == 0x4D4D) {
+        FSeek(0);
+        char byte_order[2];
+        uint16 magic;               // 42
+        uint32 ifd0;
+        if (magic == 42 && ifd0 > 0 && ifd0 + 2 <= FSize()) {
+            FSeek(ifd0);
+            uint16 count;
+            uint32 n = count;
+            if (n > 64) n = 64;
+            struct IfdEntry {
+                uint16 tag;
+                uint16 type;
+                uint32 count;
+                uint32 value;
+            };
+            IfdEntry entries[n];
+            if (FTell() + 4 <= FSize()) {
+                uint32 next_ifd;
+            }
+        }
+    }
+}

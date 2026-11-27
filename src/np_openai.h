@@ -63,6 +63,15 @@ bool np_openai_chat_stream(const char *base_url, const char *api_key,
                            volatile bool *cancel,
                            np_llm_delta_cb on_delta, void *user);
 
+/* Same as np_openai_chat_stream but with an explicit absolute endpoint path
+ * (must start with '/', no scheme). Used by providers whose OpenAI-compatible
+ * API is mounted under a custom prefix (e.g. maclaw's /api/llm/v1/...). */
+bool np_openai_chat_stream_url(const char *base_url, const char *endpoint,
+                               const char *api_key, const char *model,
+                               const char *prompt, char *out, size_t out_cap,
+                               char *err, size_t err_cap, volatile bool *cancel,
+                               np_llm_delta_cb on_delta, void *user);
+
 /* GET /v1/models and collect the model ids into `out_csv` (comma-separated,
  * bounded by `cap`). Returns the number of models found, or -1 on error. */
 int np_openai_list_models(const char *base_url, const char *api_key,

@@ -18,6 +18,7 @@ struct LocalHeader {
 };
 uint32 files = 0;
 while (!FEof()) {
+    if (FTell() >= FSize()) break;
     if (FTell() + 30 > FSize()) break;
     LocalHeader entry;
     files = files + 1;

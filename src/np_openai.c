@@ -295,12 +295,11 @@ static bool np_sse_chunk_cb(const char *chunk, size_t len, void *user) {
     return true;
 }
 
-bool np_openai_chat_stream(const char *base_url, const char *api_key,
-                           const char *model, const char *prompt,
-                           char *out, size_t out_cap,
-                           char *err, size_t err_cap,
-                           volatile bool *cancel,
-                           np_llm_delta_cb on_delta, void *user) {
+static bool chat_stream_impl(const char *base_url, const char *endpoint,
+                             const char *api_key, const char *model,
+                             const char *prompt, char *out, size_t out_cap,
+                             char *err, size_t err_cap, volatile bool *cancel,
+                             np_llm_delta_cb on_delta, void *user) {
     if (out && out_cap) out[0] = 0;
     if (err && err_cap) err[0] = 0;
     if (!base_url || !model || !prompt || !out || !out_cap) {
@@ -336,7 +335,15 @@ bool np_openai_chat_stream(const char *base_url, const char *api_key,
     free(escaped);
 
     char url[1200];
-    snprintf(url, sizeof url, "%s/v1/chat/completions", base);
+    /* endpoint must be an absolute path starting with '/' — reject anything
+     * else so a provider string can never turn this into an open redirect. */
+    const char *ep = (endpoint && *endpoint) ? endpoint : "/v1/chat/completions";
+    if (ep[0] != '/' || strstr(ep, "://")) {
+        if (err && err_cap) snprintf(err, err_cap, "端点路径无效");
+        free(body);
+        return false;
+    }
+    snprintf(url, sizeof url, "%s%s", base, ep);
     np_net_opts opts;
     memset(&opts, 0, sizeof opts);
     if (err) { opts.err = err; opts.err_cap = err_cap; }
@@ -368,6 +375,26 @@ bool np_openai_chat_stream(const char *base_url, const char *api_key,
      * truncation reason already written into err. A genuine cancel returns
      * ok == false from the HTTP layer and is still reported as a failure. */
     return ok && out[0];
+}
+
+bool np_openai_chat_stream(const char *base_url, const char *api_key,
+                           const char *model, const char *prompt,
+                           char *out, size_t out_cap,
+                           char *err, size_t err_cap,
+                           volatile bool *cancel,
+                           np_llm_delta_cb on_delta, void *user) {
+    return chat_stream_impl(base_url, "/v1/chat/completions", api_key, model,
+                            prompt, out, out_cap, err, err_cap, cancel,
+                            on_delta, user);
+}
+
+bool np_openai_chat_stream_url(const char *base_url, const char *endpoint,
+                               const char *api_key, const char *model,
+                               const char *prompt, char *out, size_t out_cap,
+                               char *err, size_t err_cap, volatile bool *cancel,
+                               np_llm_delta_cb on_delta, void *user) {
+    return chat_stream_impl(base_url, endpoint, api_key, model, prompt,
+                            out, out_cap, err, err_cap, cancel, on_delta, user);
 }
 
 int np_openai_list_models(const char *base_url, const char *api_key,

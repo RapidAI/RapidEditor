@@ -87,6 +87,41 @@ np_db_status_t np_db_parse(const unsigned char *data, size_t len,
 /* 按名字查表；未找到返回 NULL。 */
 const np_db_table_t *np_db_find_table(const np_db_schema_t *s, const char *name);
 
+/* ------------------------------------------------------------------ */
+/* F6: 只读行采样（复用 B-tree 遍历；绝不修改字节）                     */
+/* ------------------------------------------------------------------ */
+
+#define NP_DB_MAX_SAMPLE_COLS 32
+#define NP_DB_MAX_CELL_TEXT   200
+
+/* 单个单元格的文本化表示（有界，NULL 用 is_null 标记）。 */
+typedef struct {
+    char     text[NP_DB_MAX_CELL_TEXT];
+    bool     is_null;
+    uint64_t ival;              /* 整数 serial 的原始值 */
+    bool     is_int;            /* serial 1..6/8/9 */
+    bool     is_blob;           /* serial>=12 且奇数 */
+    bool     truncated;         /* 文本被截断 */
+} np_db_cell_t;
+
+/* 一行采样：cells[0..ncells-1] 对应表列顺序（不足列数为 NULL）。 */
+typedef struct {
+    uint64_t rowid;
+    int      ncells;
+    np_db_cell_t cells[NP_DB_MAX_SAMPLE_COLS];
+} np_db_row_t;
+
+/* 采样回调：返回 false 停止遍历。row 指向的数据仅在回调内有效。 */
+typedef bool (*np_db_row_cb)(const np_db_row_t *row, void *user);
+
+/* 对已 np_db_parse 的库缓冲按表名做只读行采样，最多 max_rows 行。
+ * 返回实际访问行数；partial 置位表示遍历未完整（页上限/坏页/超限）。
+ * 数据所有权仍在调用方，本函数不修改 data。 */
+size_t np_db_sample_rows(const unsigned char *data, size_t len,
+                         const np_db_schema_t *schema, const char *table,
+                         size_t max_rows, np_db_row_cb cb, void *user,
+                         bool *partial);
+
 #ifdef __cplusplus
 }
 #endif

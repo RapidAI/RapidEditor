@@ -1,0 +1,8 @@
+
+Disassembly of section .text:
+
+0000000000401000 <_start>:
+  401000:	48 89 5c 24 08       	mov    %rbx,0x8(%rsp)
+  401005:	48 83 c4 10          	add    $0x10,%rsp
+  401009:	c3                   	retq
+  40100a:	90                    nop

@@ -127,6 +127,7 @@ typedef struct {
     const unsigned char *ptr;  /* 指向 payload 内部 */
     size_t len;
     int64_t ival;
+    double  fval;              /* serial 7 的浮点值 */
 } np_db_value_t;
 
 /* 解析 record：values 输出指针指向 rec 内部，不拥有内存。
@@ -144,7 +145,7 @@ static bool parse_record(const unsigned char *rec, size_t rec_len,
         hdr_off += used;
         np_db_value_t *v = &vals[n++];
         v->serial = st;
-        v->ptr = NULL; v->len = 0; v->ival = 0;
+        v->ptr = NULL; v->len = 0; v->ival = 0; v->fval = 0.0;
         switch (st) {
         case 0: break;                          /* NULL */
         case 1: case 2: case 3: case 4: case 5: case 6: {
@@ -157,8 +158,13 @@ static bool parse_record(const unsigned char *rec, size_t rec_len,
             body_off += w;
             break;
         }
-        case 7: { /* float，跳过 8 字节 */
+        case 7: { /* float：8 字节 IEEE-754 big-endian */
             if (body_off + 8 > rec_len) return false;
+            uint64_t bits = 0;
+            for (size_t i = 0; i < 8; ++i) bits = (bits << 8) | rec[body_off + i];
+            /* bits 是按大端读入的数值；在 little-endian 主机上其内存表示
+             * 恰好与 IEEE-754 double 一致（项目全平台均小端）。 */
+            memcpy(&v->fval, &bits, 8);
             body_off += 8;
             break;
         }
@@ -336,7 +342,10 @@ static int parse_create_columns(const char *sql, np_db_table_t *t) {
 /* b-tree 遍历                                                          */
 /* ------------------------------------------------------------------ */
 
-typedef void (*row_cb)(const np_db_value_t *vals, size_t n, void *user);
+/* rowid 随行传给回调：INTEGER PRIMARY KEY 别名列在 record 中存 NULL，
+ * 真实值即 rowid（SQLite 文件格式约定）。 */
+typedef void (*row_cb)(const np_db_value_t *vals, size_t n, uint64_t rowid,
+                       void *user);
 
 typedef struct {
     const unsigned char *d;
@@ -387,7 +396,8 @@ static bool visit_page(walk_ctx_t *w, uint32_t pgno, row_cb cb, void *user,
         size_t used = 0;
         uint64_t payload_len = get_varint(pg + coff, usable - coff, &used);
         size_t used2 = 0;
-        get_varint(pg + coff + used, usable - coff - used, &used2); /* rowid */
+        uint64_t rowid = get_varint(pg + coff + used, usable - coff - used,
+                                    &used2); /* rowid */
         size_t poff = coff + used + used2;
         if (poff > usable) { w->partial = true; break; }
         size_t local = table_leaf_local(usable, payload_len);
@@ -399,7 +409,8 @@ static bool visit_page(walk_ctx_t *w, uint32_t pgno, row_cb cb, void *user,
         }
         np_db_value_t vals[8];
         size_t nv = 0;
-        if (parse_record(pl.data, pl.len, vals, 8, &nv) && cb) cb(vals, nv, user);
+        if (parse_record(pl.data, pl.len, vals, 8, &nv) && cb)
+            cb(vals, nv, rowid, user);
         payload_free(&pl);
         (*cells)++;
     }
@@ -437,7 +448,9 @@ static bool be_utf8_ci(const char *s, size_t n, const char *kw) {
     return token_eq_ci(s, n, kw);
 }
 
-static void master_row_cb(const np_db_value_t *vals, size_t n, void *user) {
+static void master_row_cb(const np_db_value_t *vals, size_t n, uint64_t rowid,
+                          void *user) {
+    (void)rowid;
     master_user_t *mu = (master_user_t *)user;
     np_db_schema_t *out = mu->out;
     if (n < 5) return;
@@ -533,4 +546,101 @@ const np_db_table_t *np_db_find_table(const np_db_schema_t *s, const char *name)
     for (int i = 0; i < s->ntables; ++i)
         if (strcmp(s->tables[i].name, name) == 0) return &s->tables[i];
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* F6: 只读行采样（复用 B-tree 遍历，绝不修改字节）                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    np_db_row_cb cb;
+    void *user;
+    size_t rows;
+    size_t max_rows;
+    bool stop;
+    const np_db_table_t *table;   /* 用于 INTEGER PRIMARY KEY 别名回填 */
+} sample_user_t;
+
+/* 把 np_db_value_t 文本化到 np_db_cell_t。
+ * 文本/整数/ blob 均转成可读文本；NULL 用 is_null 标记。 */
+static void value_to_cell(const np_db_value_t *v, np_db_cell_t *cell) {
+    memset(cell, 0, sizeof(*cell));
+    if (!v) { cell->is_null = true; return; }
+    if (v->serial == 0) { cell->is_null = true; return; }
+    if (v->serial >= 1 && v->serial <= 6) {
+        cell->is_int = true;
+        cell->ival = v->ival;
+        snprintf(cell->text, sizeof(cell->text), "%lld", (long long)v->ival);
+        return;
+    }
+    if (v->serial == 7) { /* float */
+        snprintf(cell->text, sizeof(cell->text), "%.6g", v->fval);
+        return;
+    }
+    if (v->serial == 8) { cell->is_int = true; cell->ival = 0;
+        strcpy(cell->text, "0"); return; }
+    if (v->serial == 9) { cell->is_int = true; cell->ival = 1;
+        strcpy(cell->text, "1"); return; }
+    if (v->ptr) {
+        size_t n = v->len < sizeof(cell->text) - 1 ? v->len : sizeof(cell->text) - 1;
+        if (v->len > n) cell->truncated = true;
+        memcpy(cell->text, v->ptr, n);
+        cell->text[n] = '\0';
+        cell->is_blob = ((v->serial - 12) % 2 == 1);
+    }
+}
+
+static void sample_row_cb(const np_db_value_t *vals, size_t n, uint64_t rowid,
+                          void *user) {
+    sample_user_t *su = (sample_user_t *)user;
+    np_db_row_t row;
+    size_t i;
+    (void)rowid;
+    if (su->stop || !su->cb) return;
+    memset(&row, 0, sizeof(row));
+    row.rowid = rowid;
+    row.ncells = n < NP_DB_MAX_SAMPLE_COLS ? (int)n : NP_DB_MAX_SAMPLE_COLS;
+    for (i = 0; i < (size_t)row.ncells; ++i)
+        value_to_cell(&vals[i], &row.cells[i]);
+    /* INTEGER PRIMARY KEY 别名列在 record 里是 NULL（serial 0），真实值=rowid */
+    if (su->table && su->table->rowid_alias) {
+        for (i = 0; i < (size_t)su->table->ncols && i < (size_t)row.ncells; ++i) {
+            /* np_db_col_t 无 rowid_alias 字段；用 decl_type==INTEGER && pk 判定 */
+            if (strcmp(su->table->cols[i].decl_type, "INTEGER") == 0 &&
+                su->table->cols[i].pk) {
+                row.cells[i].is_null = false;
+                row.cells[i].is_int = true;
+                row.cells[i].ival = rowid;
+                snprintf(row.cells[i].text, sizeof(row.cells[i].text),
+                         "%lld", (long long)rowid);
+                break;
+            }
+        }
+    }
+    su->rows++;
+    if (su->rows >= su->max_rows) su->stop = true;   /* 采样上限：不再继续 */
+    if (!su->cb(&row, su->user)) su->stop = true;
+}
+
+size_t np_db_sample_rows(const unsigned char *data, size_t len,
+                         const np_db_schema_t *schema, const char *table,
+                         size_t max_rows, np_db_row_cb cb, void *user,
+                         bool *partial) {
+    const np_db_table_t *t;
+    walk_ctx_t w;
+    sample_user_t su;
+    uint64_t cells = 0;
+    if (partial) *partial = false;
+    if (!data || !schema || !table || !max_rows) return 0;
+    t = np_db_find_table(schema, table);
+    if (!t || t->rootpage == 0) return 0;
+    w.d = data; w.len = len; w.page_size = schema->page_size;
+    w.reserved = (uint8_t)0; w.partial = false;
+    /* reserved 字节不可从 schema 反推，需从文件头第 20 字节读回 */
+    if (len > 20) w.reserved = data[20];
+    su.cb = cb; su.user = user; su.rows = 0; su.max_rows = max_rows;
+    su.stop = false; su.table = t;
+    (void)walk_table_btree(&w, t->rootpage, sample_row_cb, &su, &cells);
+    if (partial) *partial = w.partial;
+    return su.rows;
 }

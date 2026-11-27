@@ -1,0 +1,24 @@
+// Windows ICO / CUR: icon directory and image entries
+LittleEndian();
+if (FSize() >= 6) {
+    uint32 dir;                     // reserved=0, type=1(ICO)/2(CUR) as uint32
+    if (dir == 0x00010000 || dir == 0x00020000) {
+        FSeek(0);
+        ushort reserved;
+        ushort type;
+        ushort count;
+        uint32 n = count;
+        if (n > 64) n = 64;
+        struct IconEntry {
+            ubyte width;
+            ubyte height;
+            ubyte colors;
+            ubyte reserved;
+            ushort planes;
+            ushort bpp;
+            uint32 bytes_in_res;
+            uint32 image_offset;
+        };
+        IconEntry entries[n];
+    }
+}
